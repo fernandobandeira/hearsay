@@ -32,8 +32,10 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            // tower_http's per-request spans are noise at info level.
-            EnvFilter::new("info,tower_http=warn")
+            // tower_http's per-request spans and ONNX Runtime's arena
+            // bookkeeping are both noise at info level; the engine's own
+            // warnings and errors still come through.
+            EnvFilter::new("info,tower_http=warn,ort=warn")
         }))
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .init();

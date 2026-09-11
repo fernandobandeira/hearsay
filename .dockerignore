@@ -1,0 +1,10 @@
+target
+work
+models
+books
+client
+listen-test
+scripts/golden/.venv
+scripts/client/node_modules
+web/node_modules
+.git
