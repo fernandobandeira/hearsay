@@ -100,6 +100,43 @@ pub fn chunk_at(m: &Manifest, seconds: f64) -> usize {
     lo.saturating_sub(1).min(m.starts.len().saturating_sub(1))
 }
 
+/// `CHAPTER_BITRATE` as bits per second: ffmpeg's own spelling, which is a bare
+/// number of bits or a number with a `k`/`m` suffix.
+///
+/// The reader needs this to say how big a download will be *before* anything is
+/// packed, and it used to hard-code the 64 k default — so changing the env var
+/// on the box silently made every size in the UI wrong by that ratio. Garbage
+/// falls back to 64 k rather than to zero: an estimate that is off is worth more
+/// than one that claims a chapter weighs nothing.
+pub fn bitrate_bps(spec: &str) -> u64 {
+    const DEFAULT: u64 = 64_000;
+    let s = spec.trim().to_ascii_lowercase();
+    let s = s
+        .strip_suffix("bit/s")
+        .or_else(|| s.strip_suffix("bits"))
+        .or_else(|| s.strip_suffix("bps"))
+        .or_else(|| s.strip_suffix("bit"))
+        .unwrap_or(&s)
+        .trim()
+        .to_string();
+    let (num, mult) = match s.strip_suffix('k') {
+        Some(n) => (n, 1_000u64),
+        None => match s.strip_suffix('m') {
+            Some(n) => (n, 1_000_000),
+            None => (s.as_str(), 1),
+        },
+    };
+    match num.trim().parse::<f64>() {
+        Ok(v) if v > 0.0 => ((v * mult as f64).round() as u64).max(1),
+        _ => DEFAULT,
+    }
+}
+
+/// Bytes a minute of packed audio takes, at `spec`.
+pub fn bytes_per_minute(spec: &str) -> f64 {
+    bitrate_bps(spec) as f64 / 8.0 * 60.0
+}
+
 /// concat-demuxer quoting: close the quote, escape the quote, reopen.
 fn concat_line(p: &Path) -> String {
     format!("file '{}'", p.to_string_lossy().replace('\'', "'\\''"))
@@ -441,6 +478,22 @@ mod tests {
         assert_eq!(chunk_at(&m, 9.9), 2);
         assert_eq!(chunk_at(&m, 1e9), 3);
         assert_eq!(chunk_at(&m, -5.0), 0);
+    }
+
+    #[test]
+    fn a_bitrate_is_read_the_way_ffmpeg_spells_it() {
+        assert_eq!(bitrate_bps("64k"), 64_000);
+        assert_eq!(bitrate_bps("128K"), 128_000);
+        assert_eq!(bitrate_bps("96kbit"), 96_000);
+        assert_eq!(bitrate_bps("48000"), 48_000);
+        assert_eq!(bitrate_bps("1m"), 1_000_000);
+        assert_eq!(bitrate_bps(" 64k "), 64_000);
+        // Garbage, zero and negatives fall back rather than promising a
+        // chapter that weighs nothing.
+        assert_eq!(bitrate_bps("loud"), 64_000);
+        assert_eq!(bitrate_bps("0"), 64_000);
+        assert_eq!(bitrate_bps("-8k"), 64_000);
+        assert_eq!(bytes_per_minute("64k"), 480_000.0);
     }
 
     #[test]

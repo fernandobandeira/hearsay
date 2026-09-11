@@ -51,6 +51,10 @@ pub struct Config {
 
     pub kokoro_voice: String,
     pub kokoro_speed: f32,
+    /// `KOKORO_GAIN` — a linear multiplier applied to every rendered chunk,
+    /// with a soft knee so it cannot clip (see [`crate::tts::kokoro::apply_gain`]).
+    /// 1.0, the default, is the identity and leaves rendered bytes untouched.
+    pub kokoro_gain: f32,
     pub kokoro_model: PathBuf,
     pub kokoro_voices_dir: PathBuf,
     pub fake_tts: bool,
@@ -59,6 +63,10 @@ pub struct Config {
     pub whisper_model: PathBuf,
     pub whisper_vad_model: Option<PathBuf>,
     pub whisper_prompt: String,
+    /// `WHISPER_THREADS` — how many threads one transcription may use. Defaults
+    /// to every core, which is what it was before this was configurable, and is
+    /// measured to be the right answer on the 2-core box (see AGENTS.md).
+    pub whisper_threads: usize,
 
     pub chapter_bitrate: String,
     pub chapter_gap_s: f64,
@@ -126,6 +134,7 @@ impl Config {
 
             kokoro_voice: env("KOKORO_VOICE").unwrap_or_else(|| "af_heart".into()),
             kokoro_speed: num("KOKORO_SPEED", 1.0f32),
+            kokoro_gain: num("KOKORO_GAIN", 1.0f32),
             kokoro_model: env("KOKORO_MODEL")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| models.join("kokoro/model.onnx")),
@@ -144,6 +153,13 @@ impl Config {
                     .unwrap_or_else(|| models.join("whisper/ggml-silero-v5.1.2.bin")),
             ),
             whisper_prompt: env("WHISPER_PROMPT").unwrap_or_default(),
+            whisper_threads: num(
+                "WHISPER_THREADS",
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4),
+            )
+            .max(1),
             models,
 
             chapter_bitrate: env("CHAPTER_BITRATE").unwrap_or_else(|| "64k".into()),

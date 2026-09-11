@@ -102,9 +102,7 @@ mod real {
                 ctx: Mutex::new(None),
                 model: cfg.whisper_model.clone(),
                 vad_model: vad,
-                threads: std::thread::available_parallelism()
-                    .map(|n| n.get() as i32)
-                    .unwrap_or(4),
+                threads: cfg.whisper_threads.max(1) as i32,
             }
         }
 

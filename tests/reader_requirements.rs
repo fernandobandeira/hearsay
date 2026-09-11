@@ -1,10 +1,11 @@
-//! The six things the reader asked the rewrite for.
+//! The nine things the reader asked the rewrite for.
 //!
-//! `~/git/narrator/web/RUST-NOTES.md` is a list of requirements written against
-//! the python server by the person porting the reader, each with the client-side
-//! mitigation standing in for it. These tests are the other half of that
-//! document: one per requirement, so "fixed in the Rust server" is a thing that
-//! can be checked rather than claimed.
+//! The reader kept a list of requirements written against the python server —
+//! each with the client-side mitigation standing in for it meanwhile — and these
+//! tests are the other half of that document: one per requirement, so "fixed in
+//! the Rust server" is a thing that can be checked rather than claimed. The list
+//! itself is gone now that all nine are implemented; what each one *was* is the
+//! doc comment on its test.
 //!
 //! Every one of them is **additive**. A client that sends none of the new
 //! parameters gets exactly the python behaviour, which is what keeps the
@@ -250,4 +251,158 @@ async fn the_chapter_list_takes_a_range() {
     assert_eq!(code, StatusCode::OK);
     assert_eq!(win["from"], json!(n - 1));
     assert_eq!(win["chapters"].as_array().map(Vec::len), Some(1));
+}
+
+/// 7. The chapter endpoints must take `?book=` / `"book"`.
+///
+/// The one where a race is expensive rather than merely wrong: a single tap can
+/// queue 74 chapters of rendering, and if the server swapped books between the
+/// poll and the tap, those renders occupy the worker for hours on the wrong
+/// novel. The reader had no mitigation that closed it.
+#[tokio::test]
+async fn every_chapter_endpoint_refuses_a_book_the_session_is_not_holding() {
+    let h = Harness::new().await;
+    let load = h.load().await;
+    let key = load["key"].as_str().unwrap_or("").to_string();
+    let mine: String = url::form_urlencoded::byte_serialize(key.as_bytes()).collect();
+
+    // The view.
+    let (code, body) = h.get_json("/api/chapters?book=Another%20Book").await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().is_some_and(|e| e.contains(&key)),
+        "the refusal says which book is loaded: {body}"
+    );
+    // The three verbs.
+    for path in [
+        "/api/chapters/render",
+        "/api/chapters/build",
+        "/api/chapters/cancel",
+    ] {
+        let (code, body) = h
+            .post_json(path, json!({"chapters": [1, 2], "book": "Another Book"}))
+            .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{path}: {body}");
+    }
+    // And nothing was queued by any of them.
+    let s = h.get_json("/api/status").await.1;
+    assert_eq!(s["queue"], json!([]), "{s}");
+    assert_eq!(s["pack_queue"], json!([]));
+
+    // The right key works, and so does no key at all - which is the python
+    // behaviour the Obsidian plugin still relies on.
+    let (code, body) = h.get_json(&format!("/api/chapters?book={mine}")).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["key"].as_str(), Some(key.as_str()));
+    let (code, body) = h
+        .post_json(
+            "/api/chapters/render",
+            json!({"chapters": [2], "book": key}),
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["queue"], json!([2]));
+    let (code, body) = h
+        .post_json("/api/chapters/cancel", json!({"chapters": [2]}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["queue"], json!([]));
+
+    // With no book loaded at all, a request that names one is still a 409 and
+    // not a confident answer about nothing.
+    let empty = Harness::new().await;
+    let (code, _) = empty.get_json("/api/chapters?book=Anything").await;
+    assert_eq!(code, StatusCode::CONFLICT);
+}
+
+/// 8. A chapter's packed size must be knowable before it is packed.
+///
+/// The confirm bar has to say how big a download will be while every chapter in
+/// it is still an estimate, and the client used to hard-code the 64 kbit/s
+/// default — so changing `CHAPTER_BITRATE` on the box made every figure in the
+/// UI wrong by that ratio, silently.
+#[tokio::test]
+async fn the_packed_bitrate_and_a_per_chapter_size_estimate_are_reported() {
+    let h = Harness::with(|c| c.chapter_bitrate = "128k".into()).await;
+    h.load().await;
+
+    let s = h.get_json("/api/status").await.1;
+    assert_eq!(s["bitrate"], json!("128k"));
+    // 128 kbit/s is 960 kB a minute; the client should not have to parse `k`.
+    assert_eq!(s["bitrate_bytes_per_min"], json!(960_000.0));
+
+    let rows = h.get_json("/api/chapters").await.1["chapters"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!rows.is_empty());
+    for r in &rows {
+        let min = r["est_min"].as_f64().expect("est_min");
+        let bytes = r["est_bytes"].as_f64().expect("est_bytes");
+        assert_eq!(bytes, (min * 960_000.0).round(), "{r}");
+    }
+
+    // The default is still the default.
+    let plain = Harness::new().await;
+    plain.load().await;
+    let s = plain.get_json("/api/status").await.1;
+    assert_eq!(s["bitrate"], json!("64k"));
+    assert_eq!(s["bitrate_bytes_per_min"], json!(480_000.0));
+}
+
+/// 9. `POST /api/chapters/build` must say what it refused, and why.
+///
+/// It answered `{built, building, rendering}`, and a chapter it would not pack
+/// appeared in none of the three — indistinguishable from one nobody asked
+/// about. The reader's mitigation was to ignore the response entirely and
+/// re-ask every twenty seconds.
+#[tokio::test]
+async fn build_reports_what_it_refused_and_why() {
+    let h = Harness::new().await;
+    let load = h.load().await;
+    let n = load["chapters"].as_array().map(Vec::len).unwrap_or(0);
+    let key = load["key"].as_str().unwrap_or("").to_string();
+
+    // Chapter 1 is untouched; chapter 0 gets a complete set of chunk wavs, the
+    // way the render worker would have left it.
+    let chunks = load["chapters"][0]["n"].as_u64().unwrap_or(0) as usize;
+    let dir = narrator::cache::chapter_dir(&h.work(), &key, 0);
+    std::fs::create_dir_all(&dir).expect("chapter dir");
+    for i in 0..chunks {
+        narrator::cache::write_silence_wav(&dir.join(format!("{i:05}.wav")), 0.1, 1, 24_000, 2)
+            .expect("silence");
+    }
+
+    let (code, body) = h
+        .post_json(
+            "/api/chapters/build",
+            json!({"chapters": [0, 1, 9999], "book": key}),
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    // The complete one was taken.
+    assert_eq!(body["building"], json!([0]), "{body}");
+    // The half-rendered one was not, and says so - with its progress, so the
+    // client can tell "working on it" from "stuck".
+    let refused = body["refused"].as_array().cloned().unwrap_or_default();
+    let one = refused
+        .iter()
+        .find(|r| r["chapter"] == json!(1))
+        .unwrap_or_else(|| panic!("chapter 1 in {body}"));
+    assert_eq!(one["reason"], json!("not_rendered"));
+    assert_eq!(one["rendered"], json!(0));
+    assert!(one["n"].as_u64().unwrap_or(0) > 0, "{one}");
+    assert!(
+        body["rendering"]
+            .as_array()
+            .is_some_and(|r| r.contains(&json!(1))),
+        "and it was queued to render: {body}"
+    );
+    // An index this book does not have is named rather than dropped.
+    let far = refused
+        .iter()
+        .find(|r| r["chapter"] == json!(9999))
+        .unwrap_or_else(|| panic!("9999 in {body}"));
+    assert_eq!(far["reason"], json!("out_of_range"));
+    assert!(n < 9999);
 }

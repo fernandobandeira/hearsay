@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, ServerSentEventsResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { BookIndex2Data, BookIndex2Errors, BookIndex2Responses, BookIndexData, BookIndexErrors, BookIndexResponses, BooksData, BooksResponses, BookText2Data, BookText2Errors, BookText2Responses, BookTextData, BookTextErrors, BookTextResponses, ChapterAudio2Data, ChapterAudio2Errors, ChapterAudio2Responses, ChapterAudioData, ChapterAudioErrors, ChapterAudioResponses, ChapterData, ChapterErrors, ChapterHls2Data, ChapterHls2Errors, ChapterHls2Responses, ChapterHlsData, ChapterHlsErrors, ChapterHlsResponses, ChapterManifest2Data, ChapterManifest2Errors, ChapterManifest2Responses, ChapterManifestData, ChapterManifestErrors, ChapterManifestResponses, ChapterResponses, ChaptersBuildData, ChaptersBuildErrors, ChaptersBuildResponses, ChaptersCancelData, ChaptersCancelResponses, ChaptersListData, ChaptersListResponses, ChaptersRenderData, ChaptersRenderErrors, ChaptersRenderResponses, ChunkWav2Data, ChunkWav2Errors, ChunkWav2Responses, ChunkWavData, ChunkWavErrors, ChunkWavResponses, EventsData, EventsResponse, EventsResponses, HealthzData, HealthzErrors, HealthzResponses, HlsSegment2Data, HlsSegment2Errors, HlsSegment2Responses, HlsSegmentData, HlsSegmentErrors, HlsSegmentResponses, LoadData, LoadErrors, LoadResponses, NoteData, NoteErrors, NoteResponses, OpenChapterData, OpenChapterErrors, OpenChapterResponses, PauseData, PauseResponses, PlayheadData, PlayheadErrors, PlayheadResponses, PositionData, PositionErrors, PositionResponses, PrerenderData, PrerenderErrors, PrerenderResponses, RendererData, RendererResponses, ResumeData, ResumeResponses, StatusData, StatusResponses } from './types.gen';
+import type { BookIndex2Data, BookIndex2Errors, BookIndex2Responses, BookIndexData, BookIndexErrors, BookIndexResponses, BooksData, BooksResponses, BookText2Data, BookText2Errors, BookText2Responses, BookTextData, BookTextErrors, BookTextResponses, ChapterAudio2Data, ChapterAudio2Errors, ChapterAudio2Responses, ChapterAudioData, ChapterAudioErrors, ChapterAudioResponses, ChapterData, ChapterErrors, ChapterHls2Data, ChapterHls2Errors, ChapterHls2Responses, ChapterHlsData, ChapterHlsErrors, ChapterHlsResponses, ChapterManifest2Data, ChapterManifest2Errors, ChapterManifest2Responses, ChapterManifestData, ChapterManifestErrors, ChapterManifestResponses, ChapterResponses, ChaptersBuildData, ChaptersBuildErrors, ChaptersBuildResponses, ChaptersCancelData, ChaptersCancelErrors, ChaptersCancelResponses, ChaptersListData, ChaptersListErrors, ChaptersListResponses, ChaptersRenderData, ChaptersRenderErrors, ChaptersRenderResponses, ChunkWav2Data, ChunkWav2Errors, ChunkWav2Responses, ChunkWavData, ChunkWavErrors, ChunkWavResponses, EventsData, EventsResponse, EventsResponses, HealthzData, HealthzErrors, HealthzResponses, HlsSegment2Data, HlsSegment2Errors, HlsSegment2Responses, HlsSegmentData, HlsSegmentErrors, HlsSegmentResponses, LoadData, LoadErrors, LoadResponses, NoteData, NoteErrors, NoteResponses, OpenChapterData, OpenChapterErrors, OpenChapterResponses, PauseData, PauseResponses, PlayheadData, PlayheadErrors, PlayheadResponses, PositionData, PositionErrors, PositionResponses, PrerenderData, PrerenderErrors, PrerenderResponses, RendererData, RendererResponses, ResumeData, ResumeResponses, StatusData, StatusResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -52,7 +52,7 @@ export const chapter = <ThrowOnError extends boolean = false>(options: Options<C
  * Every chapter of the loaded book: chunks rendered / total, whether the packed
  * m4a exists and how big it is.
  */
-export const chaptersList = <ThrowOnError extends boolean = false>(options?: Options<ChaptersListData, ThrowOnError>): RequestResult<ChaptersListResponses, unknown, ThrowOnError> => (options?.client ?? client).get<ChaptersListResponses, unknown, ThrowOnError>({ url: '/api/chapters', ...options });
+export const chaptersList = <ThrowOnError extends boolean = false>(options?: Options<ChaptersListData, ThrowOnError>): RequestResult<ChaptersListResponses, ChaptersListErrors, ThrowOnError> => (options?.client ?? client).get<ChaptersListResponses, ChaptersListErrors, ThrowOnError>({ url: '/api/chapters', ...options });
 
 /**
  * Pack now what is complete, queue the rest for rendering first.
@@ -69,7 +69,7 @@ export const chaptersBuild = <ThrowOnError extends boolean = false>(options: Opt
 /**
  * Drop chapters from the queues. An empty body clears both.
  */
-export const chaptersCancel = <ThrowOnError extends boolean = false>(options: Options<ChaptersCancelData, ThrowOnError>): RequestResult<ChaptersCancelResponses, unknown, ThrowOnError> => (options.client ?? client).post<ChaptersCancelResponses, unknown, ThrowOnError>({
+export const chaptersCancel = <ThrowOnError extends boolean = false>(options: Options<ChaptersCancelData, ThrowOnError>): RequestResult<ChaptersCancelResponses, ChaptersCancelErrors, ThrowOnError> => (options.client ?? client).post<ChaptersCancelResponses, ChaptersCancelErrors, ThrowOnError>({
     url: '/api/chapters/cancel',
     ...options,
     headers: {

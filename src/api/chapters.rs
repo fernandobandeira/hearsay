@@ -25,6 +25,13 @@ pub struct ChapterRow {
     pub rendered: usize,
     #[schema(required = true)]
     pub est_min: Option<f64>,
+    /// What this chapter will weigh once packed, at the server's own
+    /// `CHAPTER_BITRATE` — the arithmetic the client used to do with a
+    /// hard-coded 64 kbit/s it could not see. `bytes` is the measured size of a
+    /// chapter that exists; this is the estimate for one that does not, and it
+    /// is null only when the duration estimate itself is missing.
+    #[schema(required = true)]
+    pub est_bytes: Option<u64>,
     /// Whether a *trustworthy* packed m4a exists. A manifest whose `chunks`
     /// disagrees with the plan reports false: it points at the wrong words.
     pub m4a: bool,
@@ -87,14 +94,19 @@ pub struct ChaptersResult {
     pub total: Option<usize>,
 }
 
-/// `?from=&to=` on the chapter list. The drawer polls this every two seconds
-/// while it is open, and for 1433 chapters the unwindowed scan is a few thousand
-/// `stat` calls; a reader that only shows a screenful never needs the rest.
-/// Both bounds are inclusive and clamped to the book.
+/// `?from=&to=&book=` on the chapter list. The drawer polls this every two
+/// seconds while it is open, and for 1433 chapters the unwindowed scan is a few
+/// thousand `stat` calls; a reader that only shows a screenful never needs the
+/// rest. Both bounds are inclusive and clamped to the book.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub struct RangeQuery {
+pub struct ChaptersQuery {
     pub from: Option<usize>,
     pub to: Option<usize>,
+    /// The book the answer is meant to be about. Supplied and mismatched, the
+    /// response is a **409** rather than a confident description of the wrong
+    /// novel — which is what a poll that raced a book switch used to get, and
+    /// what the tap acting on it would then have aimed at.
+    pub book: Option<String>,
 }
 
 /// Per-chapter render/pack state, memoised for 1.5 s: scanning a 1400-chapter
@@ -111,18 +123,21 @@ pub fn chapter_rows(st: &Arc<AppState>) -> Vec<ChapterRow> {
             }
         }
     }
+    let per_min = pack::bytes_per_minute(&st.cfg.chapter_bitrate);
     let mut rows = Vec::with_capacity(plan.len());
     for (ci, ch) in plan.iter().enumerate() {
         let n = ch.chunks.len();
         let have = cache::rendered_count(&cache::chapter_dir(&st.cfg.work, &key, ci), n);
         let (m4a, _) = pack::chapter_files(&st.cfg.work, &key, ci);
         let size = m4a.metadata().ok().map(|m| m.len());
+        let est_min = est.get(ci).map(|e| round1(e / 60.0));
         let mut row = ChapterRow {
             i: ci,
             title: ch.display_title(),
             n,
             rendered: have,
-            est_min: est.get(ci).map(|e| round1(e / 60.0)),
+            est_min,
+            est_bytes: est_min.map(|m| (m * per_min).round() as u64),
             m4a: size.is_some(),
             bytes: size,
             duration: None,
@@ -153,13 +168,17 @@ pub fn chapter_rows(st: &Arc<AppState>) -> Vec<ChapterRow> {
 /// m4a exists and how big it is.
 #[utoipa::path(
     get, path = "/api/chapters", tag = "chapters",
-    params(RangeQuery),
-    responses((status = 200, body = ChaptersResult))
+    params(ChaptersQuery),
+    responses((status = 200, body = ChaptersResult),
+              (status = 409, body = ApiError, description = "the session holds another book"))
 )]
 pub async fn chapters_list(
     State(st): State<Arc<AppState>>,
-    Query(range): Query<RangeQuery>,
+    Query(range): Query<ChaptersQuery>,
 ) -> Response {
+    if let Some(r) = super::session::wrong_book(&st, range.book.as_deref()) {
+        return r;
+    }
     let empty = st.session().plan.is_empty();
     if empty {
         return Json(ChaptersResult {
@@ -231,6 +250,28 @@ pub struct ChapterSetBody {
     /// `/api/chapters/build` only: rebuild even if an m4a already exists.
     #[serde(default)]
     pub force: Option<bool>,
+    /// The book these chapters belong to. **Additive, and the one worth
+    /// sending**: this is the endpoint where a race costs hours. The reader
+    /// polls `/api/chapters`, the reader taps "download the rest", and in
+    /// between the watcher may have picked up an epub, the Obsidian plugin may
+    /// have opened something, another device may have loaded another book — and
+    /// 74 chapters of rendering then land on that one. Supplied and mismatched,
+    /// this is a **409**; omitted, it means "whatever is loaded", as before.
+    #[serde(default)]
+    pub book: Option<String>,
+}
+
+/// The raw `{chapters: [...]}` list, de-duplicated and in the order given, with
+/// nothing thrown away — including the indices no chapter answers to, which is
+/// what lets `/api/chapters/build` say `out_of_range` instead of nothing.
+fn asked(body: &ChapterSetBody) -> Vec<i64> {
+    let mut seen = std::collections::HashSet::new();
+    body.chapters
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| seen.insert(*c))
+        .collect()
 }
 
 /// Validate a `{chapters: [...]}` body against the loaded book: de-duplicated,
@@ -260,12 +301,16 @@ pub struct RenderResult {
 #[utoipa::path(
     post, path = "/api/chapters/render", tag = "chapters",
     request_body = ChapterSetBody,
-    responses((status = 200, body = RenderResult), (status = 400, body = ApiError))
+    responses((status = 200, body = RenderResult), (status = 400, body = ApiError),
+              (status = 409, body = ApiError, description = "the session holds another book"))
 )]
 pub async fn chapters_render(
     State(st): State<Arc<AppState>>,
     Json(body): Json<ChapterSetBody>,
 ) -> Response {
+    if let Some(r) = super::session::wrong_book(&st, body.book.as_deref()) {
+        return r;
+    }
     match queue_chapters(&st, &body).await {
         Err(e) => e,
         Ok(r) => Json(r).into_response(),
@@ -328,6 +373,28 @@ async fn queue_chapters(
     })
 }
 
+/// One chapter the packer would not take, and why.
+///
+/// The list this belongs to is the answer to the reader's oldest complaint
+/// about this endpoint: a chapter that was not packable appeared in none of
+/// `built`/`building`/`rendering` and so was **indistinguishable from a chapter
+/// nobody asked about**. The client's only recourse was to re-ask every twenty
+/// seconds and read the next `/api/chapters` poll to find out what happened.
+/// With a reason per chapter it can tell "taken" from "not yet, and here is how
+/// far it got", and keep the re-ask for a genuine stall.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BuildRefusal {
+    pub chapter: usize,
+    /// `not_rendered` — queued for rendering instead, and `rendered`/`n` say how
+    /// far it is. `no_chunks` — the chapter has no speakable text, so there is
+    /// nothing to pack, ever. `out_of_range` — no such chapter in this book.
+    pub reason: String,
+    /// How many of the chapter's chunks are on disk, and how many there are.
+    /// Both 0 for `out_of_range`.
+    pub rendered: usize,
+    pub n: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BuildResult {
     pub ok: bool,
@@ -337,18 +404,26 @@ pub struct BuildResult {
     pub building: Vec<usize>,
     /// Not complete; queued for rendering first.
     pub rendering: Vec<usize>,
+    /// What was refused, and why — one entry per chapter this call did **not**
+    /// hand to the packer. A chapter in `rendering` appears here too, with
+    /// `not_rendered` and its progress: it was taken, but not for packing.
+    pub refused: Vec<BuildRefusal>,
 }
 
 /// Pack now what is complete, queue the rest for rendering first.
 #[utoipa::path(
     post, path = "/api/chapters/build", tag = "chapters",
     request_body = ChapterSetBody,
-    responses((status = 200, body = BuildResult), (status = 400, body = ApiError))
+    responses((status = 200, body = BuildResult), (status = 400, body = ApiError),
+              (status = 409, body = ApiError, description = "the session holds another book"))
 )]
 pub async fn chapters_build(
     State(st): State<Arc<AppState>>,
     Json(body): Json<ChapterSetBody>,
 ) -> Response {
+    if let Some(r) = super::session::wrong_book(&st, body.book.as_deref()) {
+        return r;
+    }
     let n = st.session().plan.len();
     if n == 0 {
         return err(StatusCode::BAD_REQUEST, "no book loaded");
@@ -360,15 +435,42 @@ pub async fn chapters_build(
         .unwrap_or_default();
     let force = body.force.unwrap_or(false);
     let (mut building, mut rendering, mut done) = (Vec::new(), Vec::new(), Vec::new());
+    let mut refused = Vec::new();
+    // Asked-for indices that no chapter answers to. `wanted()` drops them, and
+    // dropping them in silence is exactly the shape of failure this list is for.
+    for c in asked(&body) {
+        if c < 0 || c as usize >= n {
+            refused.push(BuildRefusal {
+                chapter: c.max(0) as usize,
+                reason: "out_of_range".into(),
+                rendered: 0,
+                n: 0,
+            });
+        }
+    }
     for c in want {
         let r = rows.iter().find(|r| r.i == c);
         match r {
             Some(r) if r.m4a && !force => done.push(c),
+            Some(r) if r.n == 0 => refused.push(BuildRefusal {
+                chapter: c,
+                reason: "no_chunks".into(),
+                rendered: 0,
+                n: 0,
+            }),
             Some(r) if r.rendered >= r.n => {
                 render::enqueue_build(&st, c);
                 building.push(c);
             }
-            _ => rendering.push(c),
+            _ => {
+                refused.push(BuildRefusal {
+                    chapter: c,
+                    reason: "not_rendered".into(),
+                    rendered: r.map(|r| r.rendered).unwrap_or(0),
+                    n: r.map(|r| r.n).unwrap_or(0),
+                });
+                rendering.push(c);
+            }
         }
     }
     if !rendering.is_empty() {
@@ -376,6 +478,7 @@ pub async fn chapters_build(
             chapters: Some(rendering.iter().map(|c| *c as i64).collect()),
             pack: Some(true),
             force: None,
+            book: None,
         };
         if let Err(e) = queue_chapters(&st, &b).await {
             return e;
@@ -386,6 +489,7 @@ pub async fn chapters_build(
         built: done,
         building,
         rendering,
+        refused,
     })
     .into_response()
 }
@@ -399,12 +503,17 @@ pub struct CancelResult {
 /// Drop chapters from the queues. An empty body clears both.
 #[utoipa::path(
     post, path = "/api/chapters/cancel", tag = "chapters",
-    request_body = ChapterSetBody, responses((status = 200, body = CancelResult))
+    request_body = ChapterSetBody,
+    responses((status = 200, body = CancelResult),
+              (status = 409, body = ApiError, description = "the session holds another book"))
 )]
 pub async fn chapters_cancel(
     State(st): State<Arc<AppState>>,
     Json(body): Json<ChapterSetBody>,
-) -> Json<CancelResult> {
+) -> Response {
+    if let Some(r) = super::session::wrong_book(&st, body.book.as_deref()) {
+        return r;
+    }
     let mut s = st.session();
     let n = s.plan.len();
     let want = body
@@ -432,4 +541,5 @@ pub async fn chapters_cancel(
         ok: true,
         queue: s.queue.clone(),
     })
+    .into_response()
 }

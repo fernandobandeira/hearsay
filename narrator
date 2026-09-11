@@ -49,6 +49,11 @@ case "$cmd" in
   # serves web/dist, so build it once after a checkout and after every UI edit.
   web)     cd web && npm ci --no-audit --no-fund && exec npm run build ;;
   openapi) cargo build --release --bin narrator >/dev/null && exec ./target/release/narrator --openapi ;;
+  # The .m4b export: a CLI path, run on the host against the work directory the
+  # server filled. `./narrator export --help` for the flags.
+  export)
+    cargo build --release --bin narrator >/dev/null
+    exec env NARRATOR_WORK="$WORK" ./target/release/narrator export "$@" ;;
   client)  exec ./scripts/gen-client.sh "$@" ;;
   listen-test)
     cargo build --release --bin listen_test

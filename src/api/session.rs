@@ -353,7 +353,11 @@ pub async fn open_chapter(State(st): State<Arc<AppState>>, Json(body): Json<Open
 /// which silently drags another book's render frontier around and can file a
 /// position under the wrong name. A 409 is a thing the reader can react to; a
 /// wrong write is not.
-fn wrong_book(st: &Arc<AppState>, asked: Option<&str>) -> Option<Response> {
+///
+/// Shared with the chapter endpoints, where the stake is highest: one tap can
+/// queue 74 chapters of rendering, and on the wrong book that is an afternoon of
+/// the worker spent on a novel nobody asked for.
+pub fn wrong_book(st: &Arc<AppState>, asked: Option<&str>) -> Option<Response> {
     let asked = cache::safe_key(asked?);
     if asked.is_empty() {
         return None;
@@ -733,6 +737,14 @@ pub struct Status {
     pub done_min: Option<f64>,
     pub disk_gb: f64,
     pub disk_cap_gb: f64,
+    /// `CHAPTER_BITRATE` as configured — `"64k"`. The reader multiplies a
+    /// chapter's estimated minutes by this to size a download before anything
+    /// has been packed; without it, it hard-codes the default and is silently
+    /// wrong by whatever ratio the box was set to.
+    pub bitrate: String,
+    /// The same number as bytes per minute of audio, so nobody has to parse the
+    /// suffix: `64k` → 480000.
+    pub bitrate_bytes_per_min: f64,
 }
 
 /// The heartbeat. It is also how the reader notices the server came back.
@@ -783,5 +795,7 @@ pub async fn status(State(st): State<Arc<AppState>>) -> Json<Status> {
         done_min: done.0.map(|d| round1(d / 60.0)),
         disk_gb: round2(done.1 as f64 / 1024.0_f64.powi(3)),
         disk_cap_gb: st.cfg.max_audio_gb,
+        bitrate: st.cfg.chapter_bitrate.clone(),
+        bitrate_bytes_per_min: crate::chapters::bytes_per_minute(&st.cfg.chapter_bitrate),
     })
 }

@@ -309,6 +309,45 @@ fn fnv1a(s: &str) -> u64 {
     h
 }
 
+/// Where the soft knee starts. Below it a sample is multiplied and nothing else
+/// happens, which is what makes `KOKORO_GAIN` a *flat* gain for all normal
+/// material: the ONNX render's loudest sample in 6.5 million was one that
+/// clipped, so at any gain at or below 1.0 this function is a plain multiply.
+const KNEE: f32 = 0.95;
+
+/// `KOKORO_GAIN`, applied post-synthesis.
+///
+/// The measured delta that motivates it: the ONNX render is uniformly ~1.4×
+/// (≈ +3 dB) louder than the PyTorch render Fernando accepted. A gain is the
+/// honest fix for that — but multiplying a waveform that already touches ±1.0
+/// and then clamping is how a flat gain becomes audible distortion on exactly
+/// the loudest words. So everything under the knee scales linearly and
+/// everything above it is compressed into the remaining headroom with a `tanh`,
+/// which is smooth, monotonic and can never leave the interval:
+///
+/// ```text
+/// |y| <= KNEE          y = g·x
+/// |y| >  KNEE          y = ±(KNEE + (1-KNEE)·tanh((|g·x| - KNEE)/(1-KNEE)))
+/// ```
+///
+/// `g == 1.0` is the identity on any sample already in range, so the default
+/// costs nothing and changes not one byte of a rendered chunk.
+pub fn apply_gain(samples: &mut [f32], gain: f32) {
+    if !gain.is_finite() || gain <= 0.0 || (gain - 1.0).abs() < f32::EPSILON {
+        return;
+    }
+    let head = 1.0 - KNEE;
+    for s in samples.iter_mut() {
+        let y = *s * gain;
+        let mag = y.abs();
+        *s = if mag <= KNEE {
+            y
+        } else {
+            y.signum() * (KNEE + head * ((mag - KNEE) / head).tanh())
+        };
+    }
+}
+
 /// f32 -> s16, the conversion `soundfile.write(path, wav, 24000)` does for a
 /// 16-bit PCM wav. Clamped, because Kokoro can overshoot by a hair.
 pub fn to_i16(samples: &[f32]) -> Vec<i16> {
@@ -346,6 +385,52 @@ mod tests {
     fn tokens_are_capped_at_the_style_pack_size() {
         let long = "a".repeat(MAX_PHONEMES + 50);
         assert_eq!(tokenize(&long).len(), MAX_PHONEMES);
+    }
+
+    #[test]
+    fn unity_gain_is_the_identity() {
+        let orig = vec![-1.0, -0.5, 0.0, 0.25, 0.9999, 1.0];
+        let mut s = orig.clone();
+        apply_gain(&mut s, 1.0);
+        assert_eq!(s, orig);
+        // And so is anything nonsensical, rather than silence.
+        for bad in [0.0, -2.0, f32::NAN, f32::INFINITY] {
+            let mut s = orig.clone();
+            apply_gain(&mut s, bad);
+            assert_eq!(s, orig, "gain {bad} should have been ignored");
+        }
+    }
+
+    #[test]
+    fn a_gain_is_flat_below_the_knee_and_never_clips_above_it() {
+        let mut s = vec![0.1, -0.2, 0.3];
+        apply_gain(&mut s, 2.0);
+        // 2 x 0.3 = 0.6, still under the knee: a plain multiply.
+        assert!((s[0] - 0.2).abs() < 1e-6);
+        assert!((s[1] + 0.4).abs() < 1e-6);
+        assert!((s[2] - 0.6).abs() < 1e-6);
+
+        // Full-scale material at a big gain is compressed, not clamped to a
+        // square wave: still inside the interval, and still distinguishable.
+        let mut loud = vec![0.8, 0.95, 1.0, -1.0];
+        apply_gain(&mut loud, 4.0);
+        for v in &loud {
+            assert!(v.abs() <= 1.0, "{v} left the interval");
+            assert!(v.abs() > KNEE, "{v} lost its loudness");
+        }
+        // Non-decreasing: well past the knee the tanh has saturated, which is
+        // the point — it is a limiter, not a clamp, and it got there smoothly.
+        assert!(loud[1] >= loud[0], "monotonic through the knee");
+        assert!(loud[2] >= loud[1], "monotonic above the knee");
+        assert!((loud[3] + loud[2]).abs() < 1e-6, "symmetric");
+
+        // The gain that actually matters: undoing the ~+3 dB delta the other
+        // way. Near-full-scale material still moves, and still fits.
+        let mut near = vec![0.9, 0.96, 1.0];
+        apply_gain(&mut near, 1.4);
+        assert!((near[0] - 1.26_f32).abs() > 0.2, "the knee did its work");
+        assert!(near.iter().all(|v| *v <= 1.0 && *v > KNEE));
+        assert!(near[1] >= near[0] && near[2] >= near[1]);
     }
 
     #[test]

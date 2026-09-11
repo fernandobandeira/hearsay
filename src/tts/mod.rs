@@ -32,6 +32,7 @@ pub struct Engine {
     voices: std::path::PathBuf,
     voice: String,
     speed: f32,
+    gain: f32,
     threads: usize,
     fake: bool,
     inner: OnceLock<Result<Loaded, String>>,
@@ -47,6 +48,7 @@ impl Engine {
             voices: cfg.kokoro_voices_dir.clone(),
             voice: cfg.kokoro_voice.clone(),
             speed: cfg.kokoro_speed,
+            gain: cfg.kokoro_gain,
             threads: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
@@ -123,7 +125,12 @@ impl Engine {
             Some(Ok(Loaded::Fake)) => Ok(kokoro::fake(text)),
             Some(Ok(Loaded::Real(k, g))) => {
                 let phonemes = g.phonemize(text)?;
-                let wav = k.synth(&phonemes)?;
+                let mut wav = k.synth(&phonemes)?;
+                // The one thing done to the model's output, and only when asked
+                // for: the ONNX render measures ~+3 dB over the PyTorch render,
+                // and `KOKORO_GAIN` is how that is answered without touching the
+                // model. At the default 1.0 this is a no-op.
+                kokoro::apply_gain(&mut wav, self.gain);
                 if wav.is_empty() {
                     // Nothing came back — a beat is a better chunk file than a
                     // zero-length wav, which the reader would happily "play" as

@@ -12,6 +12,7 @@ pub mod chapters;
 pub mod config;
 pub mod err;
 pub mod events;
+pub mod export;
 pub mod plancache;
 pub mod render;
 pub mod state;

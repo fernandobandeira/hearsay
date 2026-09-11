@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use narrator::{api, config::Config, render, state::AppState, watch};
+use narrator::{api, config::Config, export, render, state::AppState, watch};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
@@ -29,6 +29,14 @@ async fn main() -> anyhow::Result<()> {
     // curl in the runtime image for one request.
     if std::env::args().any(|a| a == "--healthcheck") {
         std::process::exit(if healthcheck() { 0 } else { 1 });
+    }
+    // `narrator export --book <file.epub>` packs the rendered chunks in the work
+    // directory into an .m4b and exits. A CLI path, like `app/export.py` was:
+    // nothing is waiting on it, it runs for minutes, and it has to work against
+    // a work dir whose server is not running.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("export") {
+        std::process::exit(run_export(&argv[1..]));
     }
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -106,6 +114,55 @@ async fn shutdown(state: Arc<AppState>) {
     state.stop.store(true, std::sync::atomic::Ordering::SeqCst);
     state.run.set();
     state.build_ev.set();
+}
+
+/// `narrator export` — print progress on stdout, problems on stderr, and return
+/// the exit code. No tracing subscriber is installed on this path, so the
+/// warnings the exporter logs are its own printed lines and nothing else.
+fn run_export(argv: &[String]) -> i32 {
+    if argv.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", export::USAGE);
+        return 0;
+    }
+    let cfg = Config::from_env();
+    let args = match export::args_from(argv, cfg.work.clone()) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("narrator export: {e}\n\n{}", export::USAGE);
+            return 2;
+        }
+    };
+    println!(
+        "packing {} from {} ...",
+        args.book.display(),
+        args.dir
+            .clone()
+            .unwrap_or_else(|| args.work.join("audio"))
+            .display()
+    );
+    match export::run(&args) {
+        Ok(r) => {
+            println!(
+                "done: {}  ({:.0} MB, {} chapters, {:.1} h{})",
+                r.out.display(),
+                r.bytes as f64 / 1e6,
+                r.chapters,
+                r.seconds / 3600.0,
+                if r.cover { ", cover embedded" } else { "" }
+            );
+            if !r.missing.is_empty() {
+                println!(
+                    "note: {} incomplete chapter(s) were left out",
+                    r.missing.len()
+                );
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("narrator export: {e}");
+            1
+        }
+    }
 }
 
 /// One loopback GET of `/healthz`. Anything other than a 200 - including no

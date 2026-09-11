@@ -31,6 +31,33 @@ export type BookIndex = {
     total_min: number;
 };
 
+/**
+ * One chapter the packer would not take, and why.
+ *
+ * The list this belongs to is the answer to the reader's oldest complaint
+ * about this endpoint: a chapter that was not packable appeared in none of
+ * `built`/`building`/`rendering` and so was **indistinguishable from a chapter
+ * nobody asked about**. The client's only recourse was to re-ask every twenty
+ * seconds and read the next `/api/chapters` poll to find out what happened.
+ * With a reason per chapter it can tell "taken" from "not yet, and here is how
+ * far it got", and keep the re-ask for a genuine stall.
+ */
+export type BuildRefusal = {
+    chapter: number;
+    n: number;
+    /**
+     * `not_rendered` — queued for rendering instead, and `rendered`/`n` say how
+     * far it is. `no_chunks` — the chapter has no speakable text, so there is
+     * nothing to pack, ever. `out_of_range` — no such chapter in this book.
+     */
+    reason: string;
+    /**
+     * How many of the chapter's chunks are on disk, and how many there are.
+     * Both 0 for `out_of_range`.
+     */
+    rendered: number;
+};
+
 export type BuildResult = {
     /**
      * Complete and handed to the packer now.
@@ -41,6 +68,12 @@ export type BuildResult = {
      */
     built: Array<number>;
     ok: boolean;
+    /**
+     * What was refused, and why — one entry per chapter this call did **not**
+     * hand to the packer. A chapter in `rendering` appears here too, with
+     * `not_rendered` and its progress: it was taken, but not for packing.
+     */
+    refused: Array<BuildRefusal>;
     /**
      * Not complete; queued for rendering first.
      */
@@ -68,6 +101,14 @@ export type ChapMeta = {
 export type ChapterRow = {
     bytes: number | null;
     duration: number | null;
+    /**
+     * What this chapter will weigh once packed, at the server's own
+     * `CHAPTER_BITRATE` — the arithmetic the client used to do with a
+     * hard-coded 64 kbit/s it could not see. `bytes` is the measured size of a
+     * chapter that exists; this is the estimate for one that does not, and it
+     * is null only when the duration estimate itself is missing.
+     */
+    est_bytes: number | null;
     est_min: number | null;
     i: number;
     /**
@@ -91,6 +132,16 @@ export type ChapterRow = {
 };
 
 export type ChapterSetBody = {
+    /**
+     * The book these chapters belong to. **Additive, and the one worth
+     * sending**: this is the endpoint where a race costs hours. The reader
+     * polls `/api/chapters`, the reader taps "download the rest", and in
+     * between the watcher may have picked up an epub, the Obsidian plugin may
+     * have opened something, another device may have loaded another book — and
+     * 74 chapters of rendering then land on that one. Supplied and mismatched,
+     * this is a **409**; omitted, it means "whatever is loaded", as before.
+     */
+    book?: string | null;
     chapters?: Array<number> | null;
     /**
      * `/api/chapters/build` only: rebuild even if an m4a already exists.
@@ -346,6 +397,18 @@ export type StampedPosition = {
 };
 
 export type Status = {
+    /**
+     * `CHAPTER_BITRATE` as configured — `"64k"`. The reader multiplies a
+     * chapter's estimated minutes by this to size a download before anything
+     * has been packed; without it, it hard-codes the default and is silently
+     * wrong by whatever ratio the box was set to.
+     */
+    bitrate: string;
+    /**
+     * The same number as bytes per minute of audio, so nobody has to parse the
+     * suffix: `64k` → 480000.
+     */
+    bitrate_bytes_per_min: number;
     book: string | null;
     book_min: number | null;
     build_error: string | null;
@@ -482,9 +545,25 @@ export type ChaptersListData = {
     query?: {
         from?: number | null;
         to?: number | null;
+        /**
+         * The book the answer is meant to be about. Supplied and mismatched, the
+         * response is a **409** rather than a confident description of the wrong
+         * novel — which is what a poll that raced a book switch used to get, and
+         * what the tap acting on it would then have aimed at.
+         */
+        book?: string | null;
     };
     url: '/api/chapters';
 };
+
+export type ChaptersListErrors = {
+    /**
+     * the session holds another book
+     */
+    409: ApiError;
+};
+
+export type ChaptersListError = ChaptersListErrors[keyof ChaptersListErrors];
 
 export type ChaptersListResponses = {
     200: ChaptersResult;
@@ -501,6 +580,10 @@ export type ChaptersBuildData = {
 
 export type ChaptersBuildErrors = {
     400: ApiError;
+    /**
+     * the session holds another book
+     */
+    409: ApiError;
 };
 
 export type ChaptersBuildError = ChaptersBuildErrors[keyof ChaptersBuildErrors];
@@ -518,6 +601,15 @@ export type ChaptersCancelData = {
     url: '/api/chapters/cancel';
 };
 
+export type ChaptersCancelErrors = {
+    /**
+     * the session holds another book
+     */
+    409: ApiError;
+};
+
+export type ChaptersCancelError = ChaptersCancelErrors[keyof ChaptersCancelErrors];
+
 export type ChaptersCancelResponses = {
     200: CancelResult;
 };
@@ -533,6 +625,10 @@ export type ChaptersRenderData = {
 
 export type ChaptersRenderErrors = {
     400: ApiError;
+    /**
+     * the session holds another book
+     */
+    409: ApiError;
 };
 
 export type ChaptersRenderError = ChaptersRenderErrors[keyof ChaptersRenderErrors];
