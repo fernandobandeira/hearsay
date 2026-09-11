@@ -3,8 +3,9 @@ import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import {VitePWA} from 'vite-plugin-pwa';
 
-// The reader is served by the FastAPI container in production; in development
-// vite serves it and proxies the API to a locally running narrator.
+// In production the Rust server hands this out at / (from /web, which the box
+// mounts over the image's copy - see the reader deploy in AGENTS.md). In
+// development vite serves it and proxies the API to a locally running server.
 const API = process.env.NARRATOR_API || 'http://localhost:7870';
 
 export default defineConfig({
