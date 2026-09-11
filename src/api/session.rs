@@ -90,6 +90,7 @@ pub struct LoadResult {
     pub key: String,
     pub total_min: f64,
     /// The stored position for this book, or null if it has never been opened.
+    #[schema(required = true)]
     pub position: Option<vault::Position>,
     pub chapters: Vec<ChapMeta>,
 }
@@ -525,6 +526,7 @@ pub struct PrerenderBody {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PrerenderResult {
     pub ok: bool,
+    #[schema(required = true)]
     pub hours: Option<f64>,
     pub chapters_ahead: usize,
 }
@@ -589,13 +591,19 @@ fn save_prerender(st: &AppState, hours: Option<f64>) {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct Status {
     pub status: String,
+    #[schema(required = true)]
     pub error: Option<String>,
     pub chapter: usize,
+    #[schema(required = true)]
     pub book: Option<String>,
+    #[schema(required = true)]
     pub title: Option<String>,
+    #[schema(required = true)]
     pub key: Option<String>,
     pub queue: Vec<usize>,
+    #[schema(required = true)]
     pub building: Option<usize>,
+    #[schema(required = true)]
     pub build_error: Option<String>,
     /// What the packer is about to do, not only what it is doing. Without it a
     /// chapter waiting to be packed looks idle.
@@ -606,14 +614,19 @@ pub struct Status {
     pub total: usize,
     pub chapters: usize,
     pub model_ready: bool,
+    #[schema(required = true)]
     pub rtf: Option<f64>,
     pub rendered_min: f64,
     pub voice: String,
+    #[schema(required = true)]
     pub prerender: Option<usize>,
     pub prerender_chapters: usize,
+    #[schema(required = true)]
     pub prerender_hours: Option<f64>,
     pub prerender_span: usize,
+    #[schema(required = true)]
     pub book_min: Option<f64>,
+    #[schema(required = true)]
     pub done_min: Option<f64>,
     pub disk_gb: f64,
     pub disk_cap_gb: f64,

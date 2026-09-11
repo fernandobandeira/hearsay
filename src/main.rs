@@ -14,6 +14,15 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `narrator --openapi` prints the contract on stdout and exits: that is what
+    // scripts/gen-client.sh feeds to @hey-api/openapi-ts, so generating the
+    // TypeScript client never needs a running server or a work directory. No
+    // subscriber is installed first, so nothing can share that stdout.
+    if std::env::args().any(|a| a == "--openapi") {
+        let (_, spec) = api::router(AppState::new(Config::from_env()));
+        println!("{}", serde_json::to_string_pretty(&spec)?);
+        return Ok(());
+    }
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             // tower_http's per-request spans are noise at info level.

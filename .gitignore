@@ -6,3 +6,5 @@
 node_modules
 /scripts/golden/.venv
 scripts/golden/.venv
+/scripts/client/node_modules
+/scripts/client/package-lock.json
