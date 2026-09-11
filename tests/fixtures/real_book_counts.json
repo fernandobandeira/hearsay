@@ -1,0 +1,208 @@
+{
+  "source_name": "7 Powers (2016).epub",
+  "source_path": "/home/fernando/git/obsidian-notes/03 - Resources/Books/Business/7 Powers (2016).epub",
+  "bundled_path": "tests/fixtures/real/7 Powers (2016).epub",
+  "size_bytes": 547560,
+  "sha256": "d16f68f276f3af3583dcfe864451480c06e50ddb2ff88547b07a5de6ec543a56",
+  "max_chars": 300,
+  "chapters": [
+    {
+      "index": 0,
+      "id": "text00000.html",
+      "title": "Praise for 7 Powers",
+      "n_chunks": 31,
+      "first_chunk_text": "PRAISE FOR 7 POWERS",
+      "last_chunk_text": "GREG HINCKLEY, PRESIDENT, MENTOR GRAPHICS CORPORATION",
+      "total_chars": 4057
+    },
+    {
+      "index": 1,
+      "id": "text00001.html",
+      "title": "7 Powers",
+      "n_chunks": 4,
+      "first_chunk_text": "7 Powers",
+      "last_chunk_text": "Foreword by Reed Hastings",
+      "total_chars": 84
+    },
+    {
+      "index": 2,
+      "id": "text00002.html",
+      "title": "Copyright",
+      "n_chunks": 13,
+      "first_chunk_text": "Copyrighted Material",
+      "last_chunk_text": "Cover and Interior design: Irene Young and Carol Ehrlich",
+      "total_chars": 770
+    },
+    {
+      "index": 3,
+      "id": "text00003.html",
+      "title": "Table of Contents",
+      "n_chunks": 17,
+      "first_chunk_text": "TABLE OF CONTENTS",
+      "last_chunk_text": "Chapter Notes",
+      "total_chars": 383
+    },
+    {
+      "index": 4,
+      "id": "text00004.html",
+      "title": "Foreword by Reed Hastings",
+      "n_chunks": 33,
+      "first_chunk_text": "FOREWORD",
+      "last_chunk_text": "— Reed Hastings CEO and Co-Founder of Netflix",
+      "total_chars": 6564
+    },
+    {
+      "index": 5,
+      "id": "text00005.html",
+      "title": "Dedication",
+      "n_chunks": 1,
+      "first_chunk_text": "This book is dedicated to my family—the joy of my life",
+      "last_chunk_text": "This book is dedicated to my family—the joy of my life",
+      "total_chars": 54
+    },
+    {
+      "index": 6,
+      "id": "text00006.html",
+      "title": "Introduction",
+      "n_chunks": 115,
+      "first_chunk_text": "INTRODUCTION",
+      "last_chunk_text": "13",
+      "total_chars": 19259
+    },
+    {
+      "index": 7,
+      "id": "text00007.html",
+      "title": "P A R T I",
+      "n_chunks": 2,
+      "first_chunk_text": "P A R T I",
+      "last_chunk_text": "STRATEGY STATICS",
+      "total_chars": 25
+    },
+    {
+      "index": 8,
+      "id": "text00008.html",
+      "title": "Chapter 1: Scale Economies",
+      "n_chunks": 101,
+      "first_chunk_text": "C H A P T E R 1",
+      "last_chunk_text": "Surplus Leader Margin: What governs S’s margins if P is set Э W π = 0?",
+      "total_chars": 15089
+    },
+    {
+      "index": 9,
+      "id": "text00009.html",
+      "title": "Chapter 2: Network Economies",
+      "n_chunks": 72,
+      "first_chunk_text": "C H A P T E R 2",
+      "last_chunk_text": "Some comments on Network Economies:",
+      "total_chars": 9089
+    },
+    {
+      "index": 10,
+      "id": "text00010.html",
+      "title": "Chapter 3: Counter-Positioning",
+      "n_chunks": 141,
+      "first_chunk_text": "C H A P T E R 3",
+      "last_chunk_text": "…It has no plans to bring the service to the US, its biggest market, because of potential overlaps with the many agreements it has with cable and satellite companies that distribute its film and television content.",
+      "total_chars": 22153
+    },
+    {
+      "index": 11,
+      "id": "text00011.html",
+      "title": "Chapter 4: Switching Costs",
+      "n_chunks": 89,
+      "first_chunk_text": "C H A P T E R 4",
+      "last_chunk_text": "What governs S’s margins if P is set Э W π = 0 ?",
+      "total_chars": 13287
+    },
+    {
+      "index": 12,
+      "id": "text00012.html",
+      "title": "Chapter 5: Branding",
+      "n_chunks": 96,
+      "first_chunk_text": "C H A P T E R 5",
+      "last_chunk_text": "Figure 5.6: Branding as a Function of Time, with Different Compression Factors",
+      "total_chars": 12710
+    },
+    {
+      "index": 13,
+      "id": "text00013.html",
+      "title": "Chapter 6: Cornered Resource",
+      "n_chunks": 127,
+      "first_chunk_text": "C H A P T E R 6",
+      "last_chunk_text": "For the Surplus Leader Margin (SLM) we assess:",
+      "total_chars": 20012
+    },
+    {
+      "index": 14,
+      "id": "text00014.html",
+      "title": "Chapter 7: Process Power",
+      "n_chunks": 107,
+      "first_chunk_text": "C H A P T E R 7",
+      "last_chunk_text": "Figure 7.6: Process Power as a Function of Time",
+      "total_chars": 18479
+    },
+    {
+      "index": 15,
+      "id": "text00015.html",
+      "title": "P A R T I I",
+      "n_chunks": 2,
+      "first_chunk_text": "P A R T I I",
+      "last_chunk_text": "STRATEGY DYNAMICS",
+      "total_chars": 28
+    },
+    {
+      "index": 16,
+      "id": "text00016.html",
+      "title": "Chapter 8: The Path to Power",
+      "n_chunks": 213,
+      "first_chunk_text": "C H A P T E R 8",
+      "last_chunk_text": "This provides additional assurance in its utility as a cognitive frame for business leaders in their crucial “value moments,” which are also inevitably high flux.",
+      "total_chars": 34667
+    },
+    {
+      "index": 17,
+      "id": "text00017.html",
+      "title": "Chapter 9: The Power Progression",
+      "n_chunks": 223,
+      "first_chunk_text": "C H A P T E R 9",
+      "last_chunk_text": "This would equal m in the Fundamental Equation of Strategy if the firm without Power experienced competitive arbitrage that resulted in its earning just its cost of capital and that the cost of capital for the firm with Power was equal to the cost of capital of the firm without Power.",
+      "total_chars": 35471
+    },
+    {
+      "index": 18,
+      "id": "text00018.html",
+      "title": "Acknowledgments",
+      "n_chunks": 35,
+      "first_chunk_text": "ACKNOWLEDGMENTS",
+      "last_chunk_text": "My son Andrew carefully read over the whole book, flagging numerous typos, but also helping to refine the reasoning in several spots. I have been blessed with their love and support.",
+      "total_chars": 6772
+    },
+    {
+      "index": 19,
+      "id": "text00019.html",
+      "title": "Bibliography",
+      "n_chunks": 4,
+      "first_chunk_text": "BIBLIOGRAPHY",
+      "last_chunk_text": "Professor Michael Porter of Harvard University ( http://​www.​hbs​.edu​/faculty​/Pages​/profile​.aspx​?facId​=​6532 ) and Professor David Teece of the University of California at Berkeley ( http://​facultybio.​haas​.berkeley​.edu/​faculty​-list​/teece​-david ).",
+      "total_chars": 666
+    },
+    {
+      "index": 20,
+      "id": "text00020.html",
+      "title": "Chapter Notes",
+      "n_chunks": 145,
+      "first_chunk_text": "CHAPTER NOTES",
+      "last_chunk_text": "113 This quality also underlies the investment results discussed in Appendix 8.1.",
+      "total_chars": 16822
+    },
+    {
+      "index": 21,
+      "id": "text00021.html",
+      "title": "About the Author",
+      "n_chunks": 6,
+      "first_chunk_text": "ABOUT THE AUTHOR",
+      "last_chunk_text": "More information may be found at www.7powers.com .",
+      "total_chars": 959
+    }
+  ]
+}

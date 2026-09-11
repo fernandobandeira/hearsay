@@ -1,0 +1,26 @@
+{
+  "/books/Business/7 Powers (2016).epub": {
+    "chapter": 3,
+    "chapters_total": 12,
+    "chapter_title": "Counter-Positioning",
+    "chunk": 41,
+    "chunks_total": 188,
+    "updated": "2026-09-02T08:15:00"
+  },
+  "/books/Philosophy/Преступление и наказание (1866).epub": {
+    "chapter": 0,
+    "chapters_total": 40,
+    "chapter_title": "Часть первая — глава I",
+    "chunk": 0,
+    "chunks_total": 97,
+    "updated": "2026-09-10T23:59:59"
+  },
+  "/books/Technology/Weird [draft] | v2 (2024).epub": {
+    "chapter": 7,
+    "chapters_total": 9,
+    "chapter_title": "A | piped ] title",
+    "chunk": 2,
+    "chunks_total": 3,
+    "updated": "2026-09-08T12:00:00"
+  }
+}
