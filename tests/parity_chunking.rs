@@ -245,8 +245,19 @@ fn real_book_path(f: &RealCounts) -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
+// The real-book fixtures (counts, head plan, and the epub itself) carry text
+// from a commercial book, so they are never committed - these two tests run
+// only on a machine where scripts/golden regenerated them locally.
+fn real_fixtures_present() -> bool {
+    fixtures().join("real_book_counts.json").exists()
+}
+
 #[test]
 fn a_real_book_chunks_identically_to_python() {
+    if !real_fixtures_present() {
+        eprintln!("skipping: real-book fixtures not present (local-only, never committed)");
+        return;
+    }
     let want: RealCounts = read_json("real_book_counts.json");
     let Some(path) = real_book_path(&want) else {
         eprintln!("skipping: {} not bundled", want.source_name);
@@ -313,6 +324,10 @@ fn a_real_book_chunks_identically_to_python() {
 
 #[test]
 fn the_first_chapters_of_a_real_book_match_chunk_for_chunk() {
+    if !real_fixtures_present() {
+        eprintln!("skipping: real-book fixtures not present (local-only, never committed)");
+        return;
+    }
     let counts: RealCounts = read_json("real_book_counts.json");
     let Some(path) = real_book_path(&counts) else {
         eprintln!("skipping: {} not bundled", counts.source_name);
