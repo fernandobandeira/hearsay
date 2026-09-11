@@ -1,0 +1,20 @@
+# /etc/systemd/system/hearsay-web-update.timer — template, applied by hand.
+#   sudo systemctl enable --now hearsay-web-update.timer
+#
+# Ten minutes is the worst case between a green `web` workflow and the reader
+# being live; `systemctl start hearsay-web-update` is the same thing now. On
+# boot it runs early, so a box that was off while a UI change shipped comes up
+# with it rather than serving the previous one until the first interval.
+[Unit]
+Description=check for a new HearSay reader build every ten minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+AccuracySec=30s
+# The pull is a few hundred KB, but every box on the internet asking a registry
+# on the same tick is how rate limits get hit.
+RandomizedDelaySec=60s
+
+[Install]
+WantedBy=timers.target

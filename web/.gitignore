@@ -1,0 +1,7 @@
+node_modules
+# The build is no longer vendored: source lives here and CI builds it into the
+# hearsay-web image. A dist/ in the tree would shadow it in the Docker stage.
+dist
+dist-ssr
+*.tsbuildinfo
+*.local

@@ -1,0 +1,88 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* narrator is a reader: near-black, one accent, nothing that glows. The palette
+   is the one the hand-written UI settled on, moved into shadcn's token names so
+   the components inherit it instead of fighting it. */
+:root {
+  --radius: 0.5rem;
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.955 0 0);
+  --card: oklch(0.16 0 0);
+  --card-foreground: oklch(0.955 0 0);
+  --popover: oklch(0.17 0 0);
+  --popover-foreground: oklch(0.955 0 0);
+  --primary: oklch(0.92 0 0);
+  --primary-foreground: oklch(0.16 0 0);
+  --secondary: oklch(0.24 0 0);
+  --secondary-foreground: oklch(0.92 0 0);
+  --muted: oklch(0.24 0 0);
+  --muted-foreground: oklch(0.62 0 0);
+  --accent: oklch(0.26 0 0);
+  --accent-foreground: oklch(0.955 0 0);
+  --destructive: oklch(0.62 0.11 27);
+  --border: oklch(0.26 0 0);
+  --input: oklch(0.26 0 0);
+  --ring: oklch(0.5 0 0);
+  --narrator-ok: oklch(0.66 0.07 150);
+  --narrator-work: oklch(0.68 0.07 245);
+  --narrator-part: oklch(0.7 0.08 85);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-ok: var(--narrator-ok);
+  --color-work: var(--narrator-work);
+  --color-part: var(--narrator-part);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --font-sans: Geist, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* Radix's scroll area wraps its content in a `display: table` div, which
+   shrink-wraps to the widest row instead of to the viewport. A long chapter
+   title therefore pushed that row's state badge off the right-hand edge, where
+   nobody could ever see it - the states were being rendered and never shown.
+   Pinning the wrapper to the viewport's width is what makes `truncate` and
+   `flex-1` mean anything inside a scroll area - and a width alone will not do
+   it, because an auto-layout table may not be narrower than its min-content, so
+   `table-layout: fixed` is the half that actually binds. */
+[data-slot='scroll-area-viewport'] > div {
+  width: 100% !important;
+  table-layout: fixed;
+}
+
+@layer base {
+  * { @apply border-border outline-ring/50; }
+  html, body, #root { height: 100%; }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    margin: 0;
+    overflow: hidden;
+    font-weight: 300;
+    text-rendering: optimizeLegibility;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+}

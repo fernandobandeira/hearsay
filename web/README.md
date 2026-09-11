@@ -1,10 +1,27 @@
-# web/ — the reader's slot
+# web/ — the reader
 
-A placeholder page, not the reader. The real one is the Vite + React + Tailwind
-app in `~/git/narrator/web`, which still calls the python server's hand-written
-`src/lib/api.ts`. Porting it onto the generated client
-(`scripts/gen-client.sh` → `client/`) is the integration step; when that
-happens this directory holds the app and the Dockerfile's `web` stage builds it
-with `npm ci && npm run build` instead of copying the placeholder through.
+The Vite + React + Tailwind PWA the server hands out at `/`. It lives here now;
+the build is **not** vendored (it used to be, copied out of the python repo — see
+`AGENTS.md`).
 
-`NARRATOR_WEB` points the server at a built copy somewhere else.
+```bash
+npm ci
+npm run dev        # vite on :5173, proxying /api to NARRATOR_API (default :7870)
+npm run build      # tsc -b && vite build → dist/
+npm test           # vitest
+```
+
+Two images are built from this directory:
+
+- **`ghcr.io/fernandobandeira/hearsay`** — the server. Its Dockerfile's `web`
+  stage builds `dist/` and bakes it into the image at `/web`, so the server image
+  is self-contained.
+- **`ghcr.io/fernandobandeira/hearsay-web`** — `web/Dockerfile`: the same `dist/`
+  and nothing else (`FROM scratch`, contents at `/dist`). The box's
+  `hearsay-web-update.timer` pulls it and lays the files into `/home/ubuntu/web`,
+  which the server mounts over its baked-in copy. That is what makes a UI change
+  a 10-minute file swap instead of a Rust rebuild.
+
+`placeholder/` is the page the server falls back to when there is no build at
+all. `RUST-NOTES.md` is the requirement list this reader wrote against the python
+server; the server sections of `AGENTS.md` answer it point by point.

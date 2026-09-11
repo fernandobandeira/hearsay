@@ -7,4 +7,5 @@ listen-test
 scripts/golden/.venv
 scripts/client/node_modules
 web/node_modules
+web/dist
 .git

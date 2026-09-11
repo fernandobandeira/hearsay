@@ -1,0 +1,61 @@
+# Build the reader and publish it as a *content* image: ghcr.io/…/hearsay-web,
+# a scratch image whose whole filesystem is /dist. The box's
+# hearsay-web-update.timer pulls it every ten minutes and lays the files into
+# /home/ubuntu/web, which the server mounts read-only over the copy baked into
+# its own image. So a UI change ships in minutes without recompiling the server.
+#
+# Two architectures, because the box is arm64 and a matching manifest spares it
+# a --platform flag; the node stage is pinned to $BUILDPLATFORM (see
+# web/Dockerfile), so it runs once natively and the second manifest is metadata.
+name: web
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'web/**'
+      - '.github/workflows/web.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}-web
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm --prefix web ci --no-audit --no-fund
+      - run: npm --prefix web test
+      - run: npm --prefix web exec -- tsc -b --force
+      - run: npm --prefix web run build
+
+  build:
+    # Same rule as the server: the image only exists on green.
+    needs: [test]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./web
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:latest
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web

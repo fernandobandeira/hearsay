@@ -31,13 +31,14 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `scripts/golden/` | Generates the Python golden fixtures (uv + ebooklib + bs4) the parity tests assert against. |
 | `scripts/gen-client.sh`, `scripts/drift-check.mjs` | OpenAPI → typed TS client, and the drift gate against the reader's hand-written types. |
 | `listen-test/` | GATE 0: the ONNX engine rendered against the PyTorch render Fernando accepted. |
-| `web/dist/` | **The built reader, vendored.** The Vite/React app is still developed in `~/git/narrator/web`; `./narrator sync-web` copies its `dist/` here so the image can be built on the VPS without that repo or a node tree. `web/placeholder/` is the fallback page when there is no build at all. |
+| `web/` | **The reader itself** — the Vite/React/Tailwind PWA, source and all. It moved in from the python repo; the build is no longer vendored (`web/.gitignore` ignores `dist/`), because two images are built from this tree now. See [the two images](#two-images-server-and-reader). `web/placeholder/` is the fallback page when there is no build at all. |
 | `deploy/` | systemd templates for the Oracle A1 — **applied by hand, never by a playbook**, like the python repo's. |
 
 ## Running it
 
 ```bash
 ./narrator models        # fetch Kokoro + whisper weights into ./models (~900 MB)
+./narrator web           # npm ci && npm run build in web/ (dev serves web/dist)
 ./narrator dev           # cargo run, serving ./web and ./work
 ./narrator build && ./narrator up     # docker, port 7870 on localhost only
 ./narrator test          # the whole suite: 86 tests, no model, no network
@@ -110,8 +111,7 @@ Every path, method, field name, type and nullability of the Python contract, ass
 
 ## What this server does that the Python one does not
 
-`~/git/narrator/web/RUST-NOTES.md` is a list of requirements the person porting
-the reader wrote against the Python server, each with the client-side mitigation
+`web/RUST-NOTES.md` is a list of requirements the reader wrote against the Python server, each with the client-side mitigation
 standing in for it meanwhile. All six are implemented here, all six are
 **additive** — a client that sends none of the new parameters gets exactly the
 Python behaviour, which is what keeps the Obsidian plugin working untouched —
@@ -155,7 +155,7 @@ Handlers carry `#[utoipa::path]` and every request/response is a typed struct, s
 ./scripts/gen-client.sh                              # spec → client/ → drift check
 ```
 
-`scripts/gen-client.sh` runs `@hey-api/openapi-ts` (pinned in `scripts/client/package.json`) into `client/`, then `scripts/drift-check.mjs` compares the generated types field by field against `~/git/narrator/web/src/lib/types.ts` using the TypeScript compiler's own assignability. It exits non-zero on a **MISMATCH** — something that would break the reader — and merely reports additive fields.
+`scripts/gen-client.sh` runs `@hey-api/openapi-ts` (pinned in `scripts/client/package.json`) into `client/`, then `scripts/drift-check.mjs` compares the generated types field by field against the reader's own `web/src/lib/types.ts` using the TypeScript compiler's own assignability. It exits non-zero on a **MISMATCH** — something that would break the reader — and merely reports additive fields.
 
 That check earned its keep on its first run: 29 mismatches, all real. utoipa renders `Option<T>` as both nullable *and* absent from `required`, while serde without `skip_serializing_if` always sends the key — so the spec was lying about eleven `Status` fields. Fixed with `#[schema(required = true)]` and `value_type` overrides on the fields the server genuinely always sends. **The rule: if serde will always serialize it, say so in the schema.** Current state: 0 mismatches, 0 missing endpoints, 3 additive fields.
 
@@ -218,6 +218,32 @@ A value that will not parse logs a warning and falls back. A typo in an env var 
 
 ## Docker
 
+### Two images, server and reader
+
+The repo publishes **two** images to GHCR, and the split exists for one reason:
+the server takes the better part of an hour to build (whisper.cpp, twice, for
+amd64 and arm64) and the reader takes eight seconds. Fernando edits the reader
+far more often than the server, and a CSS fix should not wait on a Rust
+compiler.
+
+| Image | Built by | What it is |
+|---|---|---|
+| `ghcr.io/fernandobandeira/hearsay` | `Dockerfile`, `.github/workflows/release.yml` | The server. Multi-arch, built natively on both runners. Its node stage still builds `web/`, so the image carries a reader at `/web` and `docker run`ing it alone is a whole working thing. |
+| `ghcr.io/fernandobandeira/hearsay-web` | `web/Dockerfile`, `.github/workflows/web.yml` | The reader's `dist/`, and nothing else: `FROM scratch`, contents at `/dist`, ~600 KB. Not runnable — it is a file delivery mechanism with a registry in front of it. |
+
+`release.yml` carries `paths-ignore: web/**` and `web.yml` carries
+`paths: web/**`, so a push touches one pipeline or the other. Both are
+test-gated identically: the image only builds on green (the reader's gate is
+`vitest` + `tsc -b`, and `release.yml` runs those too, because a reader that
+does not typecheck is a server image that does not build).
+
+`hearsay-web` is built for both architectures even though its payload is
+architecture-free — the node stage is pinned to `$BUILDPLATFORM` so it runs once
+natively, and the second manifest is pure metadata. The cost is nil and the box
+(arm64) pulls without a `--platform` flag or a platform-mismatch warning.
+
+### The server image
+
 Three stages: node builds the reader, cargo builds the server behind a manifest-only dependency layer (so a source edit does not recompile whisper.cpp, which is most of the build), and a `debian:bookworm-slim` runtime carrying one binary plus ffmpeg, espeak-ng and `libgomp1` (ONNX Runtime's CPU provider is OpenMP-threaded). 583 MB.
 
 `HEALTHCHECK` is `narrator --healthcheck`: one loopback GET of `/healthz` written against a `TcpStream`, rather than putting curl in the runtime image for a single request.
@@ -266,17 +292,56 @@ The work dir and the vault are **adopted in place**: same cache paths, same
 re-rendered and no position moves — that is what the parity suites above are
 for.
 
+### Deploying the reader
+
+The unit mounts `-v /home/ubuntu/web:/web:ro` over the reader baked into the
+server image, so what the box actually serves is a directory of files on disk.
+`deploy/hearsay-web-update.{sh,service,timer}` keep that directory current:
+
+    pull hearsay-web:latest → compare the image id to /var/lib/hearsay/web.digest
+    → unchanged? exit
+    → changed? docker create (never started) · docker cp /dist → a staging dir
+      · chown ubuntu:ubuntu · rsync into /home/ubuntu/web · stamp the digest
+
+Every ten minutes, plus two minutes after boot. **So a UI deploy is `git push`**
+— web.yml builds and pushes the image, the timer lays it down within ten
+minutes, and `sudo systemctl start hearsay-web-update` on the box is the same
+thing now.
+
+Three details that are load-bearing, not taste:
+
+- **The contents are synced, the directory is not replaced.** `/home/ubuntu/web`
+  is a bind-mount *source*: the running container holds the inode it started
+  with, so a `mv` of a freshly built directory into place would leave the server
+  serving files nobody can reach. rsync writes each file to a temp name and
+  renames it, so an update is atomic per file with the container none the wiser
+  — and narrator-rs is never restarted for a UI change.
+- **An empty directory is an empty reader.** The mount shadows the image's copy
+  unconditionally; the server does not fall back. The updater refuses to install
+  anything without an `index.html`.
+- **Offline is not a failure.** A pull it cannot do logs a line and exits 0. The
+  box keeps serving what it has, and picks the change up on a later tick.
+
+Install (by hand, like everything else in `deploy/`):
+
+```bash
+sudo install -m 0755 hearsay-web-update.sh /usr/local/bin/
+sudo cp hearsay-web-update.service hearsay-web-update.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now hearsay-web-update.timer
+```
+
 ## What is still missing before this can replace production
 
 1. **arm64.** The image has never been built for aarch64: this box has no qemu binfmt registered and no cross toolchain. The two risky dependencies both look fine on paper — `ort` ships a prebuilt ONNX Runtime 1.22.0 for `aarch64-unknown-linux-gnu` (confirmed fetchable), and whisper.cpp's primary target *is* ARM — but "looks fine" is not a build. Do it on the Oracle A1, or `docker run --privileged tonistiigi/binfmt --install arm64` here first.
-2. **The web reader.** Still the Python repo's app, still calling its hand-written `api.ts`. The generated client is ready and drift-clean; porting it is mechanical except for three things the drift report names: `ChapRow` → `ChapterRow`, the SDK's `{data, error, response}` envelope replacing the reader's `get()`/`post()` helpers, and the binary endpoints (`.m4a`, `.m3u8`) which must stay plain URL builders because they feed `<audio src>` and Cache Storage.
+2. **The reader on the generated client.** The app lives in `web/` now, but it still calls the server through its hand-written `api.ts`. The generated client is ready and drift-clean; porting it is mechanical except for three things the drift report names: `ChapRow` → `ChapterRow`, the SDK's `{data, error, response}` envelope replacing the reader's `get()`/`post()` helpers, and the binary endpoints (`.m4a`, `.m3u8`) which must stay plain URL builders because they feed `<audio src>` and Cache Storage.
 3. **A real-book soak.** The longest run so far is a few minutes. *Lord of Mysteries* is 1433 chapters; the things that only show up there are memory growth across thousands of ONNX sessions, the `/api/chapters` scan under a full cache, and gc churn at the 5 GB cap.
 4. **The listening verdict.** GATE 0 is rendered and waiting; nothing should deploy until Fernando has compared the two wavs, and the loudness delta above is decided one way or the other.
 5. **`.m4b` export.** `app/export.py` has no port yet. It is a CLI path, not a server one, and the Python script runs on the host with nothing but python3 and ffmpeg — so it still works against this server's cache unchanged.
 
 ## Rules
 
-- **Never edit `~/git/narrator`.** It is the reference and it is someone else's working tree.
+- **Never edit `~/git/narrator`.** It is the reference and it is someone else's working tree — including its `web/`, which is now a historical copy of this repo's reader. The reader is edited **here**.
+- **This repo is public.** Anything committed is on the internet: no tailnet addresses, no hostnames, no tokens, no vault contents. The reader talks to the API by relative path and has nothing to leak; keep it that way.
 - **Never touch production.** The VPS is deployed by hand.
 - No `unwrap()` or `expect()` outside tests and the startup path. Errors are typed (`thiserror`), the edges use `anyhow`, and every failure path logs and degrades.
 - `cargo fmt` and `cargo clippy --all-targets -- -D warnings` are clean, and stay clean.

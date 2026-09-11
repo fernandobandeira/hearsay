@@ -17,15 +17,18 @@ FROM node:22-slim AS web
 WORKDIR /build
 # Three ways this stage can get a reader, in order of preference:
 #
-#   1. `web/package.json` - the Vite app itself lives here, so build it.
-#   2. `web/dist/` - the build is vendored (scripts/sync-web.sh copies it out of
-#      ~/git/narrator/web/dist). This is the current arrangement: the reader is
-#      still developed in the python repo, and the VPS must be able to build
-#      this image without that repo or a node_modules tree.
+#   1. `web/package.json` - the Vite app itself lives here, so build it. This is
+#      the arrangement now: the reader's source is in this repo, so the server
+#      image is self-contained and a checkout is all a build needs.
+#   2. `web/dist/` - a vendored build, which is what this was before the reader
+#      moved in. Nothing produces one today; the branch stays because a tarball
+#      of a dist is still a legitimate way to hand this image a reader.
 #   3. neither - the placeholder page, so the server still answers on /.
 #
-# Node is only actually needed for (1); the stage is cheap in the other two and
-# keeps one place where "where does /web come from" is answered.
+# The reader that actually runs on the box comes from the *other* image,
+# ghcr.io/fernandobandeira/hearsay-web (see web/Dockerfile), laid into
+# /home/ubuntu/web and mounted over this one. What is baked in here is the
+# fallback, and the reason `docker run` of this image alone is a whole reader.
 COPY web/ ./
 RUN set -eux; \
     if [ -f package.json ]; then \

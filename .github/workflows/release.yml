@@ -7,6 +7,15 @@ name: release
 on:
   push:
     branches: [master]
+    # The reader has its own image and its own workflow (web.yml). A UI-only
+    # push has no business spending an hour recompiling whisper.cpp twice - and
+    # the box would not pick the result up anyway: it reads the reader from the
+    # hearsay-web image, not from this one. The server image still *builds*
+    # web/ (its Dockerfile's node stage), so the fallback baked into it is
+    # whatever the tree held at the last server build. That is the point of a
+    # fallback.
+    paths-ignore:
+      - 'web/**'
   workflow_dispatch:
 
 permissions:
@@ -28,6 +37,16 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # The reader too: the server image's node stage builds web/, so a reader
+      # that does not typecheck is a server image that does not build.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm --prefix web ci --no-audit --no-fund
+      - run: npm --prefix web test
+      - run: npm --prefix web exec -- tsc -b --force
 
   build:
     # A failing test must block the publish - the image only builds on green.

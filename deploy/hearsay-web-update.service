@@ -1,0 +1,21 @@
+# /etc/systemd/system/hearsay-web-update.service — template, applied by hand.
+#
+#   sudo install -m 0755 hearsay-web-update.sh /usr/local/bin/
+#   sudo cp hearsay-web-update.service hearsay-web-update.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hearsay-web-update.timer
+#
+# Force a UI deploy without waiting for the timer:
+#   sudo systemctl start hearsay-web-update
+[Unit]
+Description=install the newest HearSay reader build into /home/ubuntu/web
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hearsay-web-update.sh
+# The pull is the slow part and it is already bounded by docker's own timeouts;
+# this is the backstop against a hung registry keeping the timer's next run out.
+TimeoutStartSec=600

@@ -2,7 +2,7 @@
 /**
  * Drift check: the React reader's hand-written contract vs. the generated client.
  *
- * The reader in ~/git/narrator/web wrote the server's API down by hand, in
+ * The reader (`web/`) wrote the server's API down by hand, in
  * `src/lib/types.ts` and `src/lib/api.ts`. This Rust server is supposed to be a
  * drop-in replacement for the Python one those types describe. So the question
  * this script answers is narrow and mechanical:
@@ -25,7 +25,7 @@
  *   ADDITIVE  — fields only the generated type has. The server grew; the
  *               reader ignores them. Not a failure.
  *
- * Nothing under ~/git/narrator is ever written to. It is read as the contract.
+ * The reader's files are read, never written: they are the contract.
  *
  * Usage: node scripts/drift-check.mjs
  * Exit:  0 when there are no mismatches and no missing endpoints, 1 otherwise.
@@ -43,9 +43,8 @@ const GEN_TYPES = path.join(CLIENT_DIR, 'types.gen.ts');
 const SPEC = path.join(REPO, 'openapi.json');
 const REPORT = path.join(CLIENT_DIR, 'DRIFT.md');
 
-/** The reader. Read-only, always — it belongs to the other repo. */
-const READER = process.env.NARRATOR_WEB ??
-  path.resolve(process.env.HOME ?? '~', 'git/narrator/web/src/lib');
+/** The reader. Read-only, always: this compares against it, it does not fix it. */
+const READER = process.env.NARRATOR_WEB ?? path.join(REPO, 'web', 'src', 'lib');
 const HAND_TYPES = path.join(READER, 'types.ts');
 const HAND_API = path.join(READER, 'api.ts');
 

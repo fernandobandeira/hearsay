@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The one entry point, mirroring ~/git/narrator's CLI so the muscle memory
 # carries over: build | up | down | logs | status | test | models | openapi |
-# client | listen-test | shell.
+# client | listen-test | shell | web.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -45,7 +45,9 @@ case "$cmd" in
   test)    exec cargo test "$@" ;;
   lint)    cargo fmt --check && exec cargo clippy --all-targets -- -D warnings ;;
   models)  exec ./scripts/fetch-models.sh ;;
-  sync-web) exec ./scripts/sync-web.sh ;;
+  # The reader lives in web/ now and its build is not committed: `./narrator dev`
+  # serves web/dist, so build it once after a checkout and after every UI edit.
+  web)     cd web && npm ci --no-audit --no-fund && exec npm run build ;;
   openapi) cargo build --release --bin narrator >/dev/null && exec ./target/release/narrator --openapi ;;
   client)  exec ./scripts/gen-client.sh "$@" ;;
   listen-test)
