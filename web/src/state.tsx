@@ -175,15 +175,17 @@ export function NarratorProvider({children}: {children: ReactNode}) {
      EventSource, a stream the proxy will not pass) and the tiebreaker while the
      stream is still opening. "reconnecting" is the middle state: something is
      being retried, nothing is wrong yet, so the UI says so quietly. */
-  const conn: ConnState = !onlineManager.isOnline()
-    ? 'offline'
-    : live === 'live'
-      ? 'online'
-      : status.isError || status.failureCount >= 2
-        ? 'offline'
-        : live === 'connecting' && status.isSuccess && !status.failureCount
-          ? 'online'
-          : 'reconnecting';
+  const conn: ConnState =
+    !onlineManager.isOnline() || status.isError || status.failureCount >= 2
+      ? 'offline'
+      // Either signal being healthy is enough to be connected: the stream proves
+      // it from the server's end, and the heartbeat covers the case where the
+      // stream itself cannot be established (an old browser, a proxy that will
+      // not pass text/event-stream). Only "neither is working yet" is the middle
+      // state, and it is the only one that says reconnecting.
+      : live === 'live' || (status.isSuccess && !status.failureCount)
+        ? 'online'
+        : 'reconnecting';
 
   // ---------------------------------------------------------------- the player
   const goChapterRef = useRef<(d: number) => void>(() => {});

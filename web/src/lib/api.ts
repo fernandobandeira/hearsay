@@ -164,7 +164,9 @@ export function useChapters(enabled: boolean, book: string | null) {
     queryFn: () => call(sdk.chaptersList({query: {book: book ?? undefined}})),
     refetchInterval: enabled ? 2_000 : false,
     enabled,
-    retry: 1,
+    // One retry, and none at all for a refusal: a 409 says the server is holding
+    // another book, and asking again two milliseconds later will say so again.
+    retry: (count, e) => count < 1 && isRetryable(e instanceof ApiError ? e.status : 0),
   });
 }
 
