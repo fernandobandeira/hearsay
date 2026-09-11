@@ -34,10 +34,11 @@ import {Progress} from '@/components/ui/progress';
 import {ScrollArea} from '@/components/ui/scroll-area';
 import {Skeleton} from '@/components/ui/skeleton';
 import {useQueryClient} from '@tanstack/react-query';
-import {get, keys, useChapterActions, useChapters} from '@/lib/api';
+import {fetchChapters, keys, useChapterActions, useChapters} from '@/lib/api';
 import {chapterState, type ChapterStateKey, type Job} from '@/lib/chapterstate';
 import {
-  anyEstimated, estimateBytes, isAction, jobFor, needsRender, phaseFor,
+  anyEstimated, buildVerdict, estimateBytes, isAction, jobFor, needsRender, phaseFor,
+  renderAccepted, rowSignature, shouldReask,
 } from '@/lib/download';
 import {centeredScrollTop, scrollTargetIndex} from '@/lib/drawernav';
 import {chosen, idle, rangeAfter, reduce} from '@/lib/selection';
@@ -45,7 +46,7 @@ import {cachedChapters, downloadChapter, removeChapter} from '@/lib/offline';
 import {bytes as fmtBytes} from '@/lib/format';
 import {cn} from '@/lib/utils';
 import {useNarrator} from '@/state';
-import type {ChapRow, ChaptersResult} from '@/lib/types';
+import type {ChapRow, RenderResult} from '@/lib/types';
 
 /** One icon per state, so a glance down the list reads as a picture. */
 const ICON: Record<ChapterStateKey, typeof Check> = {
@@ -69,8 +70,13 @@ export function ChapterManager({open, active, onPick}: {
 }) {
   const n = useNarrator();
   const qc = useQueryClient();
-  const {data, isPending} = useChapters(open && !!n.book);
-  const actions = useChapterActions();
+  /* Every call here names the book. The server refuses (409) anything aimed at a
+     book it is not holding, which is what closed the one race this drawer could
+     not close itself: the poll says chapter 74 needs rendering, the server picks
+     up a new epub, the tap lands on the other novel. */
+  const book = n.book?.key ?? null;
+  const {data, isPending} = useChapters(open && !!n.book, book);
+  const actions = useChapterActions(book);
   const [sel, dispatch] = useReducer(reduce, idle);
   const [filter, setFilter] = useState('');
   const [jobs, setJobs] = useState<Record<number, Job>>({});
@@ -82,6 +88,9 @@ export function ChapterManager({open, active, onPick}: {
     for (const r of data?.chapters ?? []) byIndex.set(r.i, r);
     return n.chapters.map<ChapRow>((c) => byIndex.get(c.i) ?? {
       ...c, rendered: 0, m4a: false, bytes: null, duration: null,
+      // No row from the server yet: nothing is rendered, nothing is queued, and
+      // the size is whatever the estimate says once a row arrives.
+      est_bytes: null, queued: false, packing: false, pack_queued: false,
     });
   }, [data, n.chapters]);
 
@@ -175,7 +184,7 @@ export function ChapterManager({open, active, onPick}: {
     setRunning(true);
 
     const poll = async (): Promise<ChapRow[]> => {
-      const r = await get<ChaptersResult>('/api/chapters');
+      const r = await fetchChapters(key);
       qc.setQueryData(keys.chapters, r);
       return r.chapters;
     };
@@ -188,9 +197,12 @@ export function ChapterManager({open, active, onPick}: {
       let fresh = await poll().catch(() => rows);
       const held = await cachedChapters(key);
       const toRender = needsRender(fresh.filter((r) => cis.includes(r.i)), held);
+      // The whole selection's renders go up in one call, and the queue that
+      // comes back is the receipt each chapter's loop starts from.
+      let queued: RenderResult | null = null;
       if (toRender.length) {
         for (const ci of toRender) job(ci, 'queued');
-        await actions.render.mutateAsync(toRender).catch((e: unknown) => {
+        queued = await actions.render.mutateAsync(toRender).catch((e: unknown) => {
           throw new Error(`could not queue the render: ${msg(e)}`);
         });
       }
@@ -198,30 +210,43 @@ export function ChapterManager({open, active, onPick}: {
       for (const ci of cis) {
         if (held.has(ci)) { job(ci, null); continue; }
         const t0 = Date.now();
-        /* When each ask was last sent. Neither endpoint says what it refused -
-           a build for a half-rendered chapter is dropped in silence, and the
-           up-front render queue call can be swallowed the same way (RUST-NOTES
-           items 7 and 9) - so an ask that has not moved the row within twenty
-           seconds is simply repeated. Both are idempotent, so a repeat costs a
-           request and nothing else, and the alternative is a row that sits on
-           one rung for forty-five minutes waiting for a call nobody made. */
-        const asked = {render: Date.now(), pack: 0};
+        /* Whether each ask has been *acknowledged*, and when this chapter's row
+           last changed.
+
+           Both endpoints now say what they did with each chapter - the render
+           queue comes back in the render response, and build reports per-chapter
+           refusals with a reason. So an acknowledged ask is simply waited on,
+           and the repeat is kept for the case it was meant for: a row that has
+           not moved at all for ninety seconds, which is what a lost call or a
+           restarted server looks like from here. (This used to re-ask every
+           twenty seconds, blind, because the responses said nothing.) */
+        const ack = {render: renderAccepted(queued, ci), pack: false};
+        let sig = rowSignature(fresh.find((r) => r.i === ci));
+        let changedAt = Date.now();
         try {
           for (;;) {
-            const phase = phaseFor(fresh.find((r) => r.i === ci), false);
+            const row = fresh.find((r) => r.i === ci);
+            const now = rowSignature(row);
+            if (now !== sig) { sig = now; changedAt = Date.now(); }
+            const still = {sinceChangeMs: Date.now() - changedAt};
+            const phase = phaseFor(row, false);
             job(ci, jobFor(phase));
             if (phase === 'stored') break;
             if (phase === 'store') {
               await downloadChapter(key, ci);
               break;
             }
-            if (phase === 'queue-render' && Date.now() - asked.render > 20_000) {
-              asked.render = Date.now();
-              await actions.render.mutateAsync([ci]);
+            if (phase === 'queue-render' && shouldReask({acked: ack.render, ...still})) {
+              ack.render = renderAccepted(await actions.render.mutateAsync([ci]), ci);
+              changedAt = Date.now();
             }
-            if (phase === 'request-pack' && Date.now() - asked.pack > 20_000) {
-              asked.pack = Date.now();
-              await actions.build.mutateAsync([ci]);
+            if (phase === 'request-pack' && shouldReask({acked: ack.pack, ...still})) {
+              const verdict = buildVerdict(await actions.build.mutateAsync([ci]), ci);
+              if (verdict.t === 'impossible')
+                throw new Error(`the server will not pack it (${verdict.reason})`);
+              // "taken" and "rendering" are both an answer: stop asking.
+              ack.pack = verdict.t !== 'unknown';
+              changedAt = Date.now();
             }
             if (Date.now() - t0 > RUNG_TIMEOUT_MS)
               throw new Error('the server never finished it');
@@ -273,6 +298,10 @@ export function ChapterManager({open, active, onPick}: {
   const shards = n.index?.shards ?? 0;
   const textDone = shards > 0 && n.textShards.size >= shards;
   const loadingRows = isPending && !rows.length;
+  /* What a minute of audio weighs, from the server rather than from a constant
+     in this file: CHAPTER_BITRATE is the box's to set, and an estimate computed
+     at the wrong rate is wrong by exactly that ratio. */
+  const perMin = n.status?.bitrate_bytes_per_min;
   const busy = running || Object.keys(jobs).length > 0;
 
   return (
@@ -422,7 +451,7 @@ export function ChapterManager({open, active, onPick}: {
             <span data-testid="sel-count" className="ml-auto text-[11px] text-muted-foreground tabular-nums">
               {picks.length
                 ? <>{picks.length} chapter{picks.length > 1 ? 's' : ''}
-                    {sizeOf(pickedRows) && ` · ${sizeOf(pickedRows)}`}</>
+                    {sizeOf(pickedRows, perMin) && ` · ${sizeOf(pickedRows, perMin)}`}</>
                 : 'none picked'}
             </span>
             <Button data-testid="sel-confirm" size="sm"
@@ -459,9 +488,9 @@ export function ChapterManager({open, active, onPick}: {
 }
 
 /** "~45 MB" while anything in the selection has yet to be made. */
-function sizeOf(rows: ChapRow[]): string {
+function sizeOf(rows: ChapRow[], bytesPerMin?: number): string {
   if (!rows.length) return '';
-  const n = estimateBytes(rows);
+  const n = estimateBytes(rows, bytesPerMin);
   if (!n) return '';
   return `${anyEstimated(rows) ? '~' : ''}${fmtBytes(n)}`;
 }

@@ -14,7 +14,7 @@
  */
 import {useEffect, useRef, useState} from 'react';
 import {BookOpen} from 'lucide-react';
-import {PlayerBar, TopBar, useAutoHide} from '@/components/Chrome';
+import {FollowOffer, PlayerBar, TopBar, useAutoHide} from '@/components/Chrome';
 import {Library} from '@/components/Library';
 import {ChapterSkeleton, ReadingPage} from '@/components/ReadingPage';
 import {isRotation, shouldHeal, trackBaseline} from '@/lib/viewport';
@@ -73,6 +73,7 @@ export default function App() {
             Open the library to choose a book.
           </button>
         )}
+        <FollowOffer />
       </main>
       <PlayerBar visible={visible} />
       <Library open={drawer} onOpenChange={setDrawer} />

@@ -1,8 +1,13 @@
 /**
  * Every conversation with the server.
  *
- * TanStack Query owns retries, backoff, refetch-on-reconnect and the cache; this
- * module only describes *what* the calls are. Two rules run through it:
+ * The calls themselves are **generated**: `src/client` is built by
+ * `scripts/gen-client.sh` from the server's OpenAPI document, which utoipa
+ * generates from the handlers. So the request and response shapes in this file
+ * are not a description of the API that has to be kept true — they are the API,
+ * and a field that moves in Rust is a type error here in the same change.
+ *
+ * What stays hand-written is the *policy*, which no generator knows:
  *
  *   networkMode 'offlineFirst' everywhere. The browser saying "offline" does not
  *   mean the request will fail - the service worker answers /api/book.json,
@@ -10,15 +15,25 @@
  *   pause those requests would break offline reading, which is the opposite of
  *   what it is for.
  *
- *   The book key rides along as ?book= on everything cacheable. The server holds
- *   one book at a time; the cache is keyed by URL and knows nothing about that,
- *   so without the key a downloaded chapter 3 of one book would answer for
- *   chapter 3 of another.
+ *   The book key rides along as ?book= / "book" on everything. On the cacheable
+ *   GETs it is what keeps a downloaded chapter 3 of one book from answering for
+ *   chapter 3 of another; on the session endpoints and the chapter verbs it is
+ *   what makes the server answer 409 instead of acting on the wrong book. Both
+ *   matter, and they are the same parameter.
+ *
+ *   The URL builders below stay builders. `<audio src>`, an HLS playlist and a
+ *   Cache Storage key are strings, not calls - and the download action stores
+ *   chapter audio under exactly these URLs, so they are also the reader's cache
+ *   keys. The generated client encodes query values with `encodeURIComponent`
+ *   too, so a builder URL and an SDK URL for the same resource are byte for byte
+ *   the same request.
  */
 import {QueryClient, useQuery, useMutation, useQueryClient} from '@tanstack/react-query';
+import * as sdk from '@/client';
 import {delayFor, isRetryable} from './backoff';
 import type {
-  BookFile, BookIndex, ChaptersResult, ChapterText, LoadResult, Status, TextShard,
+  BookIndex, BuildResult, CancelResult, ChaptersResult, ChapterText, LoadResult,
+  RenderResult, TextShard,
 } from './types';
 
 export class ApiError extends Error {
@@ -38,25 +53,48 @@ export const chapterTextUrl = (key: string | null, ci: number) =>
 export const bookIndexUrl = (key: string | null) => `/api/book.json${qs(key)}`;
 export const textShardUrl = (key: string | null, s: number) => `/api/text/${s}.json${qs(key)}`;
 
+/** The `{error}` body every failure in this API carries. */
+const reason = (e: unknown): string | null => {
+  if (typeof e === 'string') return e;
+  const o = e as {error?: unknown} | null;
+  return typeof o?.error === 'string' ? o.error : null;
+};
+
+/**
+ * The generated client's `{data, error, response}` envelope, unwrapped into the
+ * reader's one failure type.
+ *
+ * Keeping ApiError is the point: the retry policy reads its status (a 4xx is not
+ * worth repeating, a 409 means the server is on another book and asking again
+ * will say so again), and the UI shows its message, which is the server's own
+ * `{error: "..."}` string rather than "HTTP 409".
+ */
+export async function call<T>(
+  op: Promise<{data?: T; error?: unknown; response?: Response}>,
+): Promise<T> {
+  const r = await op;
+  // No response at all is a transport failure, which the retry policy treats as
+  // status 0: worth repeating, unlike a 4xx.
+  const status = r.response?.status ?? 0;
+  if (r.error !== undefined || !r.response?.ok) {
+    throw new ApiError(status, reason(r.error) ?? (status ? `HTTP ${status}` : 'no answer'));
+  }
+  return r.data as T;
+}
+
+/** A typed GET of one of the URL-keyed cacheable resources above. */
 export async function get<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    throw new ApiError(res.status, (body as {error?: string} | null)?.error ?? `HTTP ${res.status}`);
+    throw new ApiError(res.status, reason(body) ?? `HTTP ${res.status}`);
   }
   return res.json() as Promise<T>;
 }
 
-export const post = <T,>(url: string, body?: unknown) =>
-  get<T>(url, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body ?? {}),
-  });
-
 /** Fire and forget: playback bookkeeping the UI must never wait on or flinch at. */
-export function tell(url: string, body?: unknown): void {
-  void post(url, body).catch(() => {});
+export function tell<T>(op: Promise<{data?: T; error?: unknown; response?: Response}>): void {
+  void call(op).catch(() => {});
 }
 
 export const queryClient = new QueryClient({
@@ -87,17 +125,25 @@ export const keys = {
 export function useBooks() {
   return useQuery({
     queryKey: keys.books,
-    queryFn: () => get<BookFile[]>('/api/books'),
+    queryFn: () => call(sdk.books()),
     staleTime: 60_000,
   });
 }
 
-/** The heartbeat. It is also how the reader notices the server came back. */
+/**
+ * The heartbeat.
+ *
+ * It used to be polled every second, because a poll was the only way to notice
+ * anything - including that the server had come back. `/api/events` does that
+ * job now, so this runs at a fifth of the rate: it is a fallback for a browser
+ * with no live stream and the source of the few numbers no event carries (the
+ * packed bitrate, the disk figures).
+ */
 export function useStatus(enabled = true) {
   return useQuery({
     queryKey: keys.status,
-    queryFn: () => get<Status>('/api/status'),
-    refetchInterval: 1_000,
+    queryFn: () => call(sdk.status()),
+    refetchInterval: 5_000,
     refetchIntervalInBackground: false,
     staleTime: 0,
     retry: 1,
@@ -105,11 +151,17 @@ export function useStatus(enabled = true) {
   });
 }
 
-/** Per-chapter render/pack state. Polled only while someone is looking. */
-export function useChapters(enabled: boolean) {
+/**
+ * Per-chapter render/pack state, for one named book.
+ *
+ * `book` is not decoration: this answer is what a tap on "download the rest"
+ * acts on, and the server refuses (409) rather than describing a book it swapped
+ * to since the last poll.
+ */
+export function useChapters(enabled: boolean, book: string | null) {
   return useQuery({
     queryKey: keys.chapters,
-    queryFn: () => get<ChaptersResult>('/api/chapters'),
+    queryFn: () => call(sdk.chaptersList({query: {book: book ?? undefined}})),
     refetchInterval: enabled ? 2_000 : false,
     enabled,
     retry: 1,
@@ -137,10 +189,13 @@ export function useTextShard(key: string | null, shard: number | null) {
   });
 }
 
+export const loadBook = (path: string): Promise<LoadResult> =>
+  call(sdk.load({body: {path}}));
+
 export function useLoadBook() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (path: string) => post<LoadResult>('/api/load', {path}),
+    mutationFn: loadBook,
     onSuccess: () => {
       void qc.invalidateQueries({queryKey: keys.chapters});
       void qc.invalidateQueries({queryKey: keys.status});
@@ -148,30 +203,62 @@ export function useLoadBook() {
   });
 }
 
-export function useChapterActions() {
+/**
+ * The chapter verbs, each aimed at a named book.
+ *
+ * This is the request where getting the book wrong is expensive rather than
+ * merely wrong: one tap can queue 74 chapters, and on the wrong novel that is
+ * the render worker's afternoon. The reader has no way to close that race on its
+ * own - the server can, and does, with a 409.
+ */
+export function useChapterActions(book: string | null) {
   const qc = useQueryClient();
   const bump = () => void qc.invalidateQueries({queryKey: keys.chapters});
+  const on = book ?? undefined;
   return {
-    render: useMutation({
-      mutationFn: (chapters: number[]) =>
-        post<{ok: boolean; queue: number[]}>('/api/chapters/render', {chapters}),
+    render: useMutation<RenderResult, Error, number[]>({
+      mutationFn: (chapters) =>
+        call(sdk.chaptersRender({body: {chapters, book: on}})),
       onSuccess: bump,
     }),
-    build: useMutation({
-      mutationFn: (chapters: number[]) =>
-        post<{built: number[]; building: number[]; rendering: number[]}>(
-          '/api/chapters/build', {chapters}),
+    build: useMutation<BuildResult, Error, number[]>({
+      mutationFn: (chapters) =>
+        call(sdk.chaptersBuild({body: {chapters, book: on}})),
       onSuccess: bump,
     }),
-    cancel: useMutation({
-      mutationFn: (chapters?: number[]) =>
-        post<{ok: boolean}>('/api/chapters/cancel', chapters ? {chapters} : {}),
+    cancel: useMutation<CancelResult, Error, number[] | undefined>({
+      mutationFn: (chapters) =>
+        call(sdk.chaptersCancel({body: chapters ? {chapters, book: on} : {book: on}})),
       onSuccess: bump,
     }),
   };
 }
 
-/** Chapter text, preferring the cached shard the whole book was taken in. */
-export async function fetchChapterText(key: string | null, ci: number): Promise<ChapterText> {
-  return get<ChapterText>(chapterTextUrl(key, ci));
-}
+/** The chapter list, fetched once rather than polled — what a download run walks. */
+export const fetchChapters = (book: string | null): Promise<ChaptersResult> =>
+  call(sdk.chaptersList({query: {book: book ?? undefined}}));
+
+/** Chapter text, straight from the endpoint (the cached-shard route is in state). */
+export const fetchChapterText = (key: string | null, ci: number): Promise<ChapterText> =>
+  get<ChapterText>(chapterTextUrl(key, ci));
+
+// ----------------------------------------------------------- playback reports
+// Each of these names its book, so a report meant for one cannot move another
+// one's render frontier or file a position under the wrong name.
+
+export const openChapter = (book: string | null, chapter: number, chunk: number) =>
+  call(sdk.openChapter({body: {chapter, chunk, book: book ?? undefined}}));
+
+export const reportPlayhead = (book: string | null, chunk: number) =>
+  call(sdk.playhead({body: {chunk, book: book ?? undefined}}));
+
+export const tellPause = () => tell(sdk.pause());
+export const tellResume = () => tell(sdk.resume());
+
+// `/api/note` and `/api/position` are deliberately *not* here: they are the
+// outbox's, and lib/flush.ts calls them with plain fetch because it needs the
+// raw status and body to decide whether a recording was filed. "A 2xx carrying
+// {ok, file, text, language} and nothing else counts as delivered" is a rule
+// about a response, not about a value, and an unwrapped envelope is the wrong
+// shape for it - the audio is on a phone and nowhere else until that call
+// succeeds.

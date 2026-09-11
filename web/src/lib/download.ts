@@ -19,7 +19,7 @@
  *
  * Pure, so the ladder can be tested rather than watched.
  */
-import type {ChapRow} from './types';
+import type {BuildResult, ChapRow, RenderResult} from './types';
 
 export type DownloadPhase =
   /** already on this device: nothing to do */
@@ -88,23 +88,102 @@ export function needsRender(
     .map((r) => r.i);
 }
 
-/** 64 kbit/s is the server's CHAPTER_BITRATE, so a minute is ~480 kB. */
-const BYTES_PER_MIN = 64_000 / 8 * 60;
+/**
+ * The fallback rate, used only when the server has told us nothing: 64 kbit/s
+ * is the default `CHAPTER_BITRATE`, so a minute is ~480 kB.
+ *
+ * It used to be the *only* rate, hard-coded here, because the server did not
+ * report its own - so changing the env var on the box silently made every size
+ * in the UI wrong by that ratio. Now each row carries `est_bytes`, computed
+ * server-side from the constants the server actually has, and `/api/status`
+ * carries the rate itself for anything that has to do its own arithmetic.
+ */
+export const FALLBACK_BYTES_PER_MIN = 64_000 / 8 * 60;
 
 /**
  * How big the selection will be, in bytes.
  *
- * A packed chapter reports its real size. An unrendered one has never existed
- * as a file, so the estimate comes off its minutes at the server's own bitrate
- * - which is why the confirm bar says "~".
+ * Three sources, in order of how much they know: the measured size of a packed
+ * chapter, the server's own estimate for one that is not packed yet, and - only
+ * if a row predates both - minutes times a rate. Which is why the confirm bar
+ * says "~" whenever anything in the selection is not yet a file.
  */
-export function estimateBytes(rows: readonly ChapRow[]): number {
+export function estimateBytes(
+  rows: readonly ChapRow[], bytesPerMin = FALLBACK_BYTES_PER_MIN,
+): number {
+  const rate = bytesPerMin > 0 ? bytesPerMin : FALLBACK_BYTES_PER_MIN;
   let n = 0;
   for (const r of rows) {
     if (r.bytes != null) n += r.bytes;
-    else if (r.est_min != null) n += Math.round(r.est_min * BYTES_PER_MIN);
+    else if (r.est_bytes != null) n += r.est_bytes;
+    else if (r.est_min != null) n += Math.round(r.est_min * rate);
   }
   return n;
+}
+
+// ------------------------------------------------------- reading the answers
+//
+// The server used to answer `/api/chapters/build` with three lists and no way
+// to tell "I refused this one" from "nobody mentioned it", so this client
+// ignored the response entirely and re-asked every twenty seconds until the row
+// moved. It now says what it refused and why, per chapter, which turns the
+// re-ask from a policy into an exception - see `shouldReask`.
+
+export type BuildVerdict =
+  /** The packer has it (or it was already packed). Stop asking. */
+  | {t: 'taken'}
+  /** Not rendered yet; the server queued the render instead. Stop asking. */
+  | {t: 'rendering'; rendered: number; n: number}
+  /** It can never be packed - no such chapter, or no audio in it. Give up. */
+  | {t: 'impossible'; reason: string}
+  /** The answer does not mention it at all: ask again when it makes sense. */
+  | {t: 'unknown'};
+
+export function buildVerdict(r: BuildResult | null | undefined, ci: number): BuildVerdict {
+  if (!r) return {t: 'unknown'};
+  if (r.built?.includes(ci) || r.building?.includes(ci)) return {t: 'taken'};
+  const refusal = r.refused?.find((x) => x.chapter === ci);
+  if (refusal?.reason === 'not_rendered')
+    return {t: 'rendering', rendered: refusal.rendered, n: refusal.n};
+  if (refusal) return {t: 'impossible', reason: refusal.reason};
+  if (r.rendering?.includes(ci)) return {t: 'rendering', rendered: 0, n: 0};
+  return {t: 'unknown'};
+}
+
+/** Did `/api/chapters/render` take this chapter? Its queue is the receipt. */
+export function renderAccepted(r: RenderResult | null | undefined, ci: number): boolean {
+  return !!r && (r.queue?.includes(ci) || r.packing?.includes(ci));
+}
+
+/**
+ * Everything about a row that means "the server is getting somewhere". Compared
+ * between polls, so a rung that has genuinely stopped moving can be told from
+ * one that is simply slow - a chapter of a big novel takes minutes to render,
+ * and minutes of silence are not a stall.
+ */
+export function rowSignature(r: ChapRow | undefined): string {
+  if (!r) return 'none';
+  return [r.rendered, r.n, r.m4a ? 1 : 0, r.queued ? 1 : 0,
+          r.packing ? 1 : 0, r.pack_queued ? 1 : 0].join(':');
+}
+
+/** How long a row may sit perfectly still before the ask is repeated. */
+export const STALL_MS = 90_000;
+
+/**
+ * Should the ask be repeated?
+ *
+ * Yes if it was never acknowledged - the call may have been lost, and both
+ * endpoints are idempotent. Yes if it was acknowledged but nothing has changed
+ * for `stallMs`, which is the case this exists for: a server restart between the
+ * ask and the work, where the acknowledgement was true when it was given and is
+ * not true any more. Otherwise no, and the client waits like it should.
+ */
+export function shouldReask(
+  {acked, sinceChangeMs}: {acked: boolean; sinceChangeMs: number},
+  stallMs = STALL_MS,
+): boolean {
+  return !acked || sinceChangeMs >= stallMs;
 }
 
 /** Did the selection include anything the server still has to make? */

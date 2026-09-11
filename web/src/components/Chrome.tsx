@@ -22,7 +22,7 @@
  */
 import {useEffect, useState} from 'react';
 import {
-  ChevronLeft, ChevronRight, CloudOff, Loader2, Menu, Pause, Play, Type, X,
+  ChevronLeft, ChevronRight, CloudOff, Loader2, Menu, Pause, Play, RefreshCw, Type, X,
 } from 'lucide-react';
 import {Button} from '@/components/ui/button';
 import {Slider} from '@/components/ui/slider';
@@ -159,6 +159,47 @@ function Connection() {
         : n.conn === 'reconnecting' ? <Loader2 className="size-3 animate-spin" /> : null}
       {text}
     </Badge>
+  );
+}
+
+/**
+ * "Reading position moved on another device."
+ *
+ * The other half of lib/live.ts's arbitration, and the reason that rule exists:
+ * while audio is playing, a position that moved elsewhere is *news*, not an
+ * instruction. Jumping the page mid-sentence because a phone in another room
+ * saved a position would be the worst thing this feature could do, so the move
+ * waits here instead - one quiet line, one tap to take it, one to dismiss it.
+ *
+ * When nothing is playing there is nothing to interrupt and the page simply
+ * follows; this never appears.
+ */
+export function FollowOffer() {
+  const n = useNarrator();
+  if (!n.moved) return null;
+  const title = n.chapters.find((c) => c.i === n.moved?.chapter)?.title;
+  return (
+    <div className="pointer-events-none absolute inset-x-0 bottom-2 z-10 flex justify-center px-4">
+      <div data-testid="follow-offer"
+           className="pointer-events-auto flex max-w-full items-center gap-2 rounded-full
+                      border border-border bg-card/95 py-1 pl-3 pr-1 text-[11px]
+                      text-muted-foreground shadow-lg backdrop-blur">
+        <RefreshCw className="size-3 shrink-0" />
+        <span className="min-w-0 truncate">
+          moved on another device{title ? ` · ${title}` : ''}
+        </span>
+        <button data-testid="follow-go" onClick={n.follow}
+                title="Open the chapter and chunk the other device is on"
+                className="shrink-0 rounded-full px-2 py-0.5 text-foreground
+                           transition-colors hover:bg-white/10">
+          follow
+        </button>
+        <button data-testid="follow-dismiss" onClick={n.dismissMoved} title="Stay here"
+                className="shrink-0 rounded-full p-1 transition-colors hover:text-foreground">
+          <X className="size-3" />
+        </button>
+      </div>
+    </div>
   );
 }
 

@@ -3,8 +3,9 @@ import {chapterState} from './chapterstate';
 import type {ChapRow} from './types';
 
 const row = (p: Partial<ChapRow> = {}): ChapRow => ({
-  i: 4, title: '5: The Sequence', n: 76, est_min: 12.2,
-  rendered: 0, m4a: false, bytes: null, duration: null, ...p,
+  i: 4, title: '5: The Sequence', n: 76, est_min: 12.2, est_bytes: 5_856_000,
+  rendered: 0, m4a: false, bytes: null, duration: null,
+  queued: false, packing: false, pack_queued: false, ...p,
 });
 const fmt = (n: number) => `${n} B`;
 

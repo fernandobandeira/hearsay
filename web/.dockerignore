@@ -3,5 +3,4 @@ dist
 *.tsbuildinfo
 Dockerfile
 README.md
-RUST-NOTES.md
 placeholder

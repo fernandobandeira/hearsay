@@ -1,68 +1,45 @@
 /**
- * The server's API, as types.
+ * The server's API, as types — **generated, not written down**.
  *
- * This is the contract the Obsidian plugin already depends on and the one a
- * future Rust rewrite has to re-implement, so it is written down here rather than
- * inferred at each call site.
+ * This file used to be the reader's own transcription of the contract, kept in
+ * step with the server by hand and by a drift check that compared the two. It is
+ * now a thin view over `src/client`, which `scripts/gen-client.sh` generates
+ * from the server's OpenAPI document (which is itself generated from the
+ * handlers). So a field that changes shape in Rust is a TypeScript error here,
+ * in the same change, rather than a runtime surprise in three weeks.
+ *
+ * What survives is the *naming*: the reader's components say `ChapRow` and
+ * `SavedPosition`, and those names are good, so they are aliases rather than a
+ * rename across forty call sites.
  */
-export interface BookFile { path: string; name: string; mb: number; key?: string }
+export type {
+  BookIndex,
+  ChapMeta,
+  ChaptersResult,
+  ChapterText,
+  LoadResult,
+  NoteResult,
+  Status,
+  TextShard,
+  BuildResult,
+  BuildRefusal,
+  RenderResult,
+  CancelResult,
+} from '@/client';
 
-export interface ChapMeta {
-  i: number; title: string; n: number; est_min: number | null; shard?: number;
-}
+import type {BookFile as ServerBookFile, ChapterRow, StampedPosition} from '@/client';
+
+/**
+ * A book in the library.
+ *
+ * `key` is the reader's own addition, not the server's: the library falls back
+ * to the books this device has opened before (localStorage) when the server
+ * cannot be reached, and those entries know their cache key.
+ */
+export type BookFile = ServerBookFile & {key?: string};
+
+/** A row of the chapter manager. `ChapterRow` server-side. */
+export type ChapRow = ChapterRow;
 
 /** What `save_position()` writes into the vault, as `/api/load` hands it back. */
-export interface SavedPosition {
-  chapter: number; chunk: number;
-  chapter_title?: string; chunks_total?: number; chapters_total?: number;
-  /** naive local ISO, e.g. `2026-09-11T14:22:07` */
-  updated?: string;
-}
-
-export interface LoadResult {
-  title: string; key: string; total_min: number;
-  position?: SavedPosition | null;
-  chapters: ChapMeta[];
-}
-
-export interface ChapRow extends ChapMeta {
-  rendered: number;
-  m4a: boolean;
-  bytes: number | null;
-  duration: number | null;
-  queued?: boolean;
-  packing?: boolean;
-  pack_queued?: boolean;
-}
-
-export interface ChaptersResult {
-  book: string | null; key: string | null; title: string | null; chapter?: number;
-  chapters: ChapRow[]; queue?: number[]; building?: number | null;
-  build_error?: string | null; chapters_gb?: number; chapters_cap_gb?: number;
-}
-
-export interface Status {
-  status: string; error: string | null; chapter: number;
-  book: string | null; title: string | null; key: string | null;
-  render_idx: number; playhead: number; total: number; chapters: number;
-  model_ready: boolean; rtf: number | null; rendered_min: number; voice: string;
-  prerender: number | null; prerender_chapters: number;
-  prerender_hours: number | null; prerender_span: number;
-  book_min: number | null; done_min: number | null;
-  disk_gb: number; disk_cap_gb: number;
-  queue: number[]; building: number | null; build_error: string | null;
-}
-
-export interface BookIndex {
-  key: string; name: string; title: string; total_min: number;
-  shards: number; text_bytes: number; chapters: ChapMeta[];
-}
-
-export interface TextShard {
-  shard: number; from: number; to: number;
-  chapters: {i: number; paras: number[]; chunks: string[]}[];
-}
-
-export interface ChapterText { title: string; chunks: string[]; paras?: number[] }
-
-export interface NoteResult { ok: boolean; file: string; text: string; language: string }
+export type SavedPosition = StampedPosition;

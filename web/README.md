@@ -23,5 +23,7 @@ Two images are built from this directory:
   a 10-minute file swap instead of a Rust rebuild.
 
 `placeholder/` is the page the server falls back to when there is no build at
-all. `RUST-NOTES.md` is the requirement list this reader wrote against the python
-server; the server sections of `AGENTS.md` answer it point by point.
+all. `src/client/` is **generated** — the typed client `scripts/gen-client.sh`
+builds from the server's OpenAPI document, which is where every request and
+response shape in `src/lib/api.ts` comes from. Do not hand-edit it; CI
+regenerates and diffs.

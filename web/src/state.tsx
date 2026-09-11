@@ -22,9 +22,12 @@ import {
 } from 'react';
 import {onlineManager, useQueryClient} from '@tanstack/react-query';
 import {
-  bookIndexUrl, chapterManifestUrl, chapterTextUrl, keys, get, tell, textShardUrl,
-  useBookIndex, useStatus,
+  bookIndexUrl, chapterManifestUrl, chapterTextUrl, keys, get, loadBook, openChapter as tellOpen,
+  reportPlayhead, tellPause, tellResume, textShardUrl, useBookIndex, useStatus,
 } from './lib/api';
+import {
+  arbitrate, connectLive, type LiveState, type PositionEvent,
+} from './lib/live';
 import {isSane, type Manifest} from './lib/manifest';
 import {Player, type PlayMode} from './lib/player';
 import {cachedChapters, cachedShards, downloadText, removeText} from './lib/offline';
@@ -70,6 +73,17 @@ interface Ctx {
   queued: {notes: number; positions: number; stalled: number};
   fontScale: number;
   status: ReturnType<typeof useStatus>['data'];
+  /**
+   * Where another device moved the reading position to, while this one is
+   * playing. Null unless there is something to offer - see lib/live.ts's
+   * arbitration: a sync that interrupts someone mid-sentence is not a feature,
+   * so it waits behind a tap.
+   */
+  moved: {chapter: number; chunk: number} | null;
+  /** Take the offer. */
+  follow: () => void;
+  /** Turn it down; it comes back if the other device moves again. */
+  dismissMoved: () => void;
 
   openBook: (b: BookFile & {key?: string}) => Promise<void>;
   openChapter: (ci: number, chunk?: number, opts?: {cacheOnly?: boolean}) => Promise<boolean>;
@@ -135,6 +149,8 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const [bookLoading, setBookLoading] = useState(false);
   const [resumedAt, setResumedAt] = useState<Resume | null>(null);
   const [queued, setQueued] = useState({notes: 0, positions: 0, stalled: 0});
+  const [moved, setMoved] = useState<{chapter: number; chunk: number} | null>(null);
+  const [live, setLive] = useState<LiveState>('connecting');
   const [fontScale, setFontScaleState] = useState(
     () => Math.min(1.8, Math.max(0.7, Number(localStorage.getItem('narrator.font')) || 1)));
 
@@ -145,9 +161,6 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const idxRef = useRef(0);
   const bookRef = useRef<OpenBook | null>(null);
   const indexRef = useRef<BookIndex | undefined>(undefined);
-  /* The server holds one book at a time, and /api/chapter/{ci} answers for
-     whichever it is. This is how the fast path knows it may ask. */
-  const serverHolds = useRef<string | null>(null);
   ciRef.current = ci;
   idxRef.current = idx;
   bookRef.current = book;
@@ -155,14 +168,22 @@ export function NarratorProvider({children}: {children: ReactNode}) {
 
   const textOptOut = !!book && optOut.includes(book.key);
 
-  /* The connection indicator, derived rather than tracked: the browser's own
-     signal plus whether the heartbeat is currently succeeding. "reconnecting" is
-     the honest middle state - a request is being retried and nothing is wrong
-     yet, so the UI says so quietly and changes nothing else. */
-  const conn: ConnState = !onlineManager.isOnline() || status.isError || status.failureCount >= 2
+  /* The connection indicator, derived rather than tracked - and now derived from
+     the live stream first, because the stream is the honest signal: it is a
+     connection that is actually open, with the server's own heartbeat proving it
+     from the other end. The heartbeat query is the fallback (a browser with no
+     EventSource, a stream the proxy will not pass) and the tiebreaker while the
+     stream is still opening. "reconnecting" is the middle state: something is
+     being retried, nothing is wrong yet, so the UI says so quietly. */
+  const conn: ConnState = !onlineManager.isOnline()
     ? 'offline'
-    : status.failureCount > 0 ? 'reconnecting'
-    : 'online';
+    : live === 'live'
+      ? 'online'
+      : status.isError || status.failureCount >= 2
+        ? 'offline'
+        : live === 'connecting' && status.isSuccess && !status.failureCount
+          ? 'online'
+          : 'reconnecting';
 
   // ---------------------------------------------------------------- the player
   const goChapterRef = useRef<(d: number) => void>(() => {});
@@ -179,23 +200,6 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const player = playerRef.current;
 
   // ------------------------------------------------------- positions, outbox
-  const report = useCallback(async (i: number) => {
-    const b = bookRef.current;
-    if (!b) return;
-    rememberDevicePos(b.path, ciRef.current, i);
-    const serverHasIt = !status.data?.book || status.data.book === b.name;
-    if (serverHasIt) {
-      try { await get('/api/playhead', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                       body: JSON.stringify({chunk: i})}); return; }
-      catch { /* fall through to the queue */ }
-    }
-    await db.putPosition({
-      book: b.name, chapter: ciRef.current, chunk: i, ts: Date.now(),
-      chapter_title: chapterTitle, chunks_total: chunks.length, chapters_total: chapters.length,
-    });
-    void refreshQueued();
-  }, [status.data?.book, chapterTitle, chunks.length, chapters.length]);
-
   const refreshQueued = useCallback(async () => {
     const [notes, positions] = await Promise.all([db.allMemos(), db.allPositions()]);
     setQueued({
@@ -204,6 +208,30 @@ export function NarratorProvider({children}: {children: ReactNode}) {
       stalled: notes.filter((n) => (n.tries ?? 0) >= 5).length,
     });
   }, []);
+
+  /* Report the playhead, or queue it.
+     The reader used to guess whether the report would land - "does /api/status
+     say the server holds my book?" - because a report aimed at the wrong book
+     moved that book's render frontier. It does not have to guess any more: the
+     call names its book and the server answers 409 if it holds another, which is
+     both safer than the guess and one fewer thing to be stale. A 409 is just
+     another reason to use the outbox, which is where a position belongs when the
+     server cannot take it. */
+  const report = useCallback(async (i: number) => {
+    const b = bookRef.current;
+    if (!b) return;
+    rememberDevicePos(b.path, ciRef.current, i);
+    try {
+      await reportPlayhead(b.key, i);
+      return;
+    } catch { /* refused or unreachable: it goes in the queue */ }
+    await db.putPosition({
+      book: b.name, chapter: ciRef.current, chunk: i, ts: Date.now(),
+      chapter_title: chapterTitle, chunks_total: chunks.length, chapters_total: chapters.length,
+    });
+    void refreshQueued();
+  }, [chapterTitle, chunks.length, chapters.length, refreshQueued]);
+
 
   const flush = useCallback(async (manual = false) => {
     const {flushOutbox, flushPositions} = await import('./lib/flush');
@@ -278,8 +306,13 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     setParas(null);
     setChapterLoading(true);
 
-    const live = !opts.cacheOnly && serverHolds.current === b.name;
-    const text = await loadChapterText(qc, b.key, target, indexRef.current, live, opts.cacheOnly);
+    /* The endpoint may always be asked now: `/api/chapter/{ci}?book=` is served
+       out of that book's own text bundle, whatever book the session holds. The
+       old `serverHolds` gate - and the first paint that waited behind /api/load
+       for it - is gone. `cacheOnly` still forbids the network entirely, because
+       that path exists to paint from this device alone. */
+    const text = await loadChapterText(
+      qc, b.key, target, indexRef.current, !opts.cacheOnly, opts.cacheOnly);
     // Another chapter (or book) was asked for while this one was in the air.
     if (bookRef.current !== b || ciRef.current !== target) return false;
     if (!text) {
@@ -299,8 +332,10 @@ export function NarratorProvider({children}: {children: ReactNode}) {
        gone next time. Without this an offline open falls back to page one. */
     rememberDevicePos(b.path, target, chunk);
 
-    // Only the book the server actually holds may be told where to render.
-    if (serverHolds.current === b.name) tell('/api/open', {chapter: target, chunk});
+    // Start the renderer here. Named, so the server refuses it outright if it
+    // holds another book rather than dragging that book's frontier along - which
+    // is why this no longer waits to be sure.
+    void tellOpen(b.key, target, chunk).catch(() => {});
 
     const manifest = await loadManifest(qc, b.key, target, text.chunks.length);
     if (bookRef.current !== b || ciRef.current !== target) return true;
@@ -332,10 +367,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     setChunks([]);
     setParas(null);
     setMessage(null);
-    // The server is about to re-parse the EPUB, which is 12 seconds on the
-    // 1433-chapter novel, and until it answers /api/chapter belongs to whatever
-    // book it had open before.
-    serverHolds.current = null;
+    setMoved(null);
 
     const queuedFor = async (name: string) =>
       (await db.allPositions()).find((p) => p.book === name) ?? null;
@@ -352,8 +384,8 @@ export function NarratorProvider({children}: {children: ReactNode}) {
       setBook(known);
       bookRef.current = known;
       setChapters(entry.chapters);
-      // The shard map, from Cache Storage if this device has it. It is scoped by
-      // ?book=, so unlike /api/chapter it cannot answer for the wrong book.
+      // The shard map, from Cache Storage if this device has it - scoped by
+      // ?book=, like everything cacheable.
       indexRef.current = await qc.fetchQuery({
         queryKey: keys.bookIndex(known.key),
         queryFn: () => get<BookIndex>(bookIndexUrl(known.key)),
@@ -374,18 +406,14 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     }
 
     try {
-      const r = await get<LoadResult>('/api/load', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({path: b.path})});
+      const r = await loadBook(b.path);
       entry = {path: b.path, name: b.name, key: r.key, title: r.title,
                chapters: r.chapters, shards: entry?.shards ?? 0};
       lib[r.key] = entry;
       writeLib(lib);
       server = r.position ?? null;
-      serverHolds.current = b.name;
       void qc.invalidateQueries({queryKey: keys.chapters});
     } catch {
-      serverHolds.current = null;
       if (!entry) {
         setMessage('offline, and this book was never opened here');
         setBookLoading(false);
@@ -415,8 +443,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     if (fast) {
       const untouched = ciRef.current === fast.chapter && idxRef.current === fast.chunk;
       if (!untouched || (at.chapter === fast.chapter && at.chunk === fast.chunk)) {
-        if (serverHolds.current === open.name)
-          tell('/api/open', {chapter: ciRef.current, chunk: idxRef.current});
+        void tellOpen(open.key, ciRef.current, idxRef.current).catch(() => {});
         return;
       }
     }
@@ -485,8 +512,54 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     if (!player) return;
     if (!player.playing) player.armMediaSession({prev: () => goChapter(-1), next: () => goChapter(1)});
     player.toggle();
-    tell(player.playing ? '/api/resume' : '/api/pause');
+    if (player.playing) tellResume();
+    else tellPause();
   }, [player, goChapter]);
+
+  // ------------------------------------------------------------- live updates
+  /* The live stream. One connection, opened once for the life of the app: every
+     event invalidates the query that owns the thing it changed (lib/live.ts),
+     which is why nothing here holds server state of its own. The exception is
+     the reading position, which is not a query - it is the page the reader is
+     looking at, and moving that is a decision rather than a refetch. */
+  const openChapterRef = useRef(openChapter);
+  openChapterRef.current = openChapter;
+
+  const onPosition = useCallback((ev: PositionEvent) => {
+    const b = bookRef.current;
+    const verdict = arbitrate(ev, {
+      book: b?.name ?? null,
+      chapter: ciRef.current,
+      chunk: idxRef.current,
+      playing: playerRef.current?.playing ?? false,
+    });
+    if (verdict.t === 'ignore') return;
+    if (verdict.t === 'offer') {
+      setMoved({chapter: verdict.chapter, chunk: verdict.chunk});
+      return;
+    }
+    // Not playing: just go there. This is the phone-down, laptop-up case, and
+    // it is the whole reason the feature exists.
+    setMoved(null);
+    void openChapterRef.current(verdict.chapter, verdict.chunk);
+  }, []);
+
+  useEffect(() => connectLive(qc, {
+    onState: setLive,
+    onEvent: (ev) => { if (ev.name === 'position') onPosition(ev.data); },
+  }), [qc, onPosition]);
+
+  const follow = useCallback(() => {
+    const to = moved;
+    if (!to) return;
+    setMoved(null);
+    const wasPlaying = player?.playing ?? false;
+    void openChapterRef.current(to.chapter, to.chunk).then((ok) => {
+      if (ok && wasPlaying) void player?.play();
+    });
+  }, [moved, player]);
+
+  const dismissMoved = useCallback(() => setMoved(null), []);
 
   useEffect(() => () => player?.destroy(), [player]);
 
@@ -495,12 +568,13 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     message, conn, offlineChapters, textShards, textBusy, textProgress, textOptOut,
     chapterLoading, bookLoading, resumedAt, queued, fontScale,
     status: status.data,
+    moved, follow, dismissMoved,
     openBook, openChapter, goChapter, setIdx, toggle,
     nudge: (s: number) => player?.nudge(s),
     setFontScale, refreshOffline, saveText, dropText, flush, queueNote, player,
   }), [book, chapters, index, ci, chunks, paras, chapterTitle, idx, mode, playing, waiting,
        message, conn, offlineChapters, textShards, textBusy, textProgress, textOptOut,
-       chapterLoading, bookLoading, resumedAt, queued, fontScale,
+       chapterLoading, bookLoading, resumedAt, queued, fontScale, moved, follow, dismissMoved,
        status.data, openBook, openChapter, goChapter, setIdx, toggle, setFontScale,
        refreshOffline, saveText, dropText, flush, queueNote, player]);
 
