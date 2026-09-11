@@ -1,0 +1,160 @@
+[
+  {
+    "index": 0,
+    "id": "chap_01.xhtml",
+    "title": "The First Chapter",
+    "chunks": [
+      {
+        "text": "The First Chapter",
+        "para": 0,
+        "silent": false
+      },
+      {
+        "text": "This is an ordinary opening paragraph. It has two sentences.",
+        "para": 1,
+        "silent": false
+      },
+      {
+        "text": "A Second-Level Heading",
+        "para": 2,
+        "silent": false
+      },
+      {
+        "text": "Dr. Smith met Mr. Brown at the lab. They argued, e.g. about tokenizers, vs. about money. Ms. Jones and Mrs. Patel and St. Peter and Jr. and Sr. all watched, i.e. nobody left, etc. and then it ended.",
+        "para": 3,
+        "silent": false
+      },
+      {
+        "text": "A Third-Level Heading",
+        "para": 4,
+        "silent": false
+      },
+      {
+        "text": "He said \"go. Then left. She replied 'fine. Then stayed. A bracketed one ends here. And another (like so. continues.",
+        "para": 5,
+        "silent": false
+      },
+      {
+        "text": "Spacing is deliberately awful here, with newlines and tabs and a non-breaking space.",
+        "para": 6,
+        "silent": false
+      }
+    ]
+  },
+  {
+    "index": 1,
+    "id": "chap_02.xhtml",
+    "title": "Quotations and Long Breaths",
+    "chunks": [
+      {
+        "text": "Quotations and Long Breaths",
+        "para": 0,
+        "silent": false
+      },
+      {
+        "text": "The quoted passage lives inside a blockquote. It is short.",
+        "para": 1,
+        "silent": false
+      },
+      {
+        "text": "The quoted passage lives inside a blockquote. It is short.",
+        "para": 2,
+        "silent": false
+      },
+      {
+        "text": "First quoted paragraph. Second quoted paragraph.",
+        "para": 3,
+        "silent": false
+      },
+      {
+        "text": "First quoted paragraph.",
+        "para": 4,
+        "silent": false
+      },
+      {
+        "text": "Second quoted paragraph.",
+        "para": 5,
+        "silent": false
+      },
+      {
+        "text": "When the renderer finally reaches a paragraph of this length it must decide, without any help from the author, where the natural seams are, and so it looks for commas, for semicolons; for colons:",
+        "para": 6,
+        "silent": false
+      },
+      {
+        "text": "and for em dashes—those being the only boundaries it trusts—because cutting mid-phrase produces audible glitches, breath in the wrong place, and a listener who reaches for the pause button instead of the next chapter, which is the one outcome the whole pipeline exists to avoid.",
+        "para": 6,
+        "silent": false
+      },
+      {
+        "text": "…",
+        "para": 7,
+        "silent": true
+      },
+      {
+        "text": "“…”",
+        "para": 8,
+        "silent": true
+      },
+      {
+        "text": "———",
+        "para": 9,
+        "silent": true
+      },
+      {
+        "text": "123 456 — 789",
+        "para": 10,
+        "silent": false
+      }
+    ]
+  },
+  {
+    "index": 2,
+    "id": "chap_03.xhtml",
+    "title": "Multilingual",
+    "chunks": [
+      {
+        "text": "Многоязычная глава",
+        "para": 0,
+        "silent": false
+      },
+      {
+        "text": "Всё смешалось в доме Облонских. Это второе предложение.",
+        "para": 1,
+        "silent": false
+      },
+      {
+        "text": "彼を知り己を知れば百戦して殆うからず。二つ目の文です。",
+        "para": 2,
+        "silent": false
+      },
+      {
+        "text": "Café naïve résumé — élève über Sträße. Segunda fração, com acentuação.",
+        "para": 3,
+        "silent": false
+      },
+      {
+        "text": "中文段落没有西文句号因此不会被切分",
+        "para": 4,
+        "silent": false
+      }
+    ]
+  },
+  {
+    "index": 3,
+    "id": "chap_05.xhtml",
+    "title": "This chapter is absent from the table of contents, so narrat",
+    "chunks": [
+      {
+        "text": "This chapter is absent from the table of contents, so narrator falls back to the first sixty characters of its first paragraph as the title.",
+        "para": 0,
+        "silent": false
+      },
+      {
+        "text": "A short trailing paragraph.",
+        "para": 1,
+        "silent": false
+      }
+    ]
+  }
+]

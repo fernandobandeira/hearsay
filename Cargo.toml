@@ -3,12 +3,39 @@ name = "narrator"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
+description = "Self-hosted TTS book reader — the Rust server"
 
 [dependencies]
-thiserror = "2"
 anyhow = "1"
+axum = { version = "0.8", features = ["macros", "http2"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+epub = "2.1"
+futures-core = "0.3"
 hound = "3"
+mime_guess = "2"
 ndarray = "0.16"
 ort = { version = "=2.0.0-rc.10", features = ["ndarray", "download-binaries"] }
+percent-encoding = "2"
+scraper = "0.23"
+tempfile = "3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-general-category = "1"
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-axum = "0.2"
+
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3

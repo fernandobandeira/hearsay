@@ -1,0 +1,103 @@
+[
+  {
+    "input": {
+      "book_title": "7 Powers",
+      "book_path": "/books/Business/7 Powers (2016).epub",
+      "chapter_index": 3,
+      "chapter_title": "Counter-Positioning",
+      "chunks": [
+        {
+          "text": "The incumbent declines to follow.",
+          "silent": false
+        },
+        {
+          "text": "…",
+          "silent": true
+        },
+        {
+          "text": "Not because it cannot, but because it will not.",
+          "silent": false
+        },
+        {
+          "text": "Collateral damage is the whole point.",
+          "silent": false
+        }
+      ],
+      "chunk_index": 2,
+      "language": "en",
+      "audio": "20260910143012.webm",
+      "captured": "2026-09-10T14:30:12",
+      "transcript": "This is exactly what happened with Netflix, isn't it? The DVD business was the moat — and the anchor.",
+      "stamp": "202609101430"
+    },
+    "derived": {
+      "context": "Not because it cannot, but because it will not. Collateral damage is the whole point.",
+      "chapter_title_used": "Counter-Positioning",
+      "deep_link": "obsidian://narrator-open?book=7%20Powers%20%282016%29.epub&chapter=3&chunk=2"
+    },
+    "filename": "202609101430 this is exactly what happened with.md",
+    "markdown": "---\ntype: fleeting\nsource: voice\nbook: \"7 Powers\"\nchapter: \"Counter-Positioning\"\nposition: chunk 3/4\nlanguage: en\naudio: 20260910143012.webm\ncaptured: 2026-09-10T14:30:12\n---\n\n> [!quote] [7 Powers — Counter-Positioning](obsidian://narrator-open?book=7%20Powers%20%282016%29.epub&chapter=3&chunk=2)\n> Not because it cannot, but because it will not. Collateral damage is the whole point.\n\nThis is exactly what happened with Netflix, isn't it? The DVD business was the moat — and the anchor.\n\n[⏮ this passage in narrator](obsidian://narrator-open?book=7%20Powers%20%282016%29.epub&chapter=3&chunk=2)\n"
+  },
+  {
+    "input": {
+      "book_title": "Преступление и наказание",
+      "book_path": "/books/Philosophy/Преступление и наказание (1866).epub",
+      "chapter_index": 0,
+      "chapter_title": "",
+      "chunks": [
+        {
+          "text": "В начале июля, в чрезвычайно жаркое время…",
+          "silent": false
+        },
+        {
+          "text": "“…”",
+          "silent": true
+        }
+      ],
+      "chunk_index": 0,
+      "language": "ru",
+      "audio": "20260911090500.ogg",
+      "captured": "2026-09-11T09:05:00",
+      "transcript": "Отлично! Заметка 🎧 — guilt-as-a-system, \"not\" remorse; cf. Dr. Smith.",
+      "stamp": "202609110905"
+    },
+    "derived": {
+      "context": "В начале июля, в чрезвычайно жаркое время…",
+      "chapter_title_used": "Section 1",
+      "deep_link": "obsidian://narrator-open?book=%D0%9F%D1%80%D0%B5%D1%81%D1%82%D1%83%D0%BF%D0%BB%D0%B5%D0%BD%D0%B8%D0%B5%20%D0%B8%20%D0%BD%D0%B0%D0%BA%D0%B0%D0%B7%D0%B0%D0%BD%D0%B8%D0%B5%20%281866%29.epub&chapter=0&chunk=0"
+    },
+    "filename": "202609110905 отлично заметка guilt-as-a-system not remorse cf.md",
+    "markdown": "---\ntype: fleeting\nsource: voice\nbook: \"Преступление и наказание\"\nchapter: \"Section 1\"\nposition: chunk 1/2\nlanguage: ru\naudio: 20260911090500.ogg\ncaptured: 2026-09-11T09:05:00\n---\n\n> [!quote] [Преступление и наказание — Section 1](obsidian://narrator-open?book=%D0%9F%D1%80%D0%B5%D1%81%D1%82%D1%83%D0%BF%D0%BB%D0%B5%D0%BD%D0%B8%D0%B5%20%D0%B8%20%D0%BD%D0%B0%D0%BA%D0%B0%D0%B7%D0%B0%D0%BD%D0%B8%D0%B5%20%281866%29.epub&chapter=0&chunk=0)\n> В начале июля, в чрезвычайно жаркое время…\n\nОтлично! Заметка 🎧 — guilt-as-a-system, \"not\" remorse; cf. Dr. Smith.\n\n[⏮ this passage in narrator](obsidian://narrator-open?book=%D0%9F%D1%80%D0%B5%D1%81%D1%82%D1%83%D0%BF%D0%BB%D0%B5%D0%BD%D0%B8%D0%B5%20%D0%B8%20%D0%BD%D0%B0%D0%BA%D0%B0%D0%B7%D0%B0%D0%BD%D0%B8%D0%B5%20%281866%29.epub&chapter=0&chunk=0)\n"
+  },
+  {
+    "input": {
+      "book_title": "Fixture",
+      "book_path": "/books/Tech/Weird [draft] | v2 (2024).epub",
+      "chapter_index": 5,
+      "chapter_title": "",
+      "chunks": [
+        {
+          "text": "…",
+          "silent": true
+        },
+        {
+          "text": "“…”",
+          "silent": true
+        }
+      ],
+      "chunk_index": 1,
+      "language": "en",
+      "audio": "20260911091500.webm",
+      "captured": "2026-09-11T09:15:00",
+      "transcript": "?!… 🎧 —— “”",
+      "stamp": "202609110915"
+    },
+    "derived": {
+      "context": "",
+      "chapter_title_used": "Section 6",
+      "deep_link": "obsidian://narrator-open?book=Weird%20%5Bdraft%5D%20%7C%20v2%20%282024%29.epub&chapter=5&chunk=1"
+    },
+    "filename": "202609110915 voice note.md",
+    "markdown": "---\ntype: fleeting\nsource: voice\nbook: \"Fixture\"\nchapter: \"Section 6\"\nposition: chunk 2/2\nlanguage: en\naudio: 20260911091500.webm\ncaptured: 2026-09-11T09:15:00\n---\n\n> [!quote] [Fixture — Section 6](obsidian://narrator-open?book=Weird%20%5Bdraft%5D%20%7C%20v2%20%282024%29.epub&chapter=5&chunk=1)\n> \n\n?!… 🎧 —— “”\n\n[⏮ this passage in narrator](obsidian://narrator-open?book=Weird%20%5Bdraft%5D%20%7C%20v2%20%282024%29.epub&chapter=5&chunk=1)\n"
+  }
+]

@@ -1,0 +1,788 @@
+[
+  {
+    "input": "",
+    "max_chars": 300,
+    "speakable": false,
+    "sentences": [],
+    "chunks": []
+  },
+  {
+    "input": "   ",
+    "max_chars": 300,
+    "speakable": false,
+    "sentences": [],
+    "chunks": []
+  },
+  {
+    "input": "\n\t  ",
+    "max_chars": 300,
+    "speakable": false,
+    "sentences": [],
+    "chunks": []
+  },
+  {
+    "input": "One sentence only.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "One sentence only."
+    ],
+    "chunks": [
+      "One sentence only."
+    ]
+  },
+  {
+    "input": "One sentence only",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "One sentence only"
+    ],
+    "chunks": [
+      "One sentence only"
+    ]
+  },
+  {
+    "input": "First. Second. Third.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "First.",
+      "Second.",
+      "Third."
+    ],
+    "chunks": [
+      "First. Second. Third."
+    ]
+  },
+  {
+    "input": "First.Second.Third.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "First.Second.Third."
+    ],
+    "chunks": [
+      "First.Second.Third."
+    ]
+  },
+  {
+    "input": "First.  Second.   Third.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "First.",
+      "Second.",
+      "Third."
+    ],
+    "chunks": [
+      "First. Second. Third."
+    ]
+  },
+  {
+    "input": "First.\nSecond.\n\nThird.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "First.",
+      "Second.",
+      "Third."
+    ],
+    "chunks": [
+      "First. Second. Third."
+    ]
+  },
+  {
+    "input": "First.\tSecond.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "First.",
+      "Second."
+    ],
+    "chunks": [
+      "First. Second."
+    ]
+  },
+  {
+    "input": "Dr. Smith went home. He slept.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Dr.",
+      "Smith went home.",
+      "He slept."
+    ],
+    "chunks": [
+      "Dr. Smith went home. He slept."
+    ]
+  },
+  {
+    "input": "Mr. Brown and Mrs. Green and Ms. White met.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Mr.",
+      "Brown and Mrs.",
+      "Green and Ms.",
+      "White met."
+    ],
+    "chunks": [
+      "Mr. Brown and Mrs. Green and Ms. White met."
+    ]
+  },
+  {
+    "input": "It was St. Peter, Jr. and Sr. together.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "It was St.",
+      "Peter, Jr.",
+      "and Sr.",
+      "together."
+    ],
+    "chunks": [
+      "It was St. Peter, Jr. and Sr. together."
+    ]
+  },
+  {
+    "input": "Cats vs. dogs. That is the question.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Cats vs.",
+      "dogs.",
+      "That is the question."
+    ],
+    "chunks": [
+      "Cats vs. dogs. That is the question."
+    ]
+  },
+  {
+    "input": "Tokenizers, e.g. this one, are slow.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Tokenizers, e.g.",
+      "this one, are slow."
+    ],
+    "chunks": [
+      "Tokenizers, e.g. this one, are slow."
+    ]
+  },
+  {
+    "input": "Tokenizers, i.e. this one, are slow.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Tokenizers, i.e.",
+      "this one, are slow."
+    ],
+    "chunks": [
+      "Tokenizers, i.e. this one, are slow."
+    ]
+  },
+  {
+    "input": "Bananas, apples, etc. were on the list.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Bananas, apples, etc.",
+      "were on the list."
+    ],
+    "chunks": [
+      "Bananas, apples, etc. were on the list."
+    ]
+  },
+  {
+    "input": "dr. smith went home. he slept.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "dr.",
+      "smith went home.",
+      "he slept."
+    ],
+    "chunks": [
+      "dr. smith went home. he slept."
+    ]
+  },
+  {
+    "input": "See Dr. Smith.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "See Dr.",
+      "Smith."
+    ],
+    "chunks": [
+      "See Dr. Smith."
+    ]
+  },
+  {
+    "input": "vs. that",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "vs.",
+      "that"
+    ],
+    "chunks": [
+      "vs. that"
+    ]
+  },
+  {
+    "input": "e.g. this",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "e.g.",
+      "this"
+    ],
+    "chunks": [
+      "e.g. this"
+    ]
+  },
+  {
+    "input": "He said \"go.\" Then left.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "He said \"go.",
+      "Then left."
+    ],
+    "chunks": [
+      "He said \"go. Then left."
+    ]
+  },
+  {
+    "input": "She replied 'fine.' Then stayed.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "She replied 'fine.",
+      "Then stayed."
+    ],
+    "chunks": [
+      "She replied 'fine. Then stayed."
+    ]
+  },
+  {
+    "input": "He said “go.” Then left.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "He said “go.",
+      "Then left."
+    ],
+    "chunks": [
+      "He said “go. Then left."
+    ]
+  },
+  {
+    "input": "He said ‘go.’ Then left.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "He said ‘go.",
+      "Then left."
+    ],
+    "chunks": [
+      "He said ‘go. Then left."
+    ]
+  },
+  {
+    "input": "A bracketed one ends here.] And another (like so.) continues.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "A bracketed one ends here.",
+      "And another (like so.",
+      "continues."
+    ],
+    "chunks": [
+      "A bracketed one ends here. And another (like so. continues."
+    ]
+  },
+  {
+    "input": "Ends with a paren.) Next sentence.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Ends with a paren.",
+      "Next sentence."
+    ],
+    "chunks": [
+      "Ends with a paren. Next sentence."
+    ]
+  },
+  {
+    "input": "Nested closers.\"’) Next sentence.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Nested closers.",
+      "Next sentence."
+    ],
+    "chunks": [
+      "Nested closers. Next sentence."
+    ]
+  },
+  {
+    "input": "Question? Answer! Statement.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Question?",
+      "Answer!",
+      "Statement."
+    ],
+    "chunks": [
+      "Question? Answer! Statement."
+    ]
+  },
+  {
+    "input": "Question?\" Answer!” Statement.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Question?",
+      "Answer!",
+      "Statement."
+    ],
+    "chunks": [
+      "Question? Answer! Statement."
+    ]
+  },
+  {
+    "input": "Wait… then go. Done.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Wait… then go.",
+      "Done."
+    ],
+    "chunks": [
+      "Wait… then go. Done."
+    ]
+  },
+  {
+    "input": "Wait... then go. Done.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Wait...",
+      "then go.",
+      "Done."
+    ],
+    "chunks": [
+      "Wait... then go. Done."
+    ]
+  },
+  {
+    "input": "He paused . . . and left. Done.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "He paused .",
+      ".",
+      ".",
+      "and left.",
+      "Done."
+    ],
+    "chunks": [
+      "He paused . . . and left. Done."
+    ]
+  },
+  {
+    "input": "It weighs 3.5 kg. Then it fell.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "It weighs 3.5 kg.",
+      "Then it fell."
+    ],
+    "chunks": [
+      "It weighs 3.5 kg. Then it fell."
+    ]
+  },
+  {
+    "input": "He lives in the U.S.A. Then he left.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "He lives in the U.S.A.",
+      "Then he left."
+    ],
+    "chunks": [
+      "He lives in the U.S.A. Then he left."
+    ]
+  },
+  {
+    "input": "See Fig. 2 for details. Then read on.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "See Fig.",
+      "2 for details.",
+      "Then read on."
+    ],
+    "chunks": [
+      "See Fig. 2 for details. Then read on."
+    ]
+  },
+  {
+    "input": "Chapter 1.2.3 covers it. Next.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Chapter 1.2.3 covers it.",
+      "Next."
+    ],
+    "chunks": [
+      "Chapter 1.2.3 covers it. Next."
+    ]
+  },
+  {
+    "input": "Pi is 3.14159 exactly. Or nearly.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Pi is 3.14159 exactly.",
+      "Or nearly."
+    ],
+    "chunks": [
+      "Pi is 3.14159 exactly. Or nearly."
+    ]
+  },
+  {
+    "input": "Version 2.0. Shipped.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Version 2.0.",
+      "Shipped."
+    ],
+    "chunks": [
+      "Version 2.0. Shipped."
+    ]
+  },
+  {
+    "input": "…",
+    "max_chars": 300,
+    "speakable": false,
+    "sentences": [
+      "…"
+    ],
+    "chunks": [
+      "…"
+    ]
+  },
+  {
+    "input": "“…”",
+    "max_chars": 300,
+    "speakable": false,
+    "sentences": [
+      "“…”"
+    ],
+    "chunks": [
+      "“…”"
+    ]
+  },
+  {
+    "input": "———",
+    "max_chars": 300,
+    "speakable": false,
+    "sentences": [
+      "———"
+    ],
+    "chunks": [
+      "———"
+    ]
+  },
+  {
+    "input": "!!!",
+    "max_chars": 300,
+    "speakable": false,
+    "sentences": [
+      "!!!"
+    ],
+    "chunks": [
+      "!!!"
+    ]
+  },
+  {
+    "input": "   ...   ",
+    "max_chars": 300,
+    "speakable": false,
+    "sentences": [
+      "..."
+    ],
+    "chunks": [
+      "..."
+    ]
+  },
+  {
+    "input": "123",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "123"
+    ],
+    "chunks": [
+      "123"
+    ]
+  },
+  {
+    "input": "Всё смешалось в доме Облонских. Это второе предложение.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Всё смешалось в доме Облонских.",
+      "Это второе предложение."
+    ],
+    "chunks": [
+      "Всё смешалось в доме Облонских. Это второе предложение."
+    ]
+  },
+  {
+    "input": "彼を知り己を知れば百戦して殆うからず。二つ目の文です。",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "彼を知り己を知れば百戦して殆うからず。二つ目の文です。"
+    ],
+    "chunks": [
+      "彼を知り己を知れば百戦して殆うからず。二つ目の文です。"
+    ]
+  },
+  {
+    "input": "中文段落没有西文句号因此不会被切分",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "中文段落没有西文句号因此不会被切分"
+    ],
+    "chunks": [
+      "中文段落没有西文句号因此不会被切分"
+    ]
+  },
+  {
+    "input": "Café naïve résumé — élève über Sträße. Segunda fração, com acentuação.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Café naïve résumé — élève über Sträße.",
+      "Segunda fração, com acentuação."
+    ],
+    "chunks": [
+      "Café naïve résumé — élève über Sträße. Segunda fração, com acentuação."
+    ]
+  },
+  {
+    "input": "Emoji 🎧 survive. Second 📚 sentence.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Emoji 🎧 survive.",
+      "Second 📚 sentence."
+    ],
+    "chunks": [
+      "Emoji 🎧 survive. Second 📚 sentence."
+    ]
+  },
+  {
+    "input": "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps goin.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps goin."
+    ],
+    "chunks": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps goin."
+    ]
+  },
+  {
+    "input": "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going."
+    ],
+    "chunks": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going."
+    ]
+  },
+  {
+    "input": "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps goingz.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps goingz."
+    ],
+    "chunks": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps goingz."
+    ]
+  },
+  {
+    "input": "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going."
+    ],
+    "chunks": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going."
+    ]
+  },
+  {
+    "input": "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going.     ",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going."
+    ],
+    "chunks": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going."
+    ]
+  },
+  {
+    "input": "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps goingz.     ",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps goingz."
+    ],
+    "chunks": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps goingz."
+    ]
+  },
+  {
+    "input": "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps ove. The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps ove.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps ove.",
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps ove."
+    ],
+    "chunks": [
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps ove.",
+      "The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps over the lazy dog and keeps going The quick brown fox jumps ove."
+    ]
+  },
+  {
+    "input": "When the renderer finally reaches a paragraph of this length it must decide, without any help from the author, where the natural seams are, and so it looks for commas, for semicolons; for colons: and for em dashes—those being the only boundaries it trusts—because cutting mid-phrase produces audible glitches, breath in the wrong place, and a listener who reaches for the pause button instead of the next chapter, which is the one outcome the whole pipeline exists to avoid.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "When the renderer finally reaches a paragraph of this length it must decide, without any help from the author, where the natural seams are, and so it looks for commas, for semicolons; for colons: and for em dashes—those being the only boundaries it trusts—because cutting mid-phrase produces audible glitches, breath in the wrong place, and a listener who reaches for the pause button instead of the next chapter, which is the one outcome the whole pipeline exists to avoid."
+    ],
+    "chunks": [
+      "When the renderer finally reaches a paragraph of this length it must decide, without any help from the author, where the natural seams are, and so it looks for commas, for semicolons; for colons:",
+      "and for em dashes—those being the only boundaries it trusts—because cutting mid-phrase produces audible glitches, breath in the wrong place, and a listener who reaches for the pause button instead of the next chapter, which is the one outcome the whole pipeline exists to avoid."
+    ]
+  },
+  {
+    "input": "A sentence with no internal punctuation at all cannot be split on clause boundaries because there are none to find and so the whole of it is handed to the renderer in a single piece no matter how long it grows which is exactly what happens here as the words continue to accumulate past the point where any reasonable author would have stopped and inserted a full stop or at the very least a comma but this one does not because the entire purpose of the string is to drive the chunker down the branch where the buffer never exceeds the limit since there is only one part to iterate over and therefore the output is a single chunk that is very much longer than the maximum character count that was requested by the caller which is the surprising behaviour this fixture exists to record for the benefit of whoever ports it.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "A sentence with no internal punctuation at all cannot be split on clause boundaries because there are none to find and so the whole of it is handed to the renderer in a single piece no matter how long it grows which is exactly what happens here as the words continue to accumulate past the point where any reasonable author would have stopped and inserted a full stop or at the very least a comma but this one does not because the entire purpose of the string is to drive the chunker down the branch where the buffer never exceeds the limit since there is only one part to iterate over and therefore the output is a single chunk that is very much longer than the maximum character count that was requested by the caller which is the surprising behaviour this fixture exists to record for the benefit of whoever ports it."
+    ],
+    "chunks": [
+      "A sentence with no internal punctuation at all cannot be split on clause boundaries because there are none to find and so the whole of it is handed to the renderer in a single piece no matter how long it grows which is exactly what happens here as the words continue to accumulate past the point where any reasonable author would have stopped and inserted a full stop or at the very least a comma but this one does not because the entire purpose of the string is to drive the chunker down the branch where the buffer never exceeds the limit since there is only one part to iterate over and therefore the output is a single chunk that is very much longer than the maximum character count that was requested by the caller which is the surprising behaviour this fixture exists to record for the benefit of whoever ports it."
+    ]
+  },
+  {
+    "input": "Sentence number 1 here. Sentence number 2 here. Sentence number 3 here. Sentence number 4 here. Sentence number 5 here. Sentence number 6 here. Sentence number 7 here. Sentence number 8 here. Sentence number 9 here. Sentence number 10 here. Sentence number 11 here. Sentence number 12 here. Sentence number 13 here. Sentence number 14 here. Sentence number 15 here. Sentence number 16 here. Sentence number 17 here. Sentence number 18 here. Sentence number 19 here. Sentence number 20 here. Sentence number 21 here. Sentence number 22 here. Sentence number 23 here. Sentence number 24 here. Sentence number 25 here. Sentence number 26 here. Sentence number 27 here. Sentence number 28 here. Sentence number 29 here. Sentence number 30 here.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "Sentence number 1 here.",
+      "Sentence number 2 here.",
+      "Sentence number 3 here.",
+      "Sentence number 4 here.",
+      "Sentence number 5 here.",
+      "Sentence number 6 here.",
+      "Sentence number 7 here.",
+      "Sentence number 8 here.",
+      "Sentence number 9 here.",
+      "Sentence number 10 here.",
+      "Sentence number 11 here.",
+      "Sentence number 12 here.",
+      "Sentence number 13 here.",
+      "Sentence number 14 here.",
+      "Sentence number 15 here.",
+      "Sentence number 16 here.",
+      "Sentence number 17 here.",
+      "Sentence number 18 here.",
+      "Sentence number 19 here.",
+      "Sentence number 20 here.",
+      "Sentence number 21 here.",
+      "Sentence number 22 here.",
+      "Sentence number 23 here.",
+      "Sentence number 24 here.",
+      "Sentence number 25 here.",
+      "Sentence number 26 here.",
+      "Sentence number 27 here.",
+      "Sentence number 28 here.",
+      "Sentence number 29 here.",
+      "Sentence number 30 here."
+    ],
+    "chunks": [
+      "Sentence number 1 here. Sentence number 2 here. Sentence number 3 here. Sentence number 4 here. Sentence number 5 here. Sentence number 6 here. Sentence number 7 here. Sentence number 8 here. Sentence number 9 here. Sentence number 10 here. Sentence number 11 here. Sentence number 12 here.",
+      "Sentence number 13 here. Sentence number 14 here. Sentence number 15 here. Sentence number 16 here. Sentence number 17 here. Sentence number 18 here. Sentence number 19 here. Sentence number 20 here. Sentence number 21 here. Sentence number 22 here. Sentence number 23 here. Sentence number 24 here.",
+      "Sentence number 25 here. Sentence number 26 here. Sentence number 27 here. Sentence number 28 here. Sentence number 29 here. Sentence number 30 here."
+    ]
+  },
+  {
+    "input": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB; CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC: DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB; CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC: DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD."
+    ],
+    "chunks": [
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA,",
+      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB;",
+      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC:",
+      "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD."
+    ]
+  },
+  {
+    "input": "One, two, three—four; five: six. XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "One, two, three—four; five: six.",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX."
+    ],
+    "chunks": [
+      "One, two, three—four; five: six.",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX."
+    ]
+  },
+  {
+    "input": "  leading and trailing whitespace.   ",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "leading and trailing whitespace."
+    ],
+    "chunks": [
+      "leading and trailing whitespace."
+    ]
+  },
+  {
+    "input": "collapsed    spaces are NOT collapsed by sentences(). Only by extract_chapters.",
+    "max_chars": 300,
+    "speakable": true,
+    "sentences": [
+      "collapsed    spaces are NOT collapsed by sentences().",
+      "Only by extract_chapters."
+    ],
+    "chunks": [
+      "collapsed    spaces are NOT collapsed by sentences(). Only by extract_chapters."
+    ]
+  }
+]
