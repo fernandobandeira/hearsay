@@ -30,6 +30,8 @@ jobs:
       - run: cargo test
 
   build:
+    # A failing test must block the publish - the image only builds on green.
+    needs: [test]
     strategy:
       matrix:
         include:
