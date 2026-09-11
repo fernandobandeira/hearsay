@@ -7,6 +7,7 @@ description = "Self-hosted TTS book reader — the Rust server"
 
 [dependencies]
 anyhow = "1"
+async-stream = "0.3"
 axum = { version = "0.8", features = ["macros", "http2"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 base64 = "0.22"
@@ -17,6 +18,7 @@ futures-core = "0.3"
 hound = "3"
 mime_guess = "2"
 ndarray = "0.16"
+notify = "8"
 ort = { version = "=2.0.0-rc.10", features = ["ndarray", "download-binaries"] }
 percent-encoding = "2"
 scraper = "0.23"
@@ -33,7 +35,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-general-category = "1"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-axum = "0.2"
+tokio-util = { version = "0.7", features = ["io"] }
+whisper-rs = { version = "0.16", default-features = false, optional = true }
 
+
+[features]
+default = ["stt"]
+stt = ["dep:whisper-rs"]
 
 [dev-dependencies]
 tempfile = "3"

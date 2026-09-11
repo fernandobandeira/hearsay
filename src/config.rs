@@ -55,7 +55,9 @@ pub struct Config {
     pub kokoro_voices_dir: PathBuf,
     pub fake_tts: bool,
 
+    pub models: PathBuf,
     pub whisper_model: PathBuf,
+    pub whisper_vad_model: Option<PathBuf>,
     pub whisper_prompt: String,
 
     pub chapter_bitrate: String,
@@ -83,7 +85,10 @@ impl Config {
         let vault = env("NARRATOR_VAULT").map(PathBuf::from).filter(|p| {
             let ok = p.is_dir();
             if !ok {
-                tracing::warn!("NARRATOR_VAULT={} is not a directory; vault integration off", p.display());
+                tracing::warn!(
+                    "NARRATOR_VAULT={} is not a directory; vault integration off",
+                    p.display()
+                );
             }
             ok
         });
@@ -99,9 +104,8 @@ impl Config {
             None => work.clone(),
         };
         if let Some(v) = &vault {
-            books.push(v.join(
-                env("BOOKS_SUBDIR").unwrap_or_else(|| "03 - Resources/Books".into()),
-            ));
+            books
+                .push(v.join(env("BOOKS_SUBDIR").unwrap_or_else(|| "03 - Resources/Books".into())));
         }
         let models = PathBuf::from(env("NARRATOR_MODELS").unwrap_or_else(|| "/models".into()));
         Self {
@@ -130,10 +134,17 @@ impl Config {
                 .unwrap_or_else(|| models.join("kokoro/voices")),
             fake_tts: flag("NARRATOR_FAKE_TTS", false),
 
-            whisper_model: env("WHISPER_MODEL")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| models.join("whisper/ggml-large-v3-turbo-q5_0.bin")),
+            whisper_model: crate::stt::model_path(
+                &env("WHISPER_MODEL").unwrap_or_else(|| "large-v3-turbo-q5_0".into()),
+                &models,
+            ),
+            whisper_vad_model: Some(
+                env("WHISPER_VAD_MODEL")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| models.join("whisper/ggml-silero-v5.1.2.bin")),
+            ),
             whisper_prompt: env("WHISPER_PROMPT").unwrap_or_default(),
+            models,
 
             chapter_bitrate: env("CHAPTER_BITRATE").unwrap_or_else(|| "64k".into()),
             chapter_gap_s: num("CHAPTER_GAP_S", 0.30),

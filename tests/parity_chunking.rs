@@ -62,7 +62,12 @@ fn sentence_splitting_and_chunking_match_python_exactly() {
             ));
         }
     }
-    assert!(bad.is_empty(), "{} mismatches:\n{}", bad.len(), bad.join("\n"));
+    assert!(
+        bad.is_empty(),
+        "{} mismatches:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
 }
 
 #[test]
@@ -114,7 +119,10 @@ fn duration_estimates_match_python() {
         for (i, k) in ch.chunks.iter().enumerate() {
             let w = want.chunks[&ci.to_string()][i];
             let got = est_chunk_s(k, want.params.silence);
-            assert!((got - w).abs() < 1e-9, "chapter {ci} chunk {i}: {got} != {w}");
+            assert!(
+                (got - w).abs() < 1e-9,
+                "chapter {ci} chunk {i}: {got} != {w}"
+            );
         }
         let got = est_chapter_s(
             &ch.chunks,
@@ -295,7 +303,12 @@ fn a_real_book_chunks_identically_to_python() {
             ));
         }
     }
-    assert!(bad.is_empty(), "{} mismatches:\n{}", bad.len(), bad.join("\n"));
+    assert!(
+        bad.is_empty(),
+        "{} mismatches:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
 }
 
 #[test]

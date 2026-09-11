@@ -201,26 +201,19 @@ pub struct NoteInput<'a> {
 /// The deep link the Obsidian plugin registers: it reopens the reader at exactly
 /// this passage.
 pub fn deep_link(book_file: &str, chapter: usize, chunk: usize) -> String {
-    let enc = percent_encoding::utf8_percent_encode(
-        book_file,
-        percent_encoding::NON_ALPHANUMERIC,
-    )
-    .to_string()
-    // python's `quote()` leaves these alone by default.
-    .replace("%2F", "/")
-    .replace("%2D", "-")
-    .replace("%2E", ".")
-    .replace("%5F", "_")
-    .replace("%7E", "~");
+    let enc = percent_encoding::utf8_percent_encode(book_file, percent_encoding::NON_ALPHANUMERIC)
+        .to_string()
+        // python's `quote()` leaves these alone by default.
+        .replace("%2F", "/")
+        .replace("%2D", "-")
+        .replace("%2E", ".")
+        .replace("%5F", "_")
+        .replace("%7E", "~");
     format!("obsidian://narrator-open?book={enc}&chapter={chapter}&chunk={chunk}")
 }
 
 /// Vault convention: `YYYYMMDDHHMM few words of the thought.md`.
-pub fn note_filename(
-    dir: &Path,
-    stamp: &chrono::DateTime<chrono::Local>,
-    text: &str,
-) -> String {
+pub fn note_filename(dir: &Path, stamp: &chrono::DateTime<chrono::Local>, text: &str) -> String {
     let cleaned: String = text
         .chars()
         .filter(|c| is_speakable_char(*c) || *c == '_' || *c == ' ' || *c == '-')
@@ -257,7 +250,10 @@ pub fn note_markdown(n: &NoteInput<'_>) -> String {
         &format!("captured: {}", n.stamp.format("%Y-%m-%dT%H:%M:%S")),
         "---",
         "",
-        &format!("> [!quote] [{} — {}]({deep})", n.book_title, n.chapter_title),
+        &format!(
+            "> [!quote] [{} — {}]({deep})",
+            n.book_title, n.chapter_title
+        ),
         &format!("> {}", n.context),
         "",
         n.text,
@@ -287,7 +283,10 @@ mod tests {
     #[test]
     fn positions_json_matches_python_dumps_indent_one() {
         let mut m = Positions::new();
-        m.insert("Bok \u{e5}.epub".into(), pos(0, 3, "Kapitel \u{e9}", 10, 2, "2026-01-01T00:00:00"));
+        m.insert(
+            "Bok \u{e5}.epub".into(),
+            pos(0, 3, "Kapitel \u{e9}", 10, 2, "2026-01-01T00:00:00"),
+        );
         let s = dumps_indent1(&Value::Object(m));
         assert_eq!(
             s,
@@ -300,9 +299,18 @@ mod tests {
     #[test]
     fn reading_log_sorts_newest_first_and_is_stable() {
         let mut m = Positions::new();
-        m.insert("a.epub".into(), pos(0, 0, "One", 5, 3, "2026-01-02T00:00:00"));
-        m.insert("b.epub".into(), pos(1, 2, "Two", 7, 3, "2026-01-03T00:00:00"));
-        m.insert("c.epub".into(), pos(2, 4, "Three", 9, 3, "2026-01-03T00:00:00"));
+        m.insert(
+            "a.epub".into(),
+            pos(0, 0, "One", 5, 3, "2026-01-02T00:00:00"),
+        );
+        m.insert(
+            "b.epub".into(),
+            pos(1, 2, "Two", 7, 3, "2026-01-03T00:00:00"),
+        );
+        m.insert(
+            "c.epub".into(),
+            pos(2, 4, "Three", 9, 3, "2026-01-03T00:00:00"),
+        );
         let log = reading_log(&m);
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines[0], "# Reading Log");
@@ -330,7 +338,10 @@ mod tests {
             note_filename(d, &t, "Hey! This, is a test of the system."),
             "202609111504 hey this is a test of.md"
         );
-        assert_eq!(note_filename(d, &t, "!!! ???"), "202609111504 voice note.md");
+        assert_eq!(
+            note_filename(d, &t, "!!! ???"),
+            "202609111504 voice note.md"
+        );
     }
 
     use chrono::TimeZone;

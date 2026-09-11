@@ -74,7 +74,10 @@ pub fn book_dir(work: &Path, key: &str) -> PathBuf {
 
 pub fn chapter_files(work: &Path, key: &str, ci: usize) -> (PathBuf, PathBuf) {
     let d = book_dir(work, key);
-    (d.join(format!("ch{ci:03}.m4a")), d.join(format!("ch{ci:03}.json")))
+    (
+        d.join(format!("ch{ci:03}.m4a")),
+        d.join(format!("ch{ci:03}.json")),
+    )
 }
 
 pub fn read_manifest(work: &Path, key: &str, ci: usize) -> Option<Manifest> {
@@ -182,8 +185,16 @@ pub fn build(
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
             .arg(&list)
-            .args(["-c:a", "aac", "-b:a", &cfg.chapter_bitrate, "-ac", "1",
-                   "-movflags", "+faststart"]);
+            .args([
+                "-c:a",
+                "aac",
+                "-b:a",
+                &cfg.chapter_bitrate,
+                "-ac",
+                "1",
+                "-movflags",
+                "+faststart",
+            ]);
         if !book_title.is_empty() {
             cmd.args(["-metadata", &format!("album={book_title}")]);
         }
@@ -196,7 +207,11 @@ pub fn build(
             let _ = std::fs::remove_file(&part);
             let err = String::from_utf8_lossy(&r.stderr);
             return Err(PackError::Ffmpeg(
-                err.trim().lines().last().unwrap_or("ffmpeg failed").to_string(),
+                err.trim()
+                    .lines()
+                    .last()
+                    .unwrap_or("ffmpeg failed")
+                    .to_string(),
             ));
         }
         std::fs::rename(&part, &m4a)?;
@@ -337,19 +352,30 @@ pub fn build_hls(cfg: &Config, key: &str, ci: usize, base_url: &str) -> Result<P
     }
     building_insert(key, ci);
     let result = (|| -> Result<PathBuf, PackError> {
-        let tmp = d.with_file_name(format!("{}.part", d.file_name().and_then(|s| s.to_str()).unwrap_or("ch")));
+        let tmp = d.with_file_name(format!(
+            "{}.part",
+            d.file_name().and_then(|s| s.to_str()).unwrap_or("ch")
+        ));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
         let r = Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-i"])
             .arg(&m4a)
             .args([
-                "-c:a", "copy", "-f", "hls",
-                "-hls_time", &cfg.hls_segment_s.to_string(),
-                "-hls_playlist_type", "vod",
-                "-hls_segment_type", "fmp4",
-                "-hls_fmp4_init_filename", "init.mp4",
-                "-hls_base_url", base_url,
+                "-c:a",
+                "copy",
+                "-f",
+                "hls",
+                "-hls_time",
+                &cfg.hls_segment_s.to_string(),
+                "-hls_playlist_type",
+                "vod",
+                "-hls_segment_type",
+                "fmp4",
+                "-hls_fmp4_init_filename",
+                "init.mp4",
+                "-hls_base_url",
+                base_url,
                 "-hls_segment_filename",
             ])
             .arg(tmp.join("seg%05d.m4s"))
@@ -390,10 +416,19 @@ mod tests {
 
     fn man(starts: Vec<f64>) -> Manifest {
         Manifest {
-            book: "B".into(), chapter: 0, title: String::new(), chunks: starts.len(),
-            duration: *starts.last().unwrap_or(&0.0), starts, gap: 0.3, para_gap: 0.6,
-            bitrate: "64k".into(), sample_rate: 24000, bytes: 0,
-            built: String::new(), build_s: 0.0,
+            book: "B".into(),
+            chapter: 0,
+            title: String::new(),
+            chunks: starts.len(),
+            duration: *starts.last().unwrap_or(&0.0),
+            starts,
+            gap: 0.3,
+            para_gap: 0.6,
+            bitrate: "64k".into(),
+            sample_rate: 24000,
+            bytes: 0,
+            built: String::new(),
+            build_s: 0.0,
         }
     }
 
