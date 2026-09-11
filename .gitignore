@@ -5,3 +5,4 @@
 /web
 node_modules
 /scripts/golden/.venv
+scripts/golden/.venv
