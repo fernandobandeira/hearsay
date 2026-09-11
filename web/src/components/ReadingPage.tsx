@@ -154,7 +154,8 @@ export function ReadingPage({
         ref={box}
         data-testid="reading"
         onScroll={onScroll}
-        className="absolute inset-0 overflow-y-auto overflow-x-hidden pb-[45vh] pt-10 [-webkit-overflow-scrolling:touch]"
+        className="absolute inset-0 overflow-y-auto overflow-x-hidden pt-3
+                   [-webkit-overflow-scrolling:touch] [overscroll-behavior:contain]"
         style={{fontSize: `${size}px`}}
       >
         {blocks.map((b) => (
@@ -190,6 +191,13 @@ export function ReadingPage({
               </button>
             : 'end of the book'}
         </div>
+        {/* Run-out, so the *last* chunk can still be centred like every other
+            one. It used to be `pb-[45vh]`, which was 45 % of the whole screen
+            measured against a box that is now the screen minus two bars - a
+            fifth of a phone screen of guaranteed blank at the end of every
+            chapter. A percentage of the reading box is the same rule stated
+            against the thing it is actually padding. */}
+        <div aria-hidden className="h-[45%]" />
       </div>
 
       {playing && !following && (
@@ -212,7 +220,7 @@ export function ReadingPage({
 export function ChapterSkeleton() {
   const widths = ['96%', '88%', '92%', '70%', '94%', '86%', '90%', '64%', '93%', '82%', '88%', '48%'];
   return (
-    <div data-testid="chapter-skeleton" className="absolute inset-0 overflow-hidden pt-10">
+    <div data-testid="chapter-skeleton" className="absolute inset-0 overflow-hidden pt-3">
       <div className="mx-auto max-w-[min(40em,92vw)] space-y-3 px-[max(18px,3vw)]">
         {widths.map((w, i) => (
           <Skeleton key={i} className="h-4 bg-white/[0.045]" style={{width: w}} />

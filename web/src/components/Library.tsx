@@ -14,14 +14,15 @@
  * falls back to what this device already knows rather than showing an error.
  */
 import {useEffect, useState} from 'react';
-import {ChevronLeft, Type} from 'lucide-react';
+import {ChevronLeft, ChevronRight} from 'lucide-react';
 import {Sheet, SheetContent, SheetHeader, SheetTitle} from '@/components/ui/sheet';
 import {ScrollArea} from '@/components/ui/scroll-area';
 import {Separator} from '@/components/ui/separator';
 import {Skeleton} from '@/components/ui/skeleton';
-import {Slider} from '@/components/ui/slider';
 import {Spinner} from '@/components/ui/spinner';
 import {useBooks} from '@/lib/api';
+import {storageEstimate} from '@/lib/offline';
+import {bytes as fmtBytes} from '@/lib/format';
 import {initialView, type DrawerView} from '@/lib/drawernav';
 import {cn} from '@/lib/utils';
 import {useNarrator} from '@/state';
@@ -56,13 +57,15 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      {/* The drawer is `position: fixed`, so the body's safe-area padding does not
-          reach it: without these two insets the notch covers the Books header and
-          the home indicator sits on the chapter action bar. */}
+      {/* Radix portals the drawer to `body`, so it is a sibling of `#root` and
+          none of the scaffold's padding reaches it - it spends the insets
+          itself, which is not a double count for exactly that reason. Without
+          them the notch covers the Books header and the home indicator sits on
+          the chapter action bar. */}
       <SheetContent
         side="left"
         className="flex w-[min(400px,88vw)] flex-col gap-0 p-0
-                   pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]"
+                   pt-[var(--sat)] pb-[var(--sab)] pl-[var(--sal)]"
       >
         <SheetHeader className="gap-0.5 px-4 pb-1.5 pt-4">
           {view === 'books' ? (
@@ -159,23 +162,60 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
         </div>
 
         <Separator />
-
-        {/* The one thing the removed reading-mode button actually did. It sits
-            under the stack rather than inside a level: on a phone the top bar
-            hides its own copy, so this is the only text-size control there is,
-            and it must not be a level away. */}
-        <div className="flex items-center gap-3 px-4 py-2">
-          <Type className="size-3 shrink-0 text-muted-foreground" />
-          <span className="shrink-0 text-[11px] text-muted-foreground">text size</span>
-          <Slider className="flex-1" min={70} max={180} step={5}
-                  value={[Math.round(n.fontScale * 100)]}
-                  onValueChange={([v]) => n.setFontScale(v / 100)}
-                  aria-label="Reading text size" />
-          <span className="w-8 shrink-0 text-right text-[10px] tabular-nums text-muted-foreground">
-            {Math.round(n.fontScale * 100)}%
-          </span>
-        </div>
+        <Diagnostics />
       </SheetContent>
     </Sheet>
+  );
+}
+
+/**
+ * The diagnostics corner.
+ *
+ * "streaming · buffer 15 · RTF 4.7× · 2.5h cached · 0.37/50 GB" used to sit in
+ * the top bar, which is the one surface that is on screen while reading - a
+ * render-pipeline readout in front of the words. It has a home now, and the
+ * home is shut: one line you have to tap. Everything in it answers "is the
+ * server keeping up", never "what am I reading", which is why it is here and
+ * not there.
+ *
+ * The text-size slider used to occupy this row. It moved to the top bar's `T`,
+ * which is the single place it lives now - on a phone and on a desktop.
+ */
+function Diagnostics() {
+  const n = useNarrator();
+  const [open, setOpen] = useState(false);
+  const [store, setStore] = useState<{usage: number; quota: number} | null>(null);
+  useEffect(() => { if (open) void storageEstimate().then(setStore); }, [open]);
+  const s = n.status;
+  const lines: string[] = [];
+  if (s) {
+    if (!s.model_ready) lines.push('the voice model is still loading');
+    lines.push(`server ${s.status}${s.rtf ? ` · ${s.rtf}× realtime` : ''}`);
+    if (s.building != null) lines.push(`packing chapter ${s.building + 1}`);
+    if (s.queue?.length) lines.push(`${s.queue.length} chapter${s.queue.length > 1 ? 's' : ''} queued to render`);
+    if (s.done_min != null && s.book_min)
+      lines.push(`${(s.done_min / 60).toFixed(1)}h of ${(s.book_min / 60).toFixed(1)}h rendered`);
+    if (s.disk_gb != null) lines.push(`server cache ${s.disk_gb}/${s.disk_cap_gb} GB`);
+  } else {
+    lines.push('the server is not answering');
+  }
+  if (store) lines.push(`this device ${fmtBytes(store.usage)}${store.quota ? ` of ${fmtBytes(store.quota)}` : ''}`);
+  return (
+    <div data-testid="diag" className="px-3 py-1.5">
+      <button
+        data-testid="diag-toggle"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-1 rounded py-0.5 text-[10px] uppercase
+                   tracking-[0.16em] text-muted-foreground/70 transition-colors hover:text-foreground"
+      >
+        <ChevronRight className={cn('size-3 transition-transform', open && 'rotate-90')} />
+        diagnostics
+      </button>
+      {open && (
+        <div data-testid="diag-lines" className="space-y-0.5 pl-4 pt-1 text-[11px] leading-relaxed text-muted-foreground">
+          {lines.map((l) => <div key={l}>{l}</div>)}
+        </div>
+      )}
+    </div>
   );
 }

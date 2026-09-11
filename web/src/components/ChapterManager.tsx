@@ -1,35 +1,51 @@
 /**
  * The chapter manager: what replaced "render ahead N hours".
  *
- * Rendering ahead by the clock was a guess. This is the same machinery addressed
- * by name - every chapter's state, multi-select, and three verbs.
+ * Two things changed after the phone review, and both were about the list being
+ * the point and everything around it being in the way.
  *
- * The two offline tiers are stated as two labelled rows, not as two badges that
- * look alike, because they are different in kind and one of them happens without
- * being asked: the book's *text* is taken whole on first open (cheap, and the
- * only reason the reader works with no network), and its *audio* is per chapter
- * and always explicit. Anything taken without asking needs a way to give back, so
- * the text row carries its own remove - and remembers the refusal.
+ * **The two tiers are one line.** They used to be two bordered cards with a
+ * label, a sentence and a badge each - 133 px of a 852 px screen, restating per
+ * book what every chapter row already says per chapter. They are now one line
+ * of small print: what the text copy costs, its remove/save affordance, and how
+ * many chapters are on the device. The caption explaining the verbs, the
+ * "server has 2.5h of 331.3h rendered" line and the text-size row all went with
+ * them; text size lives in the top bar's `T` now, and the pipeline figures live
+ * in the diagnostics corner at the bottom of the Books level.
+ *
+ * **Download is one action and selection is a mode.** "Render" is gone from the
+ * UI entirely - see lib/download.ts. Nobody wants a rendered chapter they
+ * cannot listen to offline, so download climbs the whole ladder itself: queue
+ * the render, wait for it, ask for the pack, wait for it, store the m4a. And
+ * picking chapters no longer means hitting a 14 px checkbox: "download…" or
+ * "remove…" starts a mode in which whole rows toggle on a tap, with "next 5",
+ * "next 20" and "rest" for the case that is actually common, and a confirm bar
+ * that says how many and roughly how big before anything happens. Outside a
+ * mode a tap on a row does the obvious thing and opens that chapter.
  */
-import {useEffect, useLayoutEffect, useMemo, useRef, useState} from 'react';
+import {useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState} from 'react';
 import {
   Check, CircleDashed, Clock, Download, FileAudio, HardDriveDownload, Loader2,
-  PieChart, Trash2, Type, Waves,
+  PieChart, Trash2, Type,
 } from 'lucide-react';
 import {Button} from '@/components/ui/button';
-import {Checkbox} from '@/components/ui/checkbox';
 import {Input} from '@/components/ui/input';
 import {Progress} from '@/components/ui/progress';
 import {ScrollArea} from '@/components/ui/scroll-area';
 import {Skeleton} from '@/components/ui/skeleton';
-import {useChapterActions, useChapters} from '@/lib/api';
+import {useQueryClient} from '@tanstack/react-query';
+import {get, keys, useChapterActions, useChapters} from '@/lib/api';
 import {chapterState, type ChapterStateKey, type Job} from '@/lib/chapterstate';
+import {
+  anyEstimated, estimateBytes, isAction, jobFor, needsRender, phaseFor,
+} from '@/lib/download';
 import {centeredScrollTop, scrollTargetIndex} from '@/lib/drawernav';
-import {downloadChapter, removeChapter, storageEstimate} from '@/lib/offline';
+import {chosen, idle, rangeAfter, reduce} from '@/lib/selection';
+import {cachedChapters, downloadChapter, removeChapter} from '@/lib/offline';
 import {bytes as fmtBytes} from '@/lib/format';
 import {cn} from '@/lib/utils';
 import {useNarrator} from '@/state';
-import type {ChapRow} from '@/lib/types';
+import type {ChapRow, ChaptersResult} from '@/lib/types';
 
 /** One icon per state, so a glance down the list reads as a picture. */
 const ICON: Record<ChapterStateKey, typeof Check> = {
@@ -41,6 +57,9 @@ const TONE = {
   done: 'text-foreground/50', none: 'text-muted-foreground/80',
 } as const;
 
+/** How long a single chapter may sit on one rung before we give up on it. */
+const RUNG_TIMEOUT_MS = 45 * 60_000;
+
 export function ChapterManager({open, active, onPick}: {
   /** the drawer is up: what gates the chapters query */
   open: boolean;
@@ -49,13 +68,14 @@ export function ChapterManager({open, active, onPick}: {
   onPick: (ci: number) => void;
 }) {
   const n = useNarrator();
+  const qc = useQueryClient();
   const {data, isPending} = useChapters(open && !!n.book);
   const actions = useChapterActions();
-  const [sel, setSel] = useState<Set<number>>(new Set());
+  const [sel, dispatch] = useReducer(reduce, idle);
   const [filter, setFilter] = useState('');
   const [jobs, setJobs] = useState<Record<number, Job>>({});
   const [err, setErr] = useState<string | null>(null);
-  const [store, setStore] = useState<{usage: number; quota: number} | null>(null);
+  const [running, setRunning] = useState(false);
 
   const rows = useMemo(() => {
     const byIndex = new Map<number, ChapRow>();
@@ -68,6 +88,18 @@ export function ChapterManager({open, active, onPick}: {
   const hits = useMemo(
     () => rows.filter((r) => !filter || r.title.toLowerCase().includes(filter.toLowerCase())),
     [rows, filter]);
+
+  /* Which rows the current mode may act on. Download skips what is already
+     here; remove can only touch what is. Threaded into every selection event so
+     a row that finished downloading mid-selection cannot stay picked. */
+  const eligible = useMemo(() => {
+    if (!sel.verb) return [];
+    return hits
+      .filter((r) => sel.verb === 'remove'
+        ? n.offlineChapters.has(r.i)
+        : !n.offlineChapters.has(r.i))
+      .map((r) => r.i);
+  }, [hits, sel.verb, n.offlineChapters]);
 
   /* Centring the chapter being read.
      Once per visit to this level, never while he is scrolling: `done` is armed
@@ -116,121 +148,174 @@ export function ChapterManager({open, active, onPick}: {
     return () => cancelAnimationFrame(raf);
   }, [open, active, hits, filter, n.ci]);
 
-  const toggle = (i: number) => setSel((s) => {
-    const next = new Set(s);
-    next.has(i) ? next.delete(i) : next.add(i);
-    return next;
-  });
+  const picks = chosen(sel);
+  const pickedRows = useMemo(
+    () => rows.filter((r) => sel.picked.has(r.i)), [rows, sel.picked]);
 
-  const chosen = () => [...sel].sort((a, b) => a - b);
-
-  async function download() {
+  // ------------------------------------------------------------------- the run
+  /**
+   * Climb lib/download.ts's ladder for every picked chapter.
+   *
+   * The whole selection's renders are queued in one call first, so the server's
+   * worker is never idle while this device is busy storing an earlier chapter;
+   * then each chapter is walked rung by rung.
+   *
+   * It does its own polling rather than reading the rows this component
+   * rendered with, and that is not a detail: the rungs are minutes apart, the
+   * drawer is the thing he closes to go back to reading, and closing it
+   * unmounts this component and switches off `useChapters`. The old version
+   * closed over `data` and waited on a snapshot that could never change, so it
+   * could only ever time out. Writing each poll back into the query cache keeps
+   * the list in front of him live for free, and the run survives the drawer.
+   */
+  async function runDownload(cis: number[]) {
     const key = n.book?.key;
     if (!key) return;
     setErr(null);
-    for (const ci of chosen()) {
-      if (n.offlineChapters.has(ci)) continue;
-      try {
-        const row = rows.find((r) => r.i === ci);
-        if (!row?.m4a) {
-          setJobs((j) => ({...j, [ci]: 'packing'}));
-          await actions.build.mutateAsync([ci]);
-          await waitFor(() => !!data?.chapters.find((r) => r.i === ci)?.m4a, 45 * 60_000);
-        }
-        setJobs((j) => ({...j, [ci]: 'saving'}));
-        await downloadChapter(key, ci);
-      } catch (e) {
-        setErr(`chapter ${ci + 1}: ${e instanceof Error ? e.message : String(e)}`);
-      } finally {
-        setJobs(({[ci]: _, ...rest}) => rest);
-        await n.refreshOffline();
+    setRunning(true);
+
+    const poll = async (): Promise<ChapRow[]> => {
+      const r = await get<ChaptersResult>('/api/chapters');
+      qc.setQueryData(keys.chapters, r);
+      return r.chapters;
+    };
+    const job = (ci: number, next: Job | null) => setJobs((j) => {
+      if (!next) { const {[ci]: _drop, ...rest} = j; return rest; }
+      return j[ci] === next ? j : {...j, [ci]: next};
+    });
+
+    try {
+      let fresh = await poll().catch(() => rows);
+      const held = await cachedChapters(key);
+      const toRender = needsRender(fresh.filter((r) => cis.includes(r.i)), held);
+      if (toRender.length) {
+        for (const ci of toRender) job(ci, 'queued');
+        await actions.render.mutateAsync(toRender).catch((e: unknown) => {
+          throw new Error(`could not queue the render: ${msg(e)}`);
+        });
       }
+
+      for (const ci of cis) {
+        if (held.has(ci)) { job(ci, null); continue; }
+        const t0 = Date.now();
+        /* When each ask was last sent. Neither endpoint says what it refused -
+           a build for a half-rendered chapter is dropped in silence, and the
+           up-front render queue call can be swallowed the same way (RUST-NOTES
+           items 7 and 9) - so an ask that has not moved the row within twenty
+           seconds is simply repeated. Both are idempotent, so a repeat costs a
+           request and nothing else, and the alternative is a row that sits on
+           one rung for forty-five minutes waiting for a call nobody made. */
+        const asked = {render: Date.now(), pack: 0};
+        try {
+          for (;;) {
+            const phase = phaseFor(fresh.find((r) => r.i === ci), false);
+            job(ci, jobFor(phase));
+            if (phase === 'stored') break;
+            if (phase === 'store') {
+              await downloadChapter(key, ci);
+              break;
+            }
+            if (phase === 'queue-render' && Date.now() - asked.render > 20_000) {
+              asked.render = Date.now();
+              await actions.render.mutateAsync([ci]);
+            }
+            if (phase === 'request-pack' && Date.now() - asked.pack > 20_000) {
+              asked.pack = Date.now();
+              await actions.build.mutateAsync([ci]);
+            }
+            if (Date.now() - t0 > RUNG_TIMEOUT_MS)
+              throw new Error('the server never finished it');
+            // A rung where the client just acted is re-read straight away; a
+            // rung where the server is working gets the drawer's own cadence.
+            await sleep(isAction(phase) ? 300 : 1500);
+            fresh = await poll().catch(() => fresh);
+          }
+        } catch (e) {
+          setErr(`chapter ${ci + 1}: ${msg(e)}`);
+        } finally {
+          job(ci, null);
+          await n.refreshOffline();
+        }
+      }
+    } catch (e) {
+      setErr(msg(e));
+    } finally {
+      await n.refreshOffline();
+      setRunning(false);
     }
-    setStore(await storageEstimate());
   }
 
-  async function remove() {
+  async function runRemove(cis: number[]) {
     const key = n.book?.key;
     if (!key) return;
-    for (const ci of chosen()) await removeChapter(key, ci);
-    await n.refreshOffline();
-    setStore(await storageEstimate());
+    setErr(null);
+    setRunning(true);
+    try {
+      for (const ci of cis) await removeChapter(key, ci);
+      await n.refreshOffline();
+    } finally {
+      setRunning(false);
+    }
   }
 
+  function confirm() {
+    const verb = sel.verb;
+    const cis = picks;
+    dispatch({t: 'cancel'});
+    if (!cis.length || !verb) return;
+    void (verb === 'download' ? runDownload(cis) : runRemove(cis));
+  }
+
+  // ------------------------------------------------------------------ the line
   const offlineBytes = rows
     .filter((r) => n.offlineChapters.has(r.i))
     .reduce((a, r) => a + (r.bytes ?? 0), 0);
   const shards = n.index?.shards ?? 0;
   const textDone = shards > 0 && n.textShards.size >= shards;
-  const textPct = shards > 0 ? Math.round((n.textShards.size / shards) * 100) : 0;
   const loadingRows = isPending && !rows.length;
+  const busy = running || Object.keys(jobs).length > 0;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      {/* the two tiers, named, before anything else */}
-      <div data-testid="tiers" className="space-y-1.5 px-4 pb-2.5 pt-0.5">
-        <div data-testid="tier-text" data-state={n.textOptOut ? 'off' : textDone ? 'saved' : 'partial'}
-             className="rounded-md border border-border bg-card/40 px-2.5 py-2">
-          <div className="flex items-center gap-2">
-            <Type className="size-3.5 shrink-0 text-muted-foreground" />
-            <span className="text-[12px] text-foreground/80">Text</span>
-            <span className="ml-auto flex items-center gap-1">
-              {textDone && !n.textOptOut && (
-                <Button data-testid="text-remove" size="sm" variant="ghost"
-                        className="h-6 px-2 text-[11px] text-muted-foreground hover:text-destructive"
-                        title="Delete the book's words from this device. The reader then needs the server for every chapter."
-                        onClick={() => void n.dropText()}>
-                  <Trash2 className="size-3" /> remove
-                </Button>
-              )}
-              {(n.textOptOut || (!textDone && !n.textBusy)) && (
-                <Button data-testid="text-save" size="sm" variant="ghost"
-                        className="h-6 px-2 text-[11px] text-muted-foreground hover:text-foreground"
-                        title="Keep the whole book's words on this device"
-                        onClick={() => n.saveText()}>
-                  <HardDriveDownload className="size-3" /> save
-                </Button>
-              )}
-            </span>
-          </div>
-          <div data-testid="text-state" className="mt-0.5 pl-[22px] text-[11px] text-muted-foreground">
-            {n.textOptOut
-              ? 'not saved — chapters come from the server as you open them'
-              : n.textBusy
-                ? <span className="flex items-center gap-1.5">
-                    <Loader2 className="size-3 animate-spin" />
-                    saving for offline reading · {n.textProgress?.done ?? n.textShards.size} of{' '}
-                    {n.textProgress?.total ?? shards} parts
-                  </span>
-                : textDone
-                  ? <>saved for offline reading
-                      {n.index?.text_bytes ? ` · ${fmtBytes(n.index.text_bytes)}` : ''}</>
-                  : shards
-                    ? `${n.textShards.size} of ${shards} parts saved`
-                    : 'not saved yet'}
-          </div>
-          {n.textBusy && (
-            <Progress data-testid="text-progress" className="mt-1.5 h-1 bg-white/[0.06]"
-                      value={n.textProgress
-                        ? (n.textProgress.done / Math.max(1, n.textProgress.total)) * 100
-                        : textPct} />
-          )}
-        </div>
-
-        <div data-testid="tier-audio" className="rounded-md border border-border bg-card/40 px-2.5 py-2">
-          <div className="flex items-center gap-2">
-            <FileAudio className="size-3.5 shrink-0 text-muted-foreground" />
-            <span className="text-[12px] text-foreground/80">Audio</span>
-            <span className="ml-auto text-[10px] uppercase tracking-wide text-muted-foreground">
-              per chapter
-            </span>
-          </div>
-          <div data-testid="audio-state" className="mt-0.5 pl-[22px] text-[11px] text-muted-foreground">
-            {n.offlineChapters.size} of {rows.length} chapters downloaded
-            {offlineBytes > 0 && ` · ${fmtBytes(offlineBytes)}`}
-          </div>
-        </div>
+      {/* The two tiers, as one line of small print. */}
+      <div data-testid="tiers"
+           className="flex items-center gap-1.5 px-4 pb-1.5 text-[11px] text-muted-foreground">
+        <Type className="size-3 shrink-0" />
+        <span data-testid="text-state" className="min-w-0 truncate">
+          {n.textOptOut
+            ? 'text not saved'
+            : n.textBusy
+              ? `text ${n.textProgress?.done ?? n.textShards.size}/${n.textProgress?.total ?? shards}`
+              : textDone
+                ? `text ${n.index?.text_bytes ? fmtBytes(n.index.text_bytes) : 'saved'}`
+                : shards ? `text ${n.textShards.size}/${shards}` : 'text not saved'}
+        </span>
+        {textDone && !n.textOptOut ? (
+          <button data-testid="text-remove" onClick={() => void n.dropText()}
+                  title="Delete the book's words from this device. The reader then needs the server for every chapter."
+                  className="shrink-0 rounded p-1 text-muted-foreground/70 transition-colors hover:text-destructive">
+            <Trash2 className="size-3" />
+          </button>
+        ) : (n.textOptOut || (!textDone && !n.textBusy)) ? (
+          <button data-testid="text-save" onClick={() => n.saveText()}
+                  title="Keep the whole book's words on this device"
+                  className="shrink-0 rounded p-1 text-muted-foreground/70 transition-colors hover:text-foreground">
+            <HardDriveDownload className="size-3" />
+          </button>
+        ) : null}
+        <span data-testid="audio-state"
+              className="ml-auto flex shrink-0 items-center gap-1 tabular-nums">
+          <FileAudio className="size-3" />
+          {n.offlineChapters.size}/{rows.length}
+          {offlineBytes > 0 && ` · ${fmtBytes(offlineBytes)}`}
+        </span>
       </div>
+      {n.textBusy && (
+        <Progress data-testid="text-progress" className="mx-4 mb-1.5 h-px bg-white/[0.06]"
+                  value={n.textProgress
+                    ? (n.textProgress.done / Math.max(1, n.textProgress.total)) * 100
+                    : 0} />
+      )}
 
       <Input
         value={filter}
@@ -251,28 +336,41 @@ export function ChapterManager({open, active, onPick}: {
           {hits.map((r) => {
             const s = chapterState(r, n.offlineChapters.has(r.i), fmtBytes, jobs[r.i]);
             const Icon = ICON[s.key];
+            const picked = sel.picked.has(r.i);
+            const can = !sel.verb || eligible.includes(r.i);
             return (
               <div
                 key={r.i}
                 data-testid="chapter-row"
                 data-ci={r.i}
                 data-state={s.key}
-                title={s.tip}
-                onClick={() => onPick(r.i)}
+                data-picked={picked ? '1' : undefined}
+                title={sel.verb
+                  ? can ? `tap to ${sel.verb === 'remove' ? 'remove' : 'download'} this chapter`
+                        : sel.verb === 'remove' ? 'not on this device' : 'already on this device'
+                  : s.tip}
+                onClick={() => sel.verb
+                  ? dispatch({t: 'toggle', ci: r.i, eligible})
+                  : onPick(r.i)}
                 className={cn(
-                  'relative flex cursor-pointer items-center gap-2 px-3 py-1.5 text-[13px]',
-                  'text-muted-foreground transition-colors hover:bg-white/5 hover:text-foreground',
-                  r.i === n.ci && 'bg-white/[0.06] text-foreground shadow-[inset_2px_0_0_var(--color-ring)]',
+                  // py-2 rather than py-1.5: in selection mode the row *is* the
+                  // control, so it has to be worth aiming a thumb at.
+                  'relative flex items-center gap-2 px-3 py-2 text-[13px]',
+                  'text-muted-foreground transition-colors',
+                  can ? 'cursor-pointer hover:bg-white/5 hover:text-foreground'
+                      : 'cursor-default opacity-35',
+                  r.i === n.ci && !picked
+                    && 'bg-white/[0.06] text-foreground shadow-[inset_2px_0_0_var(--color-ring)]',
+                  picked && 'bg-white/[0.1] text-foreground shadow-[inset_3px_0_0_var(--color-ok)]',
                 )}
               >
-                <Checkbox
-                  data-testid="chapter-check"
-                  checked={sel.has(r.i)}
-                  onClick={(e) => { e.stopPropagation(); toggle(r.i); }}
-                  onCheckedChange={() => undefined}
-                  className="size-3.5"
-                  aria-label={`select ${r.title}`}
-                />
+                {sel.verb && (
+                  <span data-testid="pick-mark"
+                        className={cn('flex size-4 shrink-0 items-center justify-center',
+                                      picked ? 'text-ok' : 'text-muted-foreground/30')}>
+                    {picked ? <Check className="size-3.5" /> : <CircleDashed className="size-3" />}
+                  </span>
+                )}
                 <span className="min-w-0 flex-1 truncate font-light">{r.title}</span>
                 <span data-testid="chapter-state"
                       className={cn('flex shrink-0 items-center gap-1 text-[10px] tabular-nums tracking-wide',
@@ -293,59 +391,80 @@ export function ChapterManager({open, active, onPick}: {
         </div>
       </ScrollArea>
 
-      <div className="border-t border-border px-3 py-2.5">
-        <div className="flex flex-wrap items-center gap-2">
-          <Button data-testid="act-render" size="sm" variant="outline" disabled={!sel.size}
-                  onClick={() => void actions.render.mutateAsync(chosen())}
-                  title={sel.size ? `Queue ${sel.size} chapter${sel.size > 1 ? 's' : ''} for rendering on the server`
-                                  : 'Tick some chapters first'}>
-            <Waves className="size-3.5" /> render
-          </Button>
-          <Button data-testid="act-download" size="sm" variant="outline" disabled={!sel.size}
-                  onClick={() => void download()}
-                  title={sel.size ? 'Pack if needed, then keep a copy on this device'
-                                  : 'Tick some chapters first'}>
-            <Download className="size-3.5" /> download
-          </Button>
-          <Button data-testid="act-remove" size="sm" variant="ghost" disabled={!sel.size}
-                  onClick={() => void remove()}
-                  title={sel.size ? 'Remove the downloaded copy (the server keeps its files)'
-                                  : 'Tick some chapters first'}>
-            <Trash2 className="size-3.5" /> remove
-          </Button>
-          <span data-testid="selection" className={cn('ml-auto text-[11px]',
-                                                      err ? 'text-destructive' : 'text-muted-foreground')}>
-            {err ?? (sel.size
-              ? <button className="hover:text-foreground" onClick={() => setSel(new Set())}>
-                  {sel.size} selected · clear
-                </button>
-              : 'nothing selected')}
-          </span>
+      {/* Sticky: the last row of the drawer's own column, so it never scrolls
+          away from the list it is about. */}
+      {sel.verb ? (
+        <div data-testid="confirm-bar" className="space-y-2 border-t border-border px-3 py-2">
+          <div className="flex items-center gap-1">
+            <span className="mr-auto text-[11px] text-muted-foreground">
+              tap rows to {sel.verb === 'remove' ? 'remove' : 'download'}
+            </span>
+            {([['next 5', 5], ['next 20', 20], ['rest', null]] as const).map(([label, count]) => (
+              <button
+                key={label}
+                data-testid={`bulk-${count ?? 'rest'}`}
+                onClick={() => dispatch({t: 'pick', cis: rangeAfter(eligible, n.ci, count), eligible})}
+                title={count == null
+                  ? 'every chapter after the one being read'
+                  : `the next ${count} chapters after the one being read`}
+                className="rounded border border-border px-1.5 py-0.5 text-[10.5px] text-muted-foreground
+                           transition-colors hover:border-ring hover:text-foreground"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button data-testid="sel-cancel" size="sm" variant="ghost"
+                    onClick={() => dispatch({t: 'cancel'})}>
+              cancel
+            </Button>
+            <span data-testid="sel-count" className="ml-auto text-[11px] text-muted-foreground tabular-nums">
+              {picks.length
+                ? <>{picks.length} chapter{picks.length > 1 ? 's' : ''}
+                    {sizeOf(pickedRows) && ` · ${sizeOf(pickedRows)}`}</>
+                : 'none picked'}
+            </span>
+            <Button data-testid="sel-confirm" size="sm"
+                    variant={sel.verb === 'remove' ? 'outline' : 'default'}
+                    disabled={!picks.length} onClick={confirm}>
+              {sel.verb === 'remove' ? <Trash2 className="size-3.5" /> : <Download className="size-3.5" />}
+              {sel.verb === 'remove' ? 'remove' : 'download'}
+            </Button>
+          </div>
         </div>
-        <div data-testid="verbs" className="mt-1.5 text-[10.5px] leading-relaxed text-muted-foreground/80">
-          render = the server prepares the audio · download = keeps it on this device
+      ) : (
+        <div className="flex items-center gap-2 border-t border-border px-3 py-2">
+          <Button data-testid="start-download" size="sm" variant="outline" disabled={busy}
+                  onClick={() => dispatch({t: 'start', verb: 'download'})}
+                  title="Pick chapters to keep on this device. The server renders whatever needs it first.">
+            {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Download className="size-3.5" />}
+            download…
+          </Button>
+          <Button data-testid="start-remove" size="sm" variant="ghost"
+                  disabled={busy || !n.offlineChapters.size}
+                  onClick={() => dispatch({t: 'start', verb: 'remove'})}
+                  title="Give back the downloaded copies (the server keeps its files)">
+            <Trash2 className="size-3.5" /> remove…
+          </Button>
+          {err && (
+            <span data-testid="chapter-error" className="ml-auto min-w-0 truncate text-[11px] text-destructive">
+              {err}
+            </span>
+          )}
         </div>
-      </div>
-
-      <div className="space-y-0.5 px-4 pb-3 pt-2 text-[11px] leading-relaxed text-muted-foreground">
-        {store && (
-          <div>browser storage <b className="font-normal text-foreground/70">{fmtBytes(store.usage)}</b>
-            {store.quota ? ` of ${fmtBytes(store.quota)}` : ''}</div>
-        )}
-        {n.status?.done_min != null && n.status.book_min ? (
-          <div>server has <b className="font-normal text-foreground/70">
-            {(n.status.done_min / 60).toFixed(1)}h</b> of {(n.status.book_min / 60).toFixed(1)}h rendered</div>
-        ) : null}
-      </div>
+      )}
     </div>
   );
 }
 
-async function waitFor(pred: () => boolean, ms: number) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < ms) {
-    if (pred()) return;
-    await new Promise((r) => setTimeout(r, 1500));
-  }
-  throw new Error('timed out waiting for the server to pack it');
+/** "~45 MB" while anything in the selection has yet to be made. */
+function sizeOf(rows: ChapRow[]): string {
+  if (!rows.length) return '';
+  const n = estimateBytes(rows);
+  if (!n) return '';
+  return `${anyEstimated(rows) ? '~' : ''}${fmtBytes(n)}`;
 }
+
+const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

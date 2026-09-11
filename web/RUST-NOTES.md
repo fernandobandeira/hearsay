@@ -96,3 +96,65 @@ Requirement: a range or cursor (`?from=&to=`), and a cheap "what changed" - the
 queue and the currently-building chapter are the only fast-moving parts.
 
 Mitigation: none. It is tolerable today and the drawer is only polled while open.
+
+---
+
+Added 2026-09-11, when the reader collapsed "render" and "download" into one
+action. Download now owns the whole server-side pipeline - queue the render,
+wait for it, ask for the pack, wait for it, store the m4a (`src/lib/download.ts`)
+- because rendering without downloading was never a thing anyone wanted. That
+made three more gaps load-bearing.
+
+## 7. The chapter endpoints must take `?book=`
+
+`GET /api/chapters`, `POST /api/chapters/render`, `POST /api/chapters/build` and
+`POST /api/chapters/cancel` all act on the one global session, exactly like
+`/api/open` and `/api/playhead` in item 4 - and unlike every cacheable endpoint,
+which is keyed by the book. Before, that only risked a misdirected *view*. Now a
+single tap can queue 74 chapters of rendering, and if the server has swapped
+books underneath (the watcher picked up a new epub, the Obsidian plugin opened
+something, a second device loaded another book) those 74 renders land on the
+wrong novel and occupy the worker for hours.
+
+Requirement: the same `book` parameter item 4 asks for, with the same 409 on a
+mismatch. It is the difference between a wasted request and a wasted afternoon.
+
+Mitigation in the reader: none that closes it. The chapters query is only
+enabled while the drawer is open on a book the reader believes is loaded, and
+`serverHolds` already gates `/api/open` - but nothing stops the server changing
+its mind between the poll and the tap. The window is small and the cost is
+large, which is the wrong shape for a mitigation.
+
+## 8. A chapter's packed size is not knowable before it is packed
+
+The confirm bar has to say how big a download will be *before* anything is
+rendered, and an unrendered chapter has never existed as a file. `est_min` is
+there, so the estimate is `est_min x CHAPTER_BITRATE` - but the server does not
+report `CHAPTER_BITRATE`, so the client hard-codes its default (64 kbit/s, i.e.
+~480 kB a minute) in `estimateBytes`. Change the env var on the box and every
+estimate in the UI is silently wrong by that ratio.
+
+Requirement: either report `bitrate` on `/api/status` (cheapest), or put an
+`est_bytes` on each `/api/chapters` row and let the server do the arithmetic it
+actually has the constants for.
+
+Mitigation: the figure is prefixed `~` whenever anything in the selection is an
+estimate rather than a measured `bytes`, so it reads as a promise about the
+order of magnitude and not about the number.
+
+## 9. `POST /api/chapters/build` does not say what it refused
+
+It answers `{built, building, rendering}`, and a chapter that is not fully
+rendered appears in none of the three - indistinguishable from a chapter that
+was never asked about. The ladder wants "I have taken this one" or "not yet, and
+here is why"; it gets silence.
+
+Requirement: a fourth list, or per-chapter statuses. The useful shape is the one
+the reader's own state machine uses: `stored | rendering | packing | ready`.
+
+Mitigation: `phaseFor` never trusts the build response at all. It re-reads the
+chapter's row from the next `/api/chapters` poll and decides from that - the
+same disk-truth rule the server's render worker follows, for the same reason.
+The cost is up to 1.5 s of latency per rung and a `request-pack` that can be
+sent twice if a poll lands between the call and the server's own bookkeeping;
+`/api/chapters/build` is idempotent, so the second one is merely wasted.

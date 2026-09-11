@@ -73,16 +73,87 @@
   table-layout: fixed;
 }
 
+/* ---------------------------------------------------------------- the scaffold
+ *
+ * The installed PWA is the only place this reader really lives, so the page is
+ * laid out for it: ONE full-screen box, `#root`, sized with `100dvh`, as a flex
+ * column whose three children are the top bar, the words and the player. That
+ * is the whole scaffold. App.tsx renders exactly those three.
+ *
+ * What it replaces, and why: the header, the reading area and the player bar
+ * used to be four coordinated `position: fixed` elements, each carrying its own
+ * copy of the safe-area insets, with the reading area's `top`/`bottom` written
+ * as `calc(3.5rem + env(safe-area-inset-top))` and
+ * `calc(76px + max(1rem, env(safe-area-inset-bottom)))` - magic numbers
+ * restating heights the bars only *roughly* had. `76px` against a bar that
+ * measured ~60 was 16 px of nothing; `env(safe-area-inset-bottom)` appearing in
+ * both the bar's padding and the reading area's offset is the classic
+ * double-application, and on top of it `body` carried a fourth copy as padding
+ * that no `fixed` child ever saw. In a flex column none of those numbers exist:
+ * the bars are `flex: 0 0 auto` and size themselves, the words are
+ * `flex: 1; min-height: 0` and take exactly what is left.
+ *
+ * The rules that make it correct on iOS, each one load-bearing:
+ *
+ *   100dvh, not 100vh or a height:100% chain.  `dvh` tracks the live viewport;
+ *   in standalone there is no collapsing chrome, so dvh == svh == lvh == vh ==
+ *   innerHeight, and one unit covers both installed and in-browser. A
+ *   `height: 100%` chain on html/body is the thing to avoid: it needs every
+ *   ancestor to have a definite height, and it is reported to make WebKit
+ *   silently fall back out of `viewport-fit=cover` layout.
+ *     - https://webkit.org/blog/12445/new-webkit-features-in-safari-15-4/
+ *     - https://web.dev/blog/viewport-units
+ *
+ *   viewport-fit=cover (index.html) is what makes env() nonzero at all.
+ *   Without it iOS insets the viewport itself and every
+ *   env(safe-area-inset-*) reads 0px. With it, 100dvh spans the whole screen -
+ *   behind the Dynamic Island and behind the home indicator - and the insets
+ *   describe which strips of that box are unsafe. iPhone 15 portrait: 59px top,
+ *   34px bottom, 0 sides; landscape: 0/21/59/59.
+ *     - https://webkit.org/blog/7929/designing-websites-for-iphone-x/
+ *     - https://useyourloaf.com/blog/iphone-15-screen-sizes/
+ *
+ *   Each inset is spent exactly once, as padding, on the child that touches
+ *   that edge: --sat on the top bar, --sab on the player, --sal/--sar here.
+ *   Never `height: calc(100dvh - env(...))` as well - that is the double count.
+ *
+ *   max(), not addition. `max(0.5rem, var(--sab))` is WebKit's own idiom: the
+ *   inset already is the breathing room, and the rem is only the floor for a
+ *   device that has no inset. Adding them is where an empty band comes from.
+ *
+ *   overscroll-behavior: none on the document rather than overflow: hidden on
+ *   body, which is unreliable on iOS Safari. #root cannot overflow anyway.
+ */
 @layer base {
   * { @apply border-border outline-ring/50; }
-  html, body, #root { height: 100%; }
+
+  :root {
+    /* Read once, here, with a 0px fallback so a UA that does not define them
+       leaves the max() floors standing instead of invalidating the rule. */
+    --sat: env(safe-area-inset-top, 0px);
+    --sar: env(safe-area-inset-right, 0px);
+    --sab: env(safe-area-inset-bottom, 0px);
+    --sal: env(safe-area-inset-left, 0px);
+  }
+
+  html, body {
+    margin: 0;
+    overscroll-behavior: none;
+  }
+
   body {
     @apply bg-background text-foreground font-sans antialiased;
-    margin: 0;
-    overflow: hidden;
     font-weight: 300;
     text-rendering: optimizeLegibility;
-    padding: env(safe-area-inset-top) env(safe-area-inset-right)
-             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+
+  /* The one full-screen box. Its children are the reader's three rows. */
+  #root {
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding-left: var(--sal);
+    padding-right: var(--sar);
   }
 }

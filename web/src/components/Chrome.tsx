@@ -1,12 +1,28 @@
 /**
- * The chrome: the top bar, the progress track and the diagnostics line.
+ * The chrome: the top bar and the player bar.
  *
- * It hides itself when nothing has moved for two seconds, because a reader should
- * be the words and nothing else - and comes back on any input.
+ * Both are rows of `#root`'s flex column now, not `position: fixed` overlays -
+ * see the scaffold comment in index.css for why. Each spends one safe-area
+ * inset, the one on the edge it touches, and neither states a height: the
+ * reading area is whatever is left over, so there is no number to drift.
+ *
+ * They hide themselves when nothing has moved for two seconds, because a reader
+ * should be the words and nothing else - and come back on any input. Hiding is
+ * opacity, not layout: reflowing a page of text every couple of seconds would
+ * be worse than the bar.
+ *
+ * The top bar carries controls and nothing else. It used to also carry a
+ * diagnostics line ("streaming · buffer 15 · RTF 4.7× · 2.5h cached ·
+ * 0.37/50 GB") and a chunk counter ("72/87"), which is a readout of the render
+ * pipeline on the one surface that is on screen while reading. Both are gone.
+ * What survives on the right, in the order a thumb reaches them: play/pause at
+ * the very edge, the mic beside it, and `T` - which swaps the whole row for the
+ * text-size slider until its X puts the controls back. The only text the bar
+ * still shows is an error, because an error is not a diagnostic.
  */
 import {useEffect, useState} from 'react';
 import {
-  ChevronLeft, ChevronRight, CloudOff, Loader2, Menu, Pause, Play, Type,
+  ChevronLeft, ChevronRight, CloudOff, Loader2, Menu, Pause, Play, Type, X,
 } from 'lucide-react';
 import {Button} from '@/components/ui/button';
 import {Slider} from '@/components/ui/slider';
@@ -38,43 +54,83 @@ export function useAutoHide() {
 
 export function TopBar({visible, onMenu}: {visible: boolean; onMenu: () => void}) {
   const n = useNarrator();
+  /* Text size is a thing you set once and then forget, so it does not deserve a
+     permanent seat - but it also must not be a drawer away while reading. `T`
+     borrows the bar for as long as it takes. */
+  const [sizing, setSizing] = useState(false);
   const disabled = !n.chunks.length;
   return (
-    <div className={cn(
-      // Safe-area aware: the bar's background extends under the iOS notch, the
-      // controls sit below it. Fixed elements ignore the body's inset padding.
-      'fixed inset-x-0 top-0 z-20 flex items-center gap-2 px-3',
-      'h-[calc(3.5rem+env(safe-area-inset-top))] pt-[env(safe-area-inset-top)]',
-      'bg-gradient-to-b from-background/95 to-transparent transition-opacity duration-300',
-      visible ? 'opacity-100' : 'pointer-events-none opacity-0',
-    )}>
-      <Button data-testid="menu" variant="ghost" size="icon" onClick={onMenu} title="Library (Esc closes)"
-              className="size-9 rounded-full text-muted-foreground hover:text-foreground">
-        <Menu className="size-4" />
-      </Button>
-      <Button data-testid="play" variant="ghost" size="icon" disabled={disabled} onClick={n.toggle}
-              title="Play / pause (Space)"
-              className="size-9 rounded-full text-muted-foreground hover:text-foreground">
-        {n.playing ? <Pause className="size-4" /> : <Play className="size-4" />}
-      </Button>
-      <VoiceNote disabled={disabled} />
+    <header
+      data-testid="topbar"
+      className={cn(
+        // The top inset, spent once. max() because a device without a notch
+        // still wants the row off the very edge of the glass.
+        'z-20 shrink-0 bg-background pt-[max(0.25rem,var(--sat))]',
+        'transition-opacity duration-300',
+        visible ? 'opacity-100' : 'pointer-events-none opacity-0',
+      )}
+    >
+      <div className="flex h-11 items-center gap-1 px-2">
+        {sizing ? (
+          <TextSize onClose={() => setSizing(false)} />
+        ) : (
+          <>
+            <Button data-testid="menu" variant="ghost" size="icon" onClick={onMenu}
+                    title="Library (Esc closes)"
+                    className="size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground">
+              <Menu className="size-4.5" />
+            </Button>
 
-      {/* What survived the "read with your eyes" toggle: the text size it never
-          owned but was sitting next to. It lives here and in the drawer. */}
-      <div className="hidden items-center gap-2 text-muted-foreground sm:flex" title="Reading text size">
-        <Type className="size-3" />
-        <Slider className="w-24" min={70} max={180} step={5}
-                value={[Math.round(n.fontScale * 100)]}
-                onValueChange={([v]) => n.setFontScale(v / 100)}
-                aria-label="Reading text size" />
-      </div>
+            {/* The only words on the bar, and only when something is wrong. */}
+            <div className="min-w-0 flex-1">
+              {n.message && (
+                <span data-testid="bar-message"
+                      className="block truncate text-[11px] leading-tight text-destructive">
+                  {n.message}
+                </span>
+              )}
+            </div>
 
-      <Diagnostics />
-      <Connection />
-      <div className="shrink-0 text-[11px] tracking-wide text-muted-foreground">
-        {n.chunks.length ? <><b className="font-normal text-foreground/70">{n.idx + 1}</b>/{n.chunks.length}</> : null}
+            <Connection />
+
+            <Button data-testid="text-size" variant="ghost" size="icon"
+                    onClick={() => setSizing(true)} title="Reading text size"
+                    className="size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground">
+              <Type className="size-4" />
+            </Button>
+            <VoiceNote disabled={disabled} />
+            <Button data-testid="play" variant="ghost" size="icon" disabled={disabled}
+                    onClick={n.toggle} title="Play / pause (Space)"
+                    className="size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground">
+              {n.playing ? <Pause className="size-4.5" /> : <Play className="size-4.5" />}
+            </Button>
+          </>
+        )}
       </div>
-    </div>
+    </header>
+  );
+}
+
+/** The bar, borrowed. One slider, one way out, no other controls to mis-tap. */
+function TextSize({onClose}: {onClose: () => void}) {
+  const n = useNarrator();
+  const pct = Math.round(n.fontScale * 100);
+  return (
+    <>
+      <Type className="ml-2 size-4 shrink-0 text-muted-foreground" />
+      <Slider data-testid="font-slider" className="min-w-0 flex-1" min={70} max={180} step={5}
+              value={[pct]}
+              onValueChange={([v]) => n.setFontScale(v / 100)}
+              aria-label="Reading text size" />
+      <span className="w-10 shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">
+        {pct}%
+      </span>
+      <Button data-testid="text-size-close" variant="ghost" size="icon" onClick={onClose}
+              title="Done"
+              className="size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground">
+        <X className="size-4.5" />
+      </Button>
+    </>
   );
 }
 
@@ -106,60 +162,29 @@ function Connection() {
   );
 }
 
-function Diagnostics() {
-  const n = useNarrator();
-  const s = n.status;
-  let text = '';
-  if (n.message) text = n.message;
-  else if (n.conn === 'offline')
-    text = n.mode === 'chunk' ? 'offline · reading from this device' : 'offline · audio from this device';
-  else if (n.chapterLoading) text = 'loading the chapter…';
-  else if (s) {
-    const bits: string[] = [];
-    if (n.textBusy && n.textProgress)
-      bits.push(`saving text ${n.textProgress.done}/${n.textProgress.total}`);
-    if (!s.model_ready) bits.push('loading model');
-    if (n.mode === 'hls') bits.push('streaming');
-    else if (n.mode === 'chapter') bits.push('chapter audio');
-    else {
-      bits.push(n.waiting ? 'waiting for audio…' : s.status);
-      bits.push(`buffer ${Math.max(0, s.render_idx - n.idx - 1)}`);
-    }
-    if (s.building != null) bits.push(`packing ch ${s.building + 1}`);
-    if (s.rtf) bits.push(`RTF ${s.rtf}×`);
-    if (s.done_min != null && s.book_min) bits.push(`${(s.done_min / 60).toFixed(1)}h cached`);
-    if (s.disk_gb != null) bits.push(`${s.disk_gb}/${s.disk_cap_gb} GB`);
-    text = bits.join('  ·  ');
-  }
-  return (
-    <div data-testid="diag" className={cn('min-w-0 flex-1 truncate text-[10.5px] tracking-wide',
-                       n.message ? 'text-destructive' : 'text-muted-foreground/70')}>
-      {text}
-    </div>
-  );
-}
-
-export function BottomBar({visible}: {visible: boolean}) {
+export function PlayerBar({visible}: {visible: boolean}) {
   const n = useNarrator();
   const pct = n.chunks.length > 1 ? (n.idx / (n.chunks.length - 1)) * 100 : 0;
   return (
-    <div className={cn(
-      // max(), not 1rem + inset: on a phone the additive form is 16px on top of
-      // ~34px of home-indicator inset, which reads as an empty band under the
-      // bar. The inset already is the breathing room; 1rem is the floor for
-      // everything without one. App.tsx's reading area matches this height.
-      'fixed inset-x-0 bottom-0 z-20 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]',
-      'bg-gradient-to-t from-background/95 to-transparent transition-opacity duration-300',
-      visible ? 'opacity-100' : 'pointer-events-none opacity-0',
-    )}>
+    <footer
+      data-testid="playerbar"
+      className={cn(
+        // The bottom inset, spent once, as max() - the ~34 px home-indicator
+        // strip already is the breathing room, and 0.5rem is the floor for a
+        // device that has none. Adding the two is how the band appears.
+        'z-20 shrink-0 bg-background px-4 pb-[max(0.5rem,var(--sab))] pt-1',
+        'transition-opacity duration-300',
+        visible ? 'opacity-100' : 'pointer-events-none opacity-0',
+      )}
+    >
       <Slider
-        className="mb-3" min={0} max={Math.max(0, n.chunks.length - 1)} step={1}
+        className="mb-2" min={0} max={Math.max(0, n.chunks.length - 1)} step={1}
         value={[n.idx]}
         onValueChange={([v]) => n.setIdx(v)}
         disabled={!n.chunks.length}
         aria-label="Position in the chapter"
       />
-      <div className="flex items-center gap-2">
+      <div data-testid="chapter-nav" className="flex items-center gap-2">
         <Button variant="ghost" size="icon" disabled={n.ci <= 0} onClick={() => n.goChapter(-1)}
                 title="Previous chapter (←)"
                 className="size-8 rounded-full text-muted-foreground hover:text-foreground">
@@ -176,6 +201,6 @@ export function BottomBar({visible}: {visible: boolean}) {
           <ChevronRight className="size-4" />
         </Button>
       </div>
-    </div>
+    </footer>
   );
 }

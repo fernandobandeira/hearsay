@@ -16,8 +16,12 @@ export type ChapterStateKey =
   | 'packing' | 'saving' | 'downloaded' | 'to-pack' | 'ready'
   | 'rendered' | 'queued' | 'partial' | 'none';
 
-/** A job this device is running on the chapter right now. */
-export type Job = 'packing' | 'saving';
+/**
+ * A job this device is running on the chapter right now - one rung of
+ * lib/download.ts's ladder. It outranks whatever the server's row says,
+ * because a download in flight is the thing he is actually waiting on.
+ */
+export type Job = 'queued' | 'rendering' | 'packing' | 'saving';
 
 export interface ChapterState {
   key: ChapterStateKey;
@@ -40,6 +44,16 @@ export function chapterState(
   if (job === 'saving') return {
     key: 'saving', text: 'saving', tone: 'work', spin: true,
     tip: 'copying the audio onto this device',
+  };
+  if (job === 'queued') return {
+    key: 'queued', text: 'waiting', tone: 'work',
+    tip: 'in the download queue - the server has to render it first',
+  };
+  if (job === 'rendering') return {
+    key: 'queued',
+    text: r.n && r.rendered ? `${r.rendered}/${r.n}` : 'rendering',
+    tone: 'work', spin: !r.rendered,
+    tip: 'the server is rendering this chapter, and the download follows it',
   };
   // On this device beats everything the server says about it.
   if (offline) return {
