@@ -335,3 +335,94 @@ fn the_first_chapters_of_a_real_book_match_chunk_for_chunk() {
         }
     }
 }
+
+/// The strongest check there is, and the one that cannot live in git: compare
+/// against the `plan.json` the *python server itself* wrote for the book
+/// Fernando is actually reading.
+///
+/// Opt-in, because it needs a real narrator working tree. Point
+/// `NARRATOR_REF_WORK` at one (default `~/git/narrator/work`) with a book
+/// already loaded, and this re-chunks the same epub and compares chunk for
+/// chunk. It only ever reads.
+#[test]
+fn a_python_written_plan_matches_chunk_for_chunk() {
+    let work = std::env::var("NARRATOR_REF_WORK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join("git/narrator/work"))
+                .unwrap_or_default()
+        });
+    let books = std::env::var("NARRATOR_REF_BOOKS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join("git/narrator/books"))
+                .unwrap_or_default()
+        });
+    let Ok(dirs) = std::fs::read_dir(work.join("audio")) else {
+        eprintln!("skipping: no reference work dir at {}", work.display());
+        return;
+    };
+    let mut checked = 0usize;
+    for d in dirs.flatten() {
+        let plan_file = d.path().join("plan.json");
+        if !plan_file.exists() {
+            continue;
+        }
+        let key = d.file_name().to_string_lossy().to_string();
+        // The cache key is the stem truncated to 50, so find the epub by stem.
+        let Some(epub) = std::fs::read_dir(&books).ok().and_then(|rd| {
+            rd.flatten().map(|e| e.path()).find(|p| {
+                p.extension().is_some_and(|x| x == "epub")
+                    && p.file_stem()
+                        .map(|s| s.to_string_lossy().chars().take(50).collect::<String>())
+                        .as_deref()
+                        == Some(key.as_str())
+            })
+        }) else {
+            eprintln!("skipping {key}: no matching epub under {}", books.display());
+            continue;
+        };
+        let want: Vec<Chapter> = match std::fs::read(&plan_file)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        // Copy out before parsing: the reference tree is read-only, always.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let copy = tmp.path().join(epub.file_name().unwrap_or_default());
+        std::fs::copy(&epub, &copy).expect("copy");
+        let got = build_plan(&extract_chapters(&copy).expect("parse"), 300);
+
+        assert_eq!(got.len(), want.len(), "{key}: chapter count");
+        let mut chunks = 0usize;
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(g.index, w.index, "{key}: index");
+            assert_eq!(g.id, w.id, "{key}: chapter {} id", w.index);
+            assert_eq!(g.title, w.title, "{key}: chapter {} title", w.index);
+            assert_eq!(
+                g.chunks.len(),
+                w.chunks.len(),
+                "{key}: chapter {} chunk count",
+                w.index
+            );
+            for (i, (gc, wc)) in g.chunks.iter().zip(&w.chunks).enumerate() {
+                assert_eq!(gc, wc, "{key}: chapter {} chunk {i}", w.index);
+            }
+            chunks += g.chunks.len();
+        }
+        eprintln!("{key}: {} chapters, {chunks} chunks, identical", got.len());
+        checked += 1;
+    }
+    if checked == 0 {
+        eprintln!(
+            "skipping: nothing comparable under {} - a reference plan.json needs its \
+             epub still present under {}",
+            work.display(),
+            books.display()
+        );
+    }
+}
