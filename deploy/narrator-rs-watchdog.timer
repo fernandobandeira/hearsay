@@ -1,0 +1,10 @@
+# /etc/systemd/system/narrator-rs-watchdog.timer — template, applied by hand.
+#   sudo systemctl enable --now narrator-rs-watchdog.timer
+[Unit]
+Description=check narrator-rs every two minutes
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=15s
+[Install]
+WantedBy=timers.target

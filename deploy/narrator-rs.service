@@ -1,0 +1,40 @@
+# /etc/systemd/system/narrator-rs.service
+#
+# Template — applied by hand, never by a playbook.
+#
+#   sudo cp narrator-rs.env /etc/narrator-rs.env
+#   sudo cp narrator-rs.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now narrator-rs
+#
+# The container runs in the foreground under systemd rather than with `-d`, so
+# systemd is the only thing supervising it: one restart policy, one log stream,
+# and `systemctl status` tells the truth.
+[Unit]
+Description=narrator (Rust) — self-hosted TTS book reader
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/narrator-rs.env
+Environment=IMAGE=narrator-rs:latest
+# Port 7870 is bound to loopback only. There is no auth and no TLS: the box is
+# reached over Tailscale, and publishing this port is the one thing that turns a
+# private reader into a public one.
+ExecStartPre=-/usr/bin/docker rm -f narrator-rs
+ExecStart=/usr/bin/docker run --rm --name narrator-rs \
+    -p 127.0.0.1:7870:7870 \
+    -v /home/ubuntu/narrator/work:/work \
+    -v /home/ubuntu/narrator/books:/books:ro \
+    -v /home/ubuntu/narrator/models:/models:ro \
+    -v /home/ubuntu/vault:/vault \
+    --env-file /etc/narrator-rs.env \
+    ${IMAGE}
+ExecStop=/usr/bin/docker stop --timeout 20 narrator-rs
+Restart=always
+RestartSec=15
+# A render of a long chapter should not be killed for being slow to stop.
+TimeoutStopSec=40
+
+[Install]
+WantedBy=multi-user.target

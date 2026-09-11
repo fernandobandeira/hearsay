@@ -2,7 +2,6 @@
 /models/kokoro/*.onnx
 /models/whisper/*.bin
 /work
-/web/dist
 node_modules
 /scripts/golden/.venv
 scripts/golden/.venv

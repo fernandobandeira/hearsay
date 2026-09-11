@@ -31,7 +31,8 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `scripts/golden/` | Generates the Python golden fixtures (uv + ebooklib + bs4) the parity tests assert against. |
 | `scripts/gen-client.sh`, `scripts/drift-check.mjs` | OpenAPI → typed TS client, and the drift gate against the reader's hand-written types. |
 | `listen-test/` | GATE 0: the ONNX engine rendered against the PyTorch render Fernando accepted. |
-| `web/` | A placeholder page. The real reader is still `~/git/narrator/web`; porting it onto the generated client is the integration step. |
+| `web/dist/` | **The built reader, vendored.** The Vite/React app is still developed in `~/git/narrator/web`; `./narrator sync-web` copies its `dist/` here so the image can be built on the VPS without that repo or a node tree. `web/placeholder/` is the fallback page when there is no build at all. |
+| `deploy/` | systemd templates for the Oracle A1 — **applied by hand, never by a playbook**, like the python repo's. |
 
 ## Running it
 
@@ -212,7 +213,49 @@ Three stages: node builds the reader, cargo builds the server behind a manifest-
 
 `HEALTHCHECK` is `narrator --healthcheck`: one loopback GET of `/healthz` written against a `TcpStream`, rather than putting curl in the runtime image for a single request.
 
-**amd64 is built and run end to end.** arm64 is **not yet verified** — see below.
+**amd64 is built and run end to end**, including the real reader: the production
+build of the React app, unmodified, boots against this server and goes all the
+way through — library, `/api/load`, the 1433-chapter list, the text bundle's
+twelve shards, `/api/open`, per-chunk wavs, auto-packing, and finally HLS
+playback with 206s on the segments. Zero failed requests, zero console errors.
+Notably it already sends `?book=` on `/api/chapter/{ci}`, which the python server
+ignores — requirement 2 below paid for itself on the first run.
+
+Memory while rendering *Lord of Mysteries* settles: 599 MB idle with the model
+loaded, climbing to ~1.24 GB over five minutes of continuous rendering and then
+flat to within 4 MB while still working. That is ONNX Runtime's arena reaching
+its working set, not a leak.
+
+### Deploying it
+
+`deploy/` carries the templates. The `docker run` the unit performs, spelled
+out:
+
+```
+docker run --rm --name narrator-rs \
+  -p 127.0.0.1:7870:7870 \
+  -v /home/ubuntu/narrator/work:/work \
+  -v /home/ubuntu/narrator/books:/books:ro \
+  -v /home/ubuntu/narrator/models:/models:ro \
+  -v /home/ubuntu/vault:/vault \
+  --env-file /etc/narrator-rs.env \
+  narrator-rs:latest
+```
+
+with `/etc/narrator-rs.env` holding `NARRATOR_VAULT=/vault`,
+`MAX_AUDIO_GB=50`, `KOKORO_VOICE=af_heart`,
+`WHISPER_MODEL=large-v3-turbo-q5_0` and the rest (`deploy/narrator-rs.env`).
+Port 7870 is bound to **loopback only** — there is no auth and no TLS, the box
+is reached over Tailscale, and publishing that port is the one change that turns
+a private reader into a public one. `deploy/narrator-rs-watchdog.{sh,service,timer}`
+mirror the python repo's: curl `/healthz` every two minutes, restart after three
+consecutive failures, with a fifteen-minute floor so a crash loop cannot hide
+the problem.
+
+The work dir and the vault are **adopted in place**: same cache paths, same
+`plan.json`, same `.narrator-positions.json` and `Reading Log.md`. Nothing is
+re-rendered and no position moves — that is what the parity suites above are
+for.
 
 ## What is still missing before this can replace production
 

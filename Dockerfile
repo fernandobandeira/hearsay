@@ -15,19 +15,29 @@
 # ---------------------------------------------------------------- web build
 FROM node:22-slim AS web
 WORKDIR /build
-# `web/` is a placeholder in this repo until the reader is ported onto the
-# generated client; when it holds the real Vite app this stage builds it, and
-# until then it just carries the placeholder page through. Dependencies first:
-# the lockfile changes far less often than the source.
+# Three ways this stage can get a reader, in order of preference:
+#
+#   1. `web/package.json` - the Vite app itself lives here, so build it.
+#   2. `web/dist/` - the build is vendored (scripts/sync-web.sh copies it out of
+#      ~/git/narrator/web/dist). This is the current arrangement: the reader is
+#      still developed in the python repo, and the VPS must be able to build
+#      this image without that repo or a node_modules tree.
+#   3. neither - the placeholder page, so the server still answers on /.
+#
+# Node is only actually needed for (1); the stage is cheap in the other two and
+# keeps one place where "where does /web come from" is answered.
 COPY web/ ./
 RUN set -eux; \
     if [ -f package.json ]; then \
         npm ci --no-audit --no-fund || npm install --no-audit --no-fund; \
         npm run build; \
+    elif [ -f dist/index.html ]; then \
+        echo "using the vendored reader build"; \
     else \
-        mkdir -p dist && cp -a ./. dist/ 2>/dev/null || true; \
+        mkdir -p dist && cp placeholder/index.html dist/; \
     fi; \
-    test -f dist/index.html
+    test -f dist/index.html; \
+    ls -la dist
 
 # ------------------------------------------------------------------- build
 FROM rust:1-slim-bookworm AS build
@@ -39,6 +49,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake clang libclang-dev pkg-config \
         libssl-dev ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+
+# ggml compiles for the machine it is *built* on unless told otherwise, and this
+# image is built for two architectures, sometimes under emulation. GGML_NATIVE=OFF
+# makes whisper.cpp a portable baseline build instead - the right trade when the
+# thing it renders is a thirty-second voice memo, and the wrong instruction on an
+# Ampere Altra is a SIGILL rather than a slow transcript. whisper-rs-sys passes
+# every GGML_* variable straight through to cmake.
+ARG GGML_NATIVE=OFF
+ENV GGML_NATIVE=${GGML_NATIVE}
 
 WORKDIR /src
 # Dependency layer: a manifest-only build so a source edit does not re-download

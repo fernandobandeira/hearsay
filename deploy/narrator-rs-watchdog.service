@@ -1,0 +1,6 @@
+# /etc/systemd/system/narrator-rs-watchdog.service — template, applied by hand.
+[Unit]
+Description=narrator-rs health watchdog
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/narrator-rs-watchdog.sh
