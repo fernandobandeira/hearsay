@@ -1,0 +1,6 @@
+/target
+/models/kokoro/*.onnx
+/models/whisper/*.bin
+/work
+/web
+node_modules
