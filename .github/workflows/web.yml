@@ -36,7 +36,9 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm --prefix web ci --no-audit --no-fund
       - run: npm --prefix web test
-      - run: npm --prefix web exec -- tsc -b --force
+      # `npm exec` ignores --prefix for the working directory; the package's own
+      # script does not, and it is the same `tsc -b --force`.
+      - run: npm --prefix web run typecheck
       - run: npm --prefix web run build
 
   build:
