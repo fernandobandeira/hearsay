@@ -36,7 +36,12 @@ unicode-general-category = "1"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-axum = "0.2"
 tokio-util = { version = "0.7", features = ["io"] }
-whisper-rs = { version = "0.16", default-features = false, optional = true }
+# `openmp` is NOT one of whisper-rs's defaults (it has none), so without this
+# whisper-rs-sys passes -DGGML_OPENMP=OFF and whisper.cpp falls back to ggml's
+# own thread pool. ONNX Runtime's CPU provider is OpenMP-threaded already and
+# libgomp is in both image stages, so this costs nothing and is what makes a
+# voice memo transcribe in seconds rather than tens of them.
+whisper-rs = { version = "0.16", default-features = false, features = ["openmp"], optional = true }
 
 
 [features]
