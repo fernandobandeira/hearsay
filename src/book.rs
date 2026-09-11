@@ -203,9 +203,8 @@ fn split_clauses(s: &str) -> Vec<&str> {
             i += 1;
             continue;
         }
-        let prev_ok = i > 0
-            && (matches!(b[i - 1], b',' | b';' | b':')
-                || s[..i].ends_with('\u{2014}'));
+        let prev_ok =
+            i > 0 && (matches!(b[i - 1], b',' | b';' | b':') || s[..i].ends_with('\u{2014}'));
         if !prev_ok {
             i += 1;
             continue;
@@ -364,7 +363,11 @@ pub fn extract_chapters(path: &Path) -> Result<Vec<RawChapter>, BookError> {
     // are walked depth-first, parent before children, and a later entry for the
     // same href wins — `titles[...] = it.title` in a recursive walk.
     let mut titles: HashMap<String, String> = HashMap::new();
-    fn walk(points: &[epub::doc::NavPoint], titles: &mut HashMap<String, String>, strip: &dyn Fn(&std::path::Path) -> String) {
+    fn walk(
+        points: &[epub::doc::NavPoint],
+        titles: &mut HashMap<String, String>,
+        strip: &dyn Fn(&std::path::Path) -> String,
+    ) {
         for p in points {
             let href = strip(&p.content);
             let href = href.split('#').next().unwrap_or("").to_string();
@@ -453,7 +456,10 @@ mod tests {
 
     #[test]
     fn abbreviation_guards_are_inert_bug_for_bug() {
-        assert_eq!(sentences("Dr. Smith went home."), vec!["Dr.", "Smith went home."]);
+        assert_eq!(
+            sentences("Dr. Smith went home."),
+            vec!["Dr.", "Smith went home."]
+        );
         assert_eq!(sentences("e.g. this thing."), vec!["e.g.", "this thing."]);
     }
 
@@ -483,7 +489,12 @@ mod tests {
 
     #[test]
     fn an_overlong_sentence_splits_on_clauses() {
-        let s = format!("{}, {}, {}.", "a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let s = format!(
+            "{}, {}, {}.",
+            "a".repeat(40),
+            "b".repeat(40),
+            "c".repeat(40)
+        );
         let out = chunk_paragraph(&s, 50);
         assert!(out.len() > 1, "{out:?}");
         assert!(out.iter().all(|c| c.chars().count() <= 90));
@@ -523,9 +534,21 @@ mod tests {
     #[test]
     fn estimates_match_the_python_arithmetic() {
         let chunks = vec![
-            Chunk { text: "a".repeat(14), para: 0, silent: false },
-            Chunk { text: "\u{2026}".into(), para: 0, silent: true },
-            Chunk { text: "b".repeat(28), para: 1, silent: false },
+            Chunk {
+                text: "a".repeat(14),
+                para: 0,
+                silent: false,
+            },
+            Chunk {
+                text: "\u{2026}".into(),
+                para: 0,
+                silent: true,
+            },
+            Chunk {
+                text: "b".repeat(28),
+                para: 1,
+                silent: false,
+            },
         ];
         assert!((est_chunk_s(&chunks[0], 0.5) - 1.0).abs() < 1e-9);
         assert!((est_chunk_s(&chunks[1], 0.5) - 0.5).abs() < 1e-9);

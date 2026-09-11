@@ -168,11 +168,7 @@ fn walk_wavs(root: &Path, out: &mut Vec<(std::time::SystemTime, u64, PathBuf)>) 
             Ok(t) if t.is_dir() => walk_wavs(&p, out),
             Ok(_) if p.extension().is_some_and(|x| x == "wav") => {
                 if let Ok(md) = e.metadata() {
-                    out.push((
-                        md.modified().unwrap_or(std::time::UNIX_EPOCH),
-                        md.len(),
-                        p,
-                    ));
+                    out.push((md.modified().unwrap_or(std::time::UNIX_EPOCH), md.len(), p));
                 }
             }
             _ => {}
@@ -272,7 +268,10 @@ mod tests {
 
     #[test]
     fn keys_are_stems_truncated_to_fifty() {
-        assert_eq!(book_key("/books/The Mom Test (2013).epub"), "The Mom Test (2013)");
+        assert_eq!(
+            book_key("/books/The Mom Test (2013).epub"),
+            "The Mom Test (2013)"
+        );
         let long = format!("/books/{}.epub", "x".repeat(80));
         assert_eq!(book_key(&long).len(), 50);
     }
@@ -293,7 +292,10 @@ mod tests {
             chunk_path(w, "Book", 7, 42),
             Path::new("/work/audio/Book/ch007/00042.wav")
         );
-        assert_eq!(chapter_dir(w, "Book", 1433), Path::new("/work/audio/Book/ch1433"));
+        assert_eq!(
+            chapter_dir(w, "Book", 1433),
+            Path::new("/work/audio/Book/ch1433")
+        );
     }
 
     #[test]
