@@ -17,7 +17,11 @@ Requires=docker.service
 [Service]
 Type=simple
 EnvironmentFile=/etc/narrator-rs.env
-Environment=IMAGE=narrator-rs:latest
+# The image CI publishes on every push to master, built natively for amd64 and
+# arm64. Deploying is `systemctl restart narrator-rs` - the pull below fetches
+# whatever :latest points at now. Set this to narrator-rs:latest to run an image
+# you built on the box instead.
+Environment=IMAGE=ghcr.io/fernandobandeira/hearsay:latest
 # Run as the box's own user, not root. Everything this container writes lands in
 # a bind mount - reading positions and fleeting notes go into the *vault*, which
 # is a git working tree something else commits. Root-owned files in there break
@@ -33,7 +37,21 @@ Environment=IMAGE=narrator-rs:latest
 # Port 7870 is bound to loopback only. There is no auth and no TLS: the box is
 # reached over Tailscale, and publishing this port is the one thing that turns a
 # private reader into a public one.
+# Every start fetches the newest image, so a deploy is a restart and nothing
+# else. `-` prefixed: a registry hiccup should leave the box running the image
+# it already has, not refuse to start.
+ExecStartPre=-/usr/bin/docker pull ghcr.io/fernandobandeira/hearsay:latest
 ExecStartPre=-/usr/bin/docker rm -f narrator-rs
+# The -v /home/ubuntu/web:/web:ro mount below is OPTIONAL. The image already
+# carries a reader build at /web (NARRATOR_WEB); this shadows it with a copy on
+# the box, which makes a UI-only deploy a file copy rather than an image
+# rebuild:
+#
+#   cp -r /home/ubuntu/narrator-rs/web/dist/. /home/ubuntu/web/
+#
+# Drop the line to serve the reader baked into the image. If you keep it, the
+# directory must exist and be non-empty - an empty /web is served as an empty
+# reader, and the server will not fall back to the image's copy.
 ExecStart=/usr/bin/docker run --rm --name narrator-rs \
     --user 1001:1001 \
     -p 127.0.0.1:7870:7870 \
@@ -41,6 +59,7 @@ ExecStart=/usr/bin/docker run --rm --name narrator-rs \
     -v /home/ubuntu/narrator/books:/books:ro \
     -v /home/ubuntu/narrator/models:/models:ro \
     -v /home/ubuntu/vault:/vault \
+    -v /home/ubuntu/web:/web:ro \
     --env-file /etc/narrator-rs.env \
     ${IMAGE}
 ExecStop=/usr/bin/docker stop --timeout 20 narrator-rs
