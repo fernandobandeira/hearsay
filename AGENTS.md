@@ -62,6 +62,21 @@ Fixing either is a migration, not an edit: it invalidates every rendered chunk, 
 
 Verified against `7 Powers (2016).epub` copied out of the vault: 22 chapters, 1577 chunks, 237 400 characters, identical chapter ids, titles, counts and first/last chunk text, with chapters 0–2 identical chunk for chunk.
 
+And, the check that actually settles it — `tests/parity_chunking.rs`'s opt-in
+`a_python_written_plan_matches_chunk_for_chunk` re-chunks whatever books a real
+narrator working tree already has a `plan.json` for and compares against the
+file **the Python server itself wrote**. Run against `~/git/narrator/work`:
+
+```
+01 - Lord of Mysteries: 1433 chapters, 118831 chunks, identical
+```
+
+Every chapter id, every title, every chunk's text, paragraph index and silent
+flag. That is the whole cache and every stored position in Fernando's largest
+book, proven to survive the swap. It is opt-in because it needs the epub still
+sitting next to the plan; `NARRATOR_REF_WORK` and `NARRATOR_REF_BOOKS` point it
+somewhere else, and it only ever reads (the epub is copied out before parsing).
+
 ### Cache layout
 
 `work/audio/<stem[:50]>/chNNN/IIIII.wav`, 24 kHz mono s16le; `plan.json` beside the chapter directories; `chapters/<key>/chNNN.{m4a,json}`; `hls/<key>/chNNN/`; `text/<key>/{index,NNN}.json`. **A Rust deploy adopts the existing cache in place** — a test seeds a Python-shaped cache and asserts nothing is re-rendered.
@@ -166,8 +181,22 @@ Measured on this machine (16 x86 cores), chapter 1 of *Lord of Mysteries*, 33 ch
 | Python + PyTorch Kokoro | ~4.5× realtime (AGENTS.md) |
 | Rust + ONNX Kokoro, `listen_test` | **4.31×** |
 | Rust + ONNX Kokoro, in the container, 7 Powers ch. 2 | **4.87×** |
+| Rust + ONNX Kokoro, in the container, *Lord of Mysteries* ch. 1 | **4.67×** |
 
-So: parity, within noise. The Oracle A1 is the number that actually matters and it has not been measured.
+So: parity on synthesis, within noise. The Oracle A1 is the number that actually matters and it has not been measured.
+
+Everything *around* the synthesis is a different story, and it is where the
+reader's waiting actually was. On the 1433-chapter *Lord of Mysteries*
+(7.8 MB epub, 16.8 MB of text, 12 shards), in the container:
+
+| | Python | Rust |
+|---|---|---|
+| `POST /api/load`, cold | 12.4 s (measured by the reader) | **0.73 s** |
+| `POST /api/load`, unchanged book | 12.4 s again | **0.36 s** (no parse at all) |
+| `GET /api/chapters`, 1433 rows | a few thousand `stat`s per poll | **9 ms**, 244 kB |
+| `GET /api/chapters?from=0&to=30` | not available | **12 ms**, 5.3 kB |
+
+The cold parse being seventeen times faster is just Rust against ebooklib + BeautifulSoup + lxml; the second one is [the parse cache](#what-this-server-does-that-the-python-one-does-not).
 
 ## Config surface
 

@@ -1,6 +1,6 @@
 # Drift: reader contract vs generated client
 
-Generated 2026-09-11 19:29 by `scripts/drift-check.mjs`.
+Generated 2026-09-11 19:33 by `scripts/drift-check.mjs`.
 
 - hand-written contract: `/home/fernando/git/narrator/web/src/lib/types.ts` (read-only)
 - generated client: `client/types.gen.ts`
