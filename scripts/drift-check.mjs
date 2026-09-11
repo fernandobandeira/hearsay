@@ -67,7 +67,7 @@ for (const f of [HAND_TYPES, HAND_API, GEN_TYPES, SPEC]) {
 const PAIRS = [
   ['BookFile', 'BookFile'],
   ['ChapMeta', 'ChapMeta'],
-  ['SavedPosition', 'Position'],
+  ['SavedPosition', 'StampedPosition'],
   ['LoadResult', 'LoadResult'],
   ['ChapRow', 'ChapterRow'],
   ['ChaptersResult', 'ChaptersResult'],

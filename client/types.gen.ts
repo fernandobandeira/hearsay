@@ -126,9 +126,20 @@ export type ChaptersResult = {
     chapters: Array<ChapterRow>;
     chapters_cap_gb?: number;
     chapters_gb?: number;
+    /**
+     * The window this response covers, when `?from=`/`?to=` narrowed it.
+     * Additive: without the query these are 0 and the last chapter index, and
+     * `chapters` is the whole book exactly as before.
+     */
+    from?: number;
     key: string | null;
     queue?: Array<number>;
     title: string | null;
+    to?: number;
+    /**
+     * How many chapters the book has, whatever the window is.
+     */
+    total?: number;
 };
 
 export type Health = {
@@ -141,6 +152,7 @@ export type Health = {
     model_ready: boolean;
     ok: boolean;
     packing: number | null;
+    positions_dir: string;
     problems: Array<string>;
     queue: number;
     since_progress_s: number;
@@ -148,6 +160,14 @@ export type Health = {
     status: string;
     threads: Array<string>;
     uptime_s: number;
+    /**
+     * Where positions and notes are being written. `null` means the vault is
+     * not mounted and they are falling back under the work dir — which is a
+     * thing to *say*, not to hide: with NARRATOR_VAULT pointing at a path that
+     * does not exist, the python server writes nothing, reads back `{}`, and
+     * every book quietly opens at chapter one.
+     */
+    vault?: string | null;
 };
 
 export type LoadBody = {
@@ -161,7 +181,7 @@ export type LoadResult = {
      * The cache directory name: the file stem, truncated to 50 characters.
      */
     key: string;
-    position: null | Position;
+    position: null | StampedPosition;
     title: string;
     total_min: number;
 };
@@ -217,6 +237,14 @@ export type Ok2 = {
 };
 
 export type OpenBody = {
+    /**
+     * The book this is meant for. **Additive, and worth sending.** Playback is
+     * one global session, so an open issued while the server holds a different
+     * book moves the wrong book's render frontier and saves the position into
+     * the wrong record. Supplied and mismatched, this is refused with a 409
+     * instead; omitted, it means "whatever is loaded", exactly as before.
+     */
+    book?: string | null;
     chapter?: number;
     chunk?: number;
 };
@@ -230,20 +258,12 @@ export type PauseResult = {
 };
 
 export type PlayheadBody = {
+    /**
+     * See [`OpenBody::book`]: additive, and it stops a report meant for one
+     * book from moving another one's frontier.
+     */
+    book?: string | null;
     chunk: number;
-};
-
-/**
- * One book's last position. Field order is the python dict's, because it is the
- * order `json.dumps` writes and the file is diffed by git.
- */
-export type Position = {
-    chapter: number;
-    chapter_title: string;
-    chapters_total: number;
-    chunk: number;
-    chunks_total: number;
-    updated: string;
 };
 
 export type PositionBody = {
@@ -295,6 +315,34 @@ export type ShardChapter = {
      * one-sentence blocks is not a page.
      */
     paras: Array<number>;
+};
+
+/**
+ * A position as the *API* hands it back: the record above plus an unambiguous
+ * instant.
+ *
+ * `updated` is a naive local stamp with no zone, because that is what the
+ * python server writes into the vault and the file has to keep matching. A
+ * browser cannot resolve it — a container without `/etc/localtime` stamps UTC
+ * while the same reader's other positions are local, and the reader is left
+ * guessing which of two positions is newer. So the API carries the instant as
+ * well, resolved here where the server's own zone is known.
+ */
+export type StampedPosition = {
+    chapter: number;
+    chapter_title: string;
+    chapters_total: number;
+    chunk: number;
+    chunks_total: number;
+    /**
+     * Naive local ISO, byte-identical to the vault record.
+     */
+    updated: string;
+    /**
+     * The same moment in epoch milliseconds. Null only if `updated` cannot be
+     * parsed at all, which means it was not written by a narrator.
+     */
+    updated_ms?: number | null;
 };
 
 export type Status = {
@@ -407,7 +455,12 @@ export type ChapterData = {
          */
         ci: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * The cache key. Omitted, it means the loaded book.
+         */
+        book?: string | null;
+    };
     url: '/api/chapter/{ci}';
 };
 
@@ -426,7 +479,10 @@ export type ChapterResponse = ChapterResponses[keyof ChapterResponses];
 export type ChaptersListData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        from?: number | null;
+        to?: number | null;
+    };
     url: '/api/chapters';
 };
 
@@ -831,6 +887,15 @@ export type OpenChapterData = {
     url: '/api/open';
 };
 
+export type OpenChapterErrors = {
+    /**
+     * the session holds another book
+     */
+    409: ApiError;
+};
+
+export type OpenChapterError = OpenChapterErrors[keyof OpenChapterErrors];
+
 export type OpenChapterResponses = {
     200: Ok2;
 };
@@ -856,6 +921,15 @@ export type PlayheadData = {
     query?: never;
     url: '/api/playhead';
 };
+
+export type PlayheadErrors = {
+    /**
+     * the session holds another book
+     */
+    409: ApiError;
+};
+
+export type PlayheadError = PlayheadErrors[keyof PlayheadErrors];
 
 export type PlayheadResponses = {
     200: Ok2;

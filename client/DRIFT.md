@@ -1,6 +1,6 @@
 # Drift: reader contract vs generated client
 
-Generated 2026-09-11 19:15 by `scripts/drift-check.mjs`.
+Generated 2026-09-11 19:29 by `scripts/drift-check.mjs`.
 
 - hand-written contract: `/home/fernando/git/narrator/web/src/lib/types.ts` (read-only)
 - generated client: `client/types.gen.ts`
@@ -32,7 +32,7 @@ _No mismatches._
 
 - `est_min` — generated never sends null where the reader allows it — assigns fine, the reader's guard is now dead code
 
-### SavedPosition → Position  *(renamed)*
+### SavedPosition → StampedPosition  *(renamed)*
 
 _No mismatches._
 
@@ -42,6 +42,7 @@ _No mismatches._
 | NOTE | `chapters_total` | now-always-sent | `chapters_total?: number` | `chapters_total: number  (always present)` |
 | NOTE | `chunks_total` | now-always-sent | `chunks_total?: number` | `chunks_total: number  (always present)` |
 | NOTE | `updated` | now-always-sent | `updated?: string` | `updated: string  (always present)` |
+| ADDITIVE | `updated_ms` | extra | `not in the hand-written type` | `updated_ms?: number \| null` |
 
 - `chapter_title` — server is stricter than the reader assumed — safe
 - `chapters_total` — server is stricter than the reader assumed — safe
@@ -54,7 +55,7 @@ _No mismatches._
 
 | verdict | field | kind | reader expects | generated has |
 |---|---|---|---|---|
-| NOTE | `position` | now-always-sent | `position?: SavedPosition \| null` | `position: Position \| null  (always present)` |
+| NOTE | `position` | now-always-sent | `position?: SavedPosition \| null` | `position: StampedPosition \| null  (always present)` |
 
 - `position` — server is stricter than the reader assumed — safe
 
@@ -76,7 +77,13 @@ _No mismatches._
 
 ### ChaptersResult → ChaptersResult
 
-Identical. No drift.
+_No mismatches._
+
+| verdict | field | kind | reader expects | generated has |
+|---|---|---|---|---|
+| ADDITIVE | `from` | extra | `not in the hand-written type` | `from?: number` |
+| ADDITIVE | `to` | extra | `not in the hand-written type` | `to?: number` |
+| ADDITIVE | `total` | extra | `not in the hand-written type` | `total?: number` |
 
 ### Status → Status
 
@@ -132,9 +139,9 @@ Every URL `api.ts` builds, checked against `openapi.json` (32 routes).
 
 - 0 mismatches (breaking)
 - 12 notes (safe: optional field dropped, or now always sent)
-- 3 additive fields (generated only)
+- 7 additive fields (generated only)
 - 0 missing endpoints
 
 ```
-DRIFT: 0 mismatches, 3 additive, 0 missing endpoints
+DRIFT: 0 mismatches, 7 additive, 0 missing endpoints
 ```

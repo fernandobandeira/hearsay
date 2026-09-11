@@ -33,6 +33,56 @@ pub struct Position {
     pub updated: String,
 }
 
+/// A position as the *API* hands it back: the record above plus an unambiguous
+/// instant.
+///
+/// `updated` is a naive local stamp with no zone, because that is what the
+/// python server writes into the vault and the file has to keep matching. A
+/// browser cannot resolve it — a container without `/etc/localtime` stamps UTC
+/// while the same reader's other positions are local, and the reader is left
+/// guessing which of two positions is newer. So the API carries the instant as
+/// well, resolved here where the server's own zone is known.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct StampedPosition {
+    pub chapter: i64,
+    pub chunk: i64,
+    pub chapter_title: String,
+    pub chunks_total: i64,
+    pub chapters_total: i64,
+    /// Naive local ISO, byte-identical to the vault record.
+    pub updated: String,
+    /// The same moment in epoch milliseconds. Null only if `updated` cannot be
+    /// parsed at all, which means it was not written by a narrator.
+    pub updated_ms: Option<i64>,
+}
+
+impl Position {
+    pub fn stamped(self) -> StampedPosition {
+        let updated_ms = epoch_ms(&self.updated);
+        StampedPosition {
+            chapter: self.chapter,
+            chunk: self.chunk,
+            chapter_title: self.chapter_title,
+            chunks_total: self.chunks_total,
+            chapters_total: self.chapters_total,
+            updated: self.updated,
+            updated_ms,
+        }
+    }
+}
+
+/// Resolve a naive `YYYY-MM-DDTHH:MM:SS` against this machine's zone. An
+/// ambiguous local time (the hour a DST fold repeats) takes the earlier of the
+/// two; a nonexistent one (the hour DST skips) has no answer and returns None.
+pub fn epoch_ms(naive: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    let dt = chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%dT%H:%M:%S").ok()?;
+    chrono::Local
+        .from_local_datetime(&dt)
+        .earliest()
+        .map(|t| t.timestamp_millis())
+}
+
 /// The whole file: book file name -> position. `serde_json`'s `preserve_order`
 /// feature keeps insertion order, which is what python's dicts do and what the
 /// Reading Log's stable sort falls back on for equal timestamps.

@@ -150,6 +150,31 @@ pub fn write_bundle(
     Ok(())
 }
 
+/// Read one chapter's words back out of a written bundle: `(title, paras,
+/// chunks)`, or None if that book has no bundle or no such chapter.
+///
+/// This is what makes `/api/chapter/{ci}?book=` answerable without a session.
+/// Only the chapter's own shard is read, so the cost is a small index plus at
+/// most ~1.5 MB even for a 1433-chapter book.
+pub fn chapter_from_bundle(
+    work: &Path,
+    key: &str,
+    ci: usize,
+) -> Option<(String, Vec<usize>, Vec<String>)> {
+    if key.is_empty() {
+        return None;
+    }
+    let d = text_dir(work, key);
+    let index: BookIndex =
+        serde_json::from_slice(&std::fs::read(d.join("index.json")).ok()?).ok()?;
+    let meta = index.chapters.iter().find(|c| c.i == ci)?;
+    let shard: TextShard =
+        serde_json::from_slice(&std::fs::read(d.join(format!("{:03}.json", meta.shard?))).ok()?)
+            .ok()?;
+    let c = shard.chapters.into_iter().find(|c| c.i == ci)?;
+    Some((meta.title.clone(), c.paras, c.chunks))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +229,22 @@ mod tests {
         .expect("parse");
         assert_eq!(idx.shards, 3);
         assert_eq!(idx.chapters[4].shard, Some(2));
+    }
+
+    #[test]
+    fn a_chapter_reads_back_out_of_its_own_shard() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::for_test(d.path());
+        cfg.text_shard_chapters = 2;
+        let p = plan(5, 3, 20);
+        write_bundle(&cfg, &p, &[1.0; 5], "K", "k.epub", "K").expect("write");
+        let (title, paras, chunks) = chapter_from_bundle(&cfg.work, "K", 4).expect("chapter 4");
+        assert_eq!(title, "Section 5");
+        assert_eq!(paras, vec![0, 1, 2]);
+        assert_eq!(chunks.len(), 3);
+        assert!(chapter_from_bundle(&cfg.work, "K", 99).is_none());
+        assert!(chapter_from_bundle(&cfg.work, "nope", 0).is_none());
+        assert!(chapter_from_bundle(&cfg.work, "", 0).is_none());
     }
 
     #[test]

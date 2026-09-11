@@ -131,6 +131,8 @@
         "tags": [
           "session"
         ],
+        "summary": "One chapter's words.",
+        "description": "**`?book=` is honoured**, which the python server does not do: it answers for\nwhichever book the process last loaded and ignores the query. That one\nasymmetry is why the reader's first paint was coupled to `/api/load` at all —\nthe cheapest possible \"give me the words of chapter 576\" could not be asked\nuntil the server had been told which book it was on. Here a key that is not\nthe loaded book is served straight out of that book's text bundle, with no\nsession involved. Omitted, it still means the loaded book.",
         "operationId": "chapter",
         "parameters": [
           {
@@ -141,6 +143,18 @@
             "schema": {
               "type": "integer",
               "minimum": 0
+            }
+          },
+          {
+            "name": "book",
+            "in": "query",
+            "description": "The cache key. Omitted, it means the loaded book.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -175,6 +189,32 @@
         ],
         "summary": "Every chapter of the loaded book: chunks rendered / total, whether the packed\nm4a exists and how big it is.",
         "operationId": "chapters_list",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "",
@@ -1037,6 +1077,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "the session holds another book",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         }
       }
@@ -1086,6 +1136,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Ok2"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the session holds another book",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
                 }
               }
             }
@@ -1740,6 +1800,11 @@
             "type": "number",
             "format": "double"
           },
+          "from": {
+            "type": "integer",
+            "description": "The window this response covers, when `?from=`/`?to=` narrowed it.\nAdditive: without the query these are 0 and the last chapter index, and\n`chapters` is the whole book exactly as before.",
+            "minimum": 0
+          },
           "key": {
             "type": [
               "string",
@@ -1758,6 +1823,15 @@
               "string",
               "null"
             ]
+          },
+          "to": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "description": "How many chapters the book has, whatever the window is.",
+            "minimum": 0
           }
         }
       },
@@ -1776,7 +1850,8 @@
           "build_error",
           "packing",
           "queue",
-          "live"
+          "live",
+          "positions_dir"
         ],
         "properties": {
           "book": {
@@ -1809,6 +1884,9 @@
             ],
             "minimum": 0
           },
+          "positions_dir": {
+            "type": "string"
+          },
           "problems": {
             "type": "array",
             "items": {
@@ -1839,6 +1917,13 @@
           "uptime_s": {
             "type": "number",
             "format": "double"
+          },
+          "vault": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where positions and notes are being written. `null` means the vault is\nnot mounted and they are falling back under the work dir — which is a\nthing to *say*, not to hide: with NARRATOR_VAULT pointing at a path that\ndoes not exist, the python server writes nothing, reads back `{}`, and\nevery book quietly opens at chapter one."
           }
         }
       },
@@ -1886,7 +1971,7 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/Position",
+                "$ref": "#/components/schemas/StampedPosition",
                 "description": "The stored position for this book, or null if it has never been opened."
               }
             ]
@@ -2046,6 +2131,13 @@
       "OpenBody": {
         "type": "object",
         "properties": {
+          "book": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The book this is meant for. **Additive, and worth sending.** Playback is\none global session, so an open issued while the server holds a different\nbook moves the wrong book's render frontier and saves the position into\nthe wrong record. Supplied and mismatched, this is refused with a 409\ninstead; omitted, it means \"whatever is loaded\", exactly as before."
+          },
           "chapter": {
             "type": "integer",
             "minimum": 0
@@ -2078,45 +2170,16 @@
           "chunk"
         ],
         "properties": {
+          "book": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "See [`OpenBody::book`]: additive, and it stops a report meant for one\nbook from moving another one's frontier."
+          },
           "chunk": {
             "type": "integer",
             "minimum": 0
-          }
-        }
-      },
-      "Position": {
-        "type": "object",
-        "description": "One book's last position. Field order is the python dict's, because it is the\norder `json.dumps` writes and the file is diffed by git.",
-        "required": [
-          "chapter",
-          "chunk",
-          "chapter_title",
-          "chunks_total",
-          "chapters_total",
-          "updated"
-        ],
-        "properties": {
-          "chapter": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "chapter_title": {
-            "type": "string"
-          },
-          "chapters_total": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "chunk": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "chunks_total": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "updated": {
-            "type": "string"
           }
         }
       },
@@ -2278,6 +2341,51 @@
               "minimum": 0
             },
             "description": "What lets the reader re-form real paragraphs from chunks — a wall of\none-sentence blocks is not a page."
+          }
+        }
+      },
+      "StampedPosition": {
+        "type": "object",
+        "description": "A position as the *API* hands it back: the record above plus an unambiguous\ninstant.\n\n`updated` is a naive local stamp with no zone, because that is what the\npython server writes into the vault and the file has to keep matching. A\nbrowser cannot resolve it — a container without `/etc/localtime` stamps UTC\nwhile the same reader's other positions are local, and the reader is left\nguessing which of two positions is newer. So the API carries the instant as\nwell, resolved here where the server's own zone is known.",
+        "required": [
+          "chapter",
+          "chunk",
+          "chapter_title",
+          "chunks_total",
+          "chapters_total",
+          "updated"
+        ],
+        "properties": {
+          "chapter": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "chapter_title": {
+            "type": "string"
+          },
+          "chapters_total": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "chunk": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "chunks_total": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "updated": {
+            "type": "string",
+            "description": "Naive local ISO, byte-identical to the vault record."
+          },
+          "updated_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The same moment in epoch milliseconds. Null only if `updated` cannot be\nparsed at all, which means it was not written by a narrator."
           }
         }
       },

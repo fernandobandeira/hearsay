@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -72,6 +72,29 @@ pub struct ChaptersResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = f64)]
     pub chapters_cap_gb: Option<f64>,
+    /// The window this response covers, when `?from=`/`?to=` narrowed it.
+    /// Additive: without the query these are 0 and the last chapter index, and
+    /// `chapters` is the whole book exactly as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = usize)]
+    pub from: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = usize)]
+    pub to: Option<usize>,
+    /// How many chapters the book has, whatever the window is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = usize)]
+    pub total: Option<usize>,
+}
+
+/// `?from=&to=` on the chapter list. The drawer polls this every two seconds
+/// while it is open, and for 1433 chapters the unwindowed scan is a few thousand
+/// `stat` calls; a reader that only shows a screenful never needs the rest.
+/// Both bounds are inclusive and clamped to the book.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct RangeQuery {
+    pub from: Option<usize>,
+    pub to: Option<usize>,
 }
 
 /// Per-chapter render/pack state, memoised for 1.5 s: scanning a 1400-chapter
@@ -130,9 +153,13 @@ pub fn chapter_rows(st: &Arc<AppState>) -> Vec<ChapterRow> {
 /// m4a exists and how big it is.
 #[utoipa::path(
     get, path = "/api/chapters", tag = "chapters",
+    params(RangeQuery),
     responses((status = 200, body = ChaptersResult))
 )]
-pub async fn chapters_list(State(st): State<Arc<AppState>>) -> Response {
+pub async fn chapters_list(
+    State(st): State<Arc<AppState>>,
+    Query(range): Query<RangeQuery>,
+) -> Response {
     let empty = st.session().plan.is_empty();
     if empty {
         return Json(ChaptersResult {
@@ -146,6 +173,9 @@ pub async fn chapters_list(State(st): State<Arc<AppState>>) -> Response {
             build_error: None,
             chapters_gb: None,
             chapters_cap_gb: None,
+            from: None,
+            to: None,
+            total: None,
         })
         .into_response();
     }
@@ -155,8 +185,15 @@ pub async fn chapters_list(State(st): State<Arc<AppState>>) -> Response {
         .unwrap_or_default();
     let s = st.session();
     let (queue, want, bq) = (s.queue.clone(), s.build_want.clone(), s.pack_queue.clone());
+    let total = rows.len();
+    let from = range.from.unwrap_or(0).min(total.saturating_sub(1));
+    let to = range
+        .to
+        .unwrap_or(total.saturating_sub(1))
+        .min(total.saturating_sub(1));
     let rows = rows
         .into_iter()
+        .filter(|r| r.i >= from && r.i <= to)
         .map(|mut r| {
             r.queued = queue.contains(&r.i);
             r.packing = s.building == Some(r.i);
@@ -177,6 +214,9 @@ pub async fn chapters_list(State(st): State<Arc<AppState>>) -> Response {
             pack::total_bytes(&st.cfg.work) as f64 / 1024.0_f64.powi(3),
         )),
         chapters_cap_gb: Some(st.cfg.max_chapter_gb),
+        from: Some(from),
+        to: Some(to),
+        total: Some(total),
     })
     .into_response()
 }
