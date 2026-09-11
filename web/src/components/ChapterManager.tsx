@@ -11,7 +11,7 @@
  * and always explicit. Anything taken without asking needs a way to give back, so
  * the text row carries its own remove - and remembers the refusal.
  */
-import {useMemo, useState} from 'react';
+import {useEffect, useLayoutEffect, useMemo, useRef, useState} from 'react';
 import {
   Check, CircleDashed, Clock, Download, FileAudio, HardDriveDownload, Loader2,
   PieChart, Trash2, Type, Waves,
@@ -24,6 +24,7 @@ import {ScrollArea} from '@/components/ui/scroll-area';
 import {Skeleton} from '@/components/ui/skeleton';
 import {useChapterActions, useChapters} from '@/lib/api';
 import {chapterState, type ChapterStateKey, type Job} from '@/lib/chapterstate';
+import {centeredScrollTop, scrollTargetIndex} from '@/lib/drawernav';
 import {downloadChapter, removeChapter, storageEstimate} from '@/lib/offline';
 import {bytes as fmtBytes} from '@/lib/format';
 import {cn} from '@/lib/utils';
@@ -40,7 +41,13 @@ const TONE = {
   done: 'text-foreground/50', none: 'text-muted-foreground/80',
 } as const;
 
-export function ChapterManager({open, onPick}: {open: boolean; onPick: (ci: number) => void}) {
+export function ChapterManager({open, active, onPick}: {
+  /** the drawer is up: what gates the chapters query */
+  open: boolean;
+  /** this level of the stack is the one on screen: what triggers the centring */
+  active: boolean;
+  onPick: (ci: number) => void;
+}) {
   const n = useNarrator();
   const {data, isPending} = useChapters(open && !!n.book);
   const actions = useChapterActions();
@@ -61,6 +68,53 @@ export function ChapterManager({open, onPick}: {open: boolean; onPick: (ci: numb
   const hits = useMemo(
     () => rows.filter((r) => !filter || r.title.toLowerCase().includes(filter.toLowerCase())),
     [rows, filter]);
+
+  /* Centring the chapter being read.
+     Once per visit to this level, never while he is scrolling: `done` is armed
+     again when the drawer closes, when the stack goes back to Books, and when
+     another book is picked - that last one because this component is not
+     remounted by a book switch, so without it the new book's list inherits the
+     old one's scroll offset. The row is measured against the scroller rather
+     than trusted to be `i * rowHeight` - the rows are one line of text and could
+     wrap - and the first attempt can land before the sheet's slide-in has given
+     the viewport a height, so it retries on a few frames rather than silently
+     scrolling nowhere. */
+  const scroller = useRef<HTMLDivElement>(null);
+  const done = useRef(false);
+  useEffect(() => {
+    if (!open || !active) done.current = false;
+  }, [open, active]);
+  useEffect(() => { done.current = false; }, [n.book?.key]);
+  useLayoutEffect(() => {
+    if (!open || !active || done.current) return;
+    let frames = 0;
+    let raf = 0;
+    const tick = () => {
+      const vp = scroller.current?.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]');
+      const at = scrollTargetIndex(hits.map((r) => r.i), n.ci);
+      const row = at == null
+        ? null
+        : vp?.querySelector<HTMLElement>(`[data-testid="chapter-row"][data-ci="${n.ci}"]`);
+      if (vp && row && vp.clientHeight > 0) {
+        const box = row.getBoundingClientRect();
+        vp.scrollTop = centeredScrollTop({
+          rowTop: box.top - vp.getBoundingClientRect().top + vp.scrollTop,
+          rowHeight: box.height,
+          viewportHeight: vp.clientHeight,
+          scrollHeight: vp.scrollHeight,
+        });
+        done.current = true;
+        return;
+      }
+      // Nothing to centre on. If the filter box is what removed it, that was his
+      // doing and the list stays where it is; otherwise the row is simply not
+      // rendered yet (a book switch lands here for a frame or two) and it waits.
+      if (at == null && vp && filter) { done.current = true; return; }
+      if (++frames < 10) raf = requestAnimationFrame(tick);
+    };
+    tick();
+    return () => cancelAnimationFrame(raf);
+  }, [open, active, hits, filter, n.ci]);
 
   const toggle = (i: number) => setSel((s) => {
     const next = new Set(s);
@@ -185,7 +239,7 @@ export function ChapterManager({open, onPick}: {open: boolean; onPick: (ci: numb
         className="mx-4 mb-2 h-8 w-[calc(100%-2rem)] bg-card text-xs"
       />
 
-      <ScrollArea className="min-h-0 flex-1">
+      <ScrollArea ref={scroller} data-testid="chapter-scroller" className="min-h-0 flex-1">
         <div className="pb-2">
           {loadingRows && (
             <div data-testid="chapters-skeleton" className="space-y-2 px-3 py-2">
