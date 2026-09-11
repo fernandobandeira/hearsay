@@ -18,11 +18,23 @@ Requires=docker.service
 Type=simple
 EnvironmentFile=/etc/narrator-rs.env
 Environment=IMAGE=narrator-rs:latest
+# Run as the box's own user, not root. Everything this container writes lands in
+# a bind mount - reading positions and fleeting notes go into the *vault*, which
+# is a git working tree something else commits. Root-owned files in there break
+# that, quietly, later. Check what you have first and fix it once:
+#
+#   ls -l /home/ubuntu/vault/'02 - Studies'/.narrator-positions.json
+#   sudo chown -R ubuntu:ubuntu /home/ubuntu/narrator /home/ubuntu/vault
+#
+# Set RUN_AS= (empty) to fall back to root, which is what the python container
+# does today.
+Environment=RUN_AS=1000:1000
 # Port 7870 is bound to loopback only. There is no auth and no TLS: the box is
 # reached over Tailscale, and publishing this port is the one thing that turns a
 # private reader into a public one.
 ExecStartPre=-/usr/bin/docker rm -f narrator-rs
 ExecStart=/usr/bin/docker run --rm --name narrator-rs \
+    ${RUN_AS:+--user ${RUN_AS}} \
     -p 127.0.0.1:7870:7870 \
     -v /home/ubuntu/narrator/work:/work \
     -v /home/ubuntu/narrator/books:/books:ro \

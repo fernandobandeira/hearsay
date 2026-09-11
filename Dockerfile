@@ -51,13 +51,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ggml compiles for the machine it is *built* on unless told otherwise, and this
-# image is built for two architectures, sometimes under emulation. GGML_NATIVE=OFF
-# makes whisper.cpp a portable baseline build instead - the right trade when the
-# thing it renders is a thirty-second voice memo, and the wrong instruction on an
-# Ampere Altra is a SIGILL rather than a slow transcript. whisper-rs-sys passes
-# every GGML_* variable straight through to cmake.
+# image is built for two architectures, sometimes under emulation - where "the
+# machine" is QEMU's idea of a CPU, not the Ampere Altra the result will run on.
+# A wrong instruction there is a SIGILL, not a slow transcript, so GGML_NATIVE is
+# off and the baseline is named explicitly instead.
+#
+#   amd64: x86-64-v3 (AVX, AVX2, FMA, F16C) - every Intel/AMD part since ~2013,
+#          which both this box and any plausible VPS are. Leaving these off as
+#          well costs whisper.cpp several times its speed for nothing.
+#   arm64: the ARMv8 baseline, which already mandates NEON. Not armv8.2+dotprod:
+#          the A1 has it, but naming it here would make the image A1-only, and a
+#          voice memo is not the hot path. Build on the box with
+#          `--build-arg GGML_NATIVE=ON` if that transcript ever feels slow.
+#
+# whisper-rs-sys passes every GGML_* variable straight through to cmake.
+ARG TARGETARCH
 ARG GGML_NATIVE=OFF
 ENV GGML_NATIVE=${GGML_NATIVE}
+# One shell snippet, sourced by both cargo invocations below. TARGETARCH comes
+# from buildx; dpkg is the fallback for a plain `docker build`.
+RUN set -eux; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    if [ "${GGML_NATIVE}" = "OFF" ] && [ "$arch" = "amd64" ]; then \
+        echo 'export GGML_AVX=ON GGML_AVX2=ON GGML_FMA=ON GGML_F16C=ON' > /etc/ggml.sh; \
+    else \
+        echo '# ggml baseline for this arch' > /etc/ggml.sh; \
+    fi; \
+    cat /etc/ggml.sh
 
 WORKDIR /src
 # Dependency layer: a manifest-only build so a source edit does not re-download
@@ -68,14 +88,17 @@ RUN mkdir -p src/bin \
     && echo 'fn main() {}' > src/main.rs \
     && echo '' > src/lib.rs \
     && echo 'fn main() {}' > src/bin/listen_test.rs \
-    && cargo build --release --locked || true \
+    && sh -c '. /etc/ggml.sh; cargo build --release --locked || true' \
     && rm -rf src
 
 COPY src/ ./src/
 COPY tests/ ./tests/
 # Touch so cargo does not reuse the stub's fingerprint.
-RUN touch src/main.rs src/lib.rs && cargo build --release --locked --bin narrator \
-    && strip target/release/narrator || true
+RUN set -eux; \
+    . /etc/ggml.sh; \
+    touch src/main.rs src/lib.rs; \
+    cargo build --release --locked --bin narrator; \
+    strip target/release/narrator || true
 
 # ----------------------------------------------------------------- runtime
 FROM debian:bookworm-slim
