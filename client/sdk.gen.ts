@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, ServerSentEventsResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { BookIndex2Data, BookIndex2Errors, BookIndex2Responses, BookIndexData, BookIndexErrors, BookIndexResponses, BooksData, BooksResponses, BookText2Data, BookText2Errors, BookText2Responses, BookTextData, BookTextErrors, BookTextResponses, ChapterAudio2Data, ChapterAudio2Errors, ChapterAudio2Responses, ChapterAudioData, ChapterAudioErrors, ChapterAudioResponses, ChapterData, ChapterErrors, ChapterHls2Data, ChapterHls2Errors, ChapterHls2Responses, ChapterHlsData, ChapterHlsErrors, ChapterHlsResponses, ChapterManifest2Data, ChapterManifest2Errors, ChapterManifest2Responses, ChapterManifestData, ChapterManifestErrors, ChapterManifestResponses, ChapterResponses, ChaptersBuildData, ChaptersBuildErrors, ChaptersBuildResponses, ChaptersCancelData, ChaptersCancelResponses, ChaptersListData, ChaptersListResponses, ChaptersRenderData, ChaptersRenderErrors, ChaptersRenderResponses, ChunkWav2Data, ChunkWav2Errors, ChunkWav2Responses, ChunkWavData, ChunkWavErrors, ChunkWavResponses, EventsData, EventsResponse, EventsResponses, HealthzData, HealthzErrors, HealthzResponses, HlsSegment2Data, HlsSegment2Errors, HlsSegment2Responses, HlsSegmentData, HlsSegmentErrors, HlsSegmentResponses, LoadData, LoadErrors, LoadResponses, NoteData, NoteErrors, NoteResponses, OpenChapterData, OpenChapterResponses, PauseData, PauseResponses, PlayheadData, PlayheadResponses, PositionData, PositionErrors, PositionResponses, PrerenderData, PrerenderErrors, PrerenderResponses, RendererData, RendererResponses, ResumeData, ResumeResponses, StatusData, StatusResponses } from './types.gen';
+import type { BookIndex2Data, BookIndex2Errors, BookIndex2Responses, BookIndexData, BookIndexErrors, BookIndexResponses, BooksData, BooksResponses, BookText2Data, BookText2Errors, BookText2Responses, BookTextData, BookTextErrors, BookTextResponses, ChapterAudio2Data, ChapterAudio2Errors, ChapterAudio2Responses, ChapterAudioData, ChapterAudioErrors, ChapterAudioResponses, ChapterData, ChapterErrors, ChapterHls2Data, ChapterHls2Errors, ChapterHls2Responses, ChapterHlsData, ChapterHlsErrors, ChapterHlsResponses, ChapterManifest2Data, ChapterManifest2Errors, ChapterManifest2Responses, ChapterManifestData, ChapterManifestErrors, ChapterManifestResponses, ChapterResponses, ChaptersBuildData, ChaptersBuildErrors, ChaptersBuildResponses, ChaptersCancelData, ChaptersCancelResponses, ChaptersListData, ChaptersListResponses, ChaptersRenderData, ChaptersRenderErrors, ChaptersRenderResponses, ChunkWav2Data, ChunkWav2Errors, ChunkWav2Responses, ChunkWavData, ChunkWavErrors, ChunkWavResponses, EventsData, EventsResponse, EventsResponses, HealthzData, HealthzErrors, HealthzResponses, HlsSegment2Data, HlsSegment2Errors, HlsSegment2Responses, HlsSegmentData, HlsSegmentErrors, HlsSegmentResponses, LoadData, LoadErrors, LoadResponses, NoteData, NoteErrors, NoteResponses, OpenChapterData, OpenChapterErrors, OpenChapterResponses, PauseData, PauseResponses, PlayheadData, PlayheadErrors, PlayheadResponses, PositionData, PositionErrors, PositionResponses, PrerenderData, PrerenderErrors, PrerenderResponses, RendererData, RendererResponses, ResumeData, ResumeResponses, StatusData, StatusResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -35,6 +35,17 @@ export const bookIndex2 = <ThrowOnError extends boolean = false>(options?: Optio
  */
 export const books = <ThrowOnError extends boolean = false>(options?: Options<BooksData, ThrowOnError>): RequestResult<BooksResponses, unknown, ThrowOnError> => (options?.client ?? client).get<BooksResponses, unknown, ThrowOnError>({ url: '/api/books', ...options });
 
+/**
+ * One chapter's words.
+ *
+ * **`?book=` is honoured**, which the python server does not do: it answers for
+ * whichever book the process last loaded and ignores the query. That one
+ * asymmetry is why the reader's first paint was coupled to `/api/load` at all —
+ * the cheapest possible "give me the words of chapter 576" could not be asked
+ * until the server had been told which book it was on. Here a key that is not
+ * the loaded book is served straight out of that book's text bundle, with no
+ * session involved. Omitted, it still means the loaded book.
+ */
 export const chapter = <ThrowOnError extends boolean = false>(options: Options<ChapterData, ThrowOnError>): RequestResult<ChapterResponses, ChapterErrors, ThrowOnError> => (options.client ?? client).get<ChapterResponses, ChapterErrors, ThrowOnError>({ url: '/api/chapter/{ci}', ...options });
 
 /**
@@ -181,7 +192,7 @@ export const note = <ThrowOnError extends boolean = false>(options: Options<Note
  * The opened chunk is *guaranteed* to render: the worker renders whatever is
  * under the playhead before anything else, and this sets the playhead.
  */
-export const openChapter = <ThrowOnError extends boolean = false>(options: Options<OpenChapterData, ThrowOnError>): RequestResult<OpenChapterResponses, unknown, ThrowOnError> => (options.client ?? client).post<OpenChapterResponses, unknown, ThrowOnError>({
+export const openChapter = <ThrowOnError extends boolean = false>(options: Options<OpenChapterData, ThrowOnError>): RequestResult<OpenChapterResponses, OpenChapterErrors, ThrowOnError> => (options.client ?? client).post<OpenChapterResponses, OpenChapterErrors, ThrowOnError>({
     url: '/api/open',
     ...options,
     headers: {
@@ -202,7 +213,7 @@ export const pause = <ThrowOnError extends boolean = false>(options?: Options<Pa
  * backwards — anything already on disk still plays, and the worker skips files
  * that exist, so nothing is re-rendered.
  */
-export const playhead = <ThrowOnError extends boolean = false>(options: Options<PlayheadData, ThrowOnError>): RequestResult<PlayheadResponses, unknown, ThrowOnError> => (options.client ?? client).post<PlayheadResponses, unknown, ThrowOnError>({
+export const playhead = <ThrowOnError extends boolean = false>(options: Options<PlayheadData, ThrowOnError>): RequestResult<PlayheadResponses, PlayheadErrors, ThrowOnError> => (options.client ?? client).post<PlayheadResponses, PlayheadErrors, ThrowOnError>({
     url: '/api/playhead',
     ...options,
     headers: {

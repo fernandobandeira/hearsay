@@ -19,6 +19,7 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `src/stt.rs` | whisper.cpp via `whisper-rs`: `large-v3-turbo-q5_0`, CPU, one transcription at a time, ffmpeg decoding the webm, silero VAD when its model is present. |
 | `src/cache.rs` | `work/audio/<key>/chNNN/IIIII.wav` and `gc_audio`. |
 | `src/chapters.rs` | Chapter packing (AAC m4a + chunk→second manifest), lazy HLS, the chapter gc. |
+| `src/plancache.rs` | The parse cache: `plan.json` plus a `parse.json` stamp, so `/api/load` does not re-parse a book that has not changed. |
 | `src/text.rs` | The two-tier offline text bundle: `index.json` + byte-budgeted shards. |
 | `src/vault.rs` | `.narrator-positions.json`, `Reading Log.md`, fleeting notes — all byte-identical to the Python output. |
 | `src/render.rs` | The render worker and the packer, one OS thread each. |
@@ -26,7 +27,7 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `src/state.rs` | One global session, exactly like Python's process-wide `S`. |
 | `src/api/` | Every endpoint, with typed request/response structs that **generate** the OpenAPI document. |
 | `src/watch.rs` | The library watcher (`notify`), which turns "the vault's git sync pulled an epub onto the server" into a `books` event. |
-| `tests/` | Five parity suites plus a harness that runs a whole server in a temp dir. |
+| `tests/` | Five parity suites, the reader-requirement suite, and a harness that runs a whole server in a temp dir. |
 | `scripts/golden/` | Generates the Python golden fixtures (uv + ebooklib + bs4) the parity tests assert against. |
 | `scripts/gen-client.sh`, `scripts/drift-check.mjs` | OpenAPI → typed TS client, and the drift gate against the reader's hand-written types. |
 | `listen-test/` | GATE 0: the ONNX engine rendered against the PyTorch render Fernando accepted. |
@@ -38,7 +39,7 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 ./narrator models        # fetch Kokoro + whisper weights into ./models (~900 MB)
 ./narrator dev           # cargo run, serving ./web and ./work
 ./narrator build && ./narrator up     # docker, port 7870 on localhost only
-./narrator test          # the whole suite: 75 tests, no model, no network
+./narrator test          # the whole suite: 86 tests, no model, no network
 ./narrator lint          # rustfmt --check + clippy -D warnings
 ./narrator client        # regenerate the TS client and run the drift check
 ./narrator listen-test   # re-render the GATE 0 passage and report RTF
@@ -90,6 +91,44 @@ Tested three ways: a cache with holes opened at a missing chunk, a hole punched 
 Every path, method, field name, type and nullability of the Python contract, asserted against `tests/fixtures/api_contract.json` — a transcription of `AGENTS.md` + `app/server.py` + `web/src/lib/types.ts`, written down rather than generated here, so it can catch *this* server drifting.
 
 25 paths. `/api/events` (SSE) is implemented over a tokio broadcast channel with the same wire format, the same coalescing of `progress` and the same refusal to replay. `/healthz` returns 503 with `problems[]` for the failures that actually happen: a dead render thread, a "rendering" status with no chunk in `HEALTH_STALL_S`, an unwritable work dir.
+
+## What this server does that the Python one does not
+
+`~/git/narrator/web/RUST-NOTES.md` is a list of requirements the person porting
+the reader wrote against the Python server, each with the client-side mitigation
+standing in for it meanwhile. All six are implemented here, all six are
+**additive** — a client that sends none of the new parameters gets exactly the
+Python behaviour, which is what keeps the Obsidian plugin working untouched —
+and each has a test in `tests/reader_requirements.rs`.
+
+1. **`/api/load` does not re-parse an unchanged book.** Measured at 12.4 s per
+   call on the 1433-chapter *Lord of Mysteries*, and the reading position comes
+   back in that response, so first paint on a new device waited for all of it.
+   The plan was already being written to disk for `narrator export`; what was
+   missing was a way to know it is still valid, which is the `parse.json` stamp
+   beside it — source path, size, mtime, `max_chars`, format version. All match,
+   and the plan is read back instead of rebuilt; anything differs and the book is
+   parsed and the text bundle rebuilt exactly as before. Because the stamp is on
+   disk, a container restart is fast too, not just a second call.
+2. **`/api/chapter/{ci}` honours `?book=`.** The Python one answers for whichever
+   book the process last loaded and ignores the query — the one asymmetry that
+   coupled the reader's first paint to `/api/load` at all. Here a key that is not
+   the loaded book is served straight out of that book's text bundle, one shard,
+   no session.
+3. **A returned position carries `updated_ms`.** `updated` stays the naive local
+   stamp, byte-identical, because that is what goes in the vault; the instant
+   rides along beside it, resolved here where the server's zone is actually
+   known.
+4. **`/api/open` and `/api/playhead` take an optional `book`.** Supplied and
+   mismatched, they answer **409** instead of dragging another book's render
+   frontier around and filing a position under the wrong name.
+5. **An unwritable positions directory is a health problem.** `/healthz` reports
+   `vault` and `positions_dir` and probes the latter. The failure this prevents
+   is the nastiest one in the list: with `NARRATOR_VAULT` pointing at a path that
+   does not exist, every write fails, every read returns `{}`, and every book
+   quietly opens at chapter one.
+6. **`/api/chapters` takes `?from=&to=`.** Inclusive, clamped, with `total`
+   alongside so a windowed response still says how big the book is.
 
 ## OpenAPI is the contract
 

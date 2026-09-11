@@ -39,6 +39,13 @@ pub struct Health {
     pub queue: usize,
     /// Open SSE streams.
     pub live: usize,
+    /// Where positions and notes are being written. `null` means the vault is
+    /// not mounted and they are falling back under the work dir — which is a
+    /// thing to *say*, not to hide: with NARRATOR_VAULT pointing at a path that
+    /// does not exist, the python server writes nothing, reads back `{}`, and
+    /// every book quietly opens at chapter one.
+    pub vault: Option<String>,
+    pub positions_dir: String,
 }
 
 #[utoipa::path(
@@ -101,6 +108,17 @@ pub async fn healthz(State(st): State<Arc<AppState>>) -> Response {
     {
         problems.push(format!("work dir not writable: {e}"));
     }
+    // Positions that cannot be written are positions that do not exist, and the
+    // symptom - every book opening at chapter one - looks nothing like the
+    // cause. Probe the directory that is actually being used.
+    if let Err(e) = std::fs::create_dir_all(&st.cfg.positions_dir)
+        .and_then(|()| std::fs::write(st.cfg.positions_dir.join(".healthz"), b"1"))
+    {
+        problems.push(format!(
+            "positions dir {} not writable: {e}",
+            st.cfg.positions_dir.display()
+        ));
+    }
 
     let body = Health {
         ok: problems.is_empty(),
@@ -115,6 +133,8 @@ pub async fn healthz(State(st): State<Arc<AppState>>) -> Response {
         packing,
         queue,
         live: st.bus.subscribers(),
+        vault: st.cfg.vault.as_ref().map(|p| p.display().to_string()),
+        positions_dir: st.cfg.positions_dir.display().to_string(),
         problems,
     };
     let code = if body.ok {

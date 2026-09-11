@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{Path as AxPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -15,9 +15,12 @@ use utoipa::ToSchema;
 use super::{err, ok, round1, round2, ApiError, Ok2};
 use crate::book::{build_plan, est_chapter_s, extract_chapters};
 use crate::cache;
+use crate::plancache;
 use crate::render;
 use crate::state::AppState;
 use crate::text::ChapMeta;
+
+use super::media::BookQuery;
 use crate::vault;
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -91,7 +94,7 @@ pub struct LoadResult {
     pub total_min: f64,
     /// The stored position for this book, or null if it has never been opened.
     #[schema(required = true)]
-    pub position: Option<vault::Position>,
+    pub position: Option<vault::StampedPosition>,
     pub chapters: Vec<ChapMeta>,
 }
 
@@ -115,14 +118,36 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
 
     let path = body.path.clone();
     let max_chars = body.max_chars.unwrap_or(crate::book::DEFAULT_MAX_CHARS);
-    let parsed = tokio::task::spawn_blocking(move || {
-        extract_chapters(Path::new(&path)).map(|c| build_plan(&c, max_chars))
-    })
-    .await;
-    let plan = match parsed {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => return err(StatusCode::BAD_REQUEST, e.to_string()),
-        Err(e) => return err(StatusCode::BAD_REQUEST, format!("parse panicked: {e}")),
+    let key = cache::book_key(&body.path);
+
+    // Re-parsing an unchanged book is the reader's twelve-second wait on first
+    // paint, and it buys nothing: the plan is already on disk. Reuse it when the
+    // file's size and mtime still match the stamp it was built from.
+    let want = plancache::stamp(Path::new(&path), max_chars);
+    let cached = want
+        .as_ref()
+        .and_then(|s| plancache::load(&st.cfg.work, &key, s));
+    let reused = cached.is_some();
+    let plan: Arc<Vec<_>> = match cached {
+        Some(p) => {
+            tracing::info!(
+                "load: reusing the cached plan for {key} ({} chapters)",
+                p.len()
+            );
+            p
+        }
+        None => {
+            let p2 = path.clone();
+            let parsed = tokio::task::spawn_blocking(move || {
+                extract_chapters(Path::new(&p2)).map(|c| build_plan(&c, max_chars))
+            })
+            .await;
+            match parsed {
+                Ok(Ok(p)) => Arc::new(p),
+                Ok(Err(e)) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+                Err(e) => return err(StatusCode::BAD_REQUEST, format!("parse panicked: {e}")),
+            }
+        }
     };
 
     let est: Vec<f64> = plan
@@ -140,12 +165,10 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let key = cache::book_key(&body.path);
     let name = Path::new(&body.path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let plan = Arc::new(plan);
     {
         let mut s = st.session();
         s.book = Some(body.path.clone());
@@ -164,28 +187,33 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
     }
 
     // Drop the plan next to the cached audio: `narrator export` packs the
-    // streaming cache into an .m4b from it without the container.
-    let plan_path = cache::plan_path(&st.cfg.work, &key);
-    if let Some(d) = plan_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(d) {
-            tracing::warn!("could not write plan.json: {e}");
+    // streaming cache into an .m4b from it without the container, and the stamp
+    // beside it is what lets the next load skip the parse entirely.
+    if !reused {
+        if let Some(s) = &want {
+            if let Err(e) = plancache::store(&st.cfg.work, &key, &plan, s) {
+                tracing::warn!("could not write plan.json: {e}");
+            }
         }
     }
-    if let Err(e) = std::fs::write(
-        &plan_path,
-        serde_json::to_vec(&*plan).unwrap_or_else(|_| b"[]".to_vec()),
-    ) {
-        tracing::warn!("could not write plan.json: {e}");
-    }
-    if let Err(e) = crate::text::write_bundle(&st.cfg, &plan, &est, &key, &name, &title) {
-        tracing::warn!("could not write text bundle: {e}");
+    // The bundle is rebuilt whenever the plan was: re-parsing can move chunk
+    // boundaries and a stale shard puts every position in it on the wrong
+    // words. A reused plan is by definition the same words, so the bundle is
+    // only written when it is missing — which is also how a load recovers from
+    // a half-written one.
+    let bundle = crate::text::text_dir(&st.cfg.work, &key).join("index.json");
+    if !reused || !bundle.exists() {
+        if let Err(e) = crate::text::write_bundle(&st.cfg, &plan, &est, &key, &name, &title) {
+            tracing::warn!("could not write text bundle: {e}");
+        }
     }
 
     let position = st
         .positions()
         .get(&name)
         .cloned()
-        .and_then(|v| serde_json::from_value(v).ok());
+        .and_then(|v| serde_json::from_value::<vault::Position>(v).ok())
+        .map(|p| p.stamped());
     Json(LoadResult {
         title,
         key,
@@ -216,23 +244,59 @@ pub struct ChapterText {
     pub paras: Vec<usize>,
 }
 
+/// One chapter's words.
+///
+/// **`?book=` is honoured**, which the python server does not do: it answers for
+/// whichever book the process last loaded and ignores the query. That one
+/// asymmetry is why the reader's first paint was coupled to `/api/load` at all —
+/// the cheapest possible "give me the words of chapter 576" could not be asked
+/// until the server had been told which book it was on. Here a key that is not
+/// the loaded book is served straight out of that book's text bundle, with no
+/// session involved. Omitted, it still means the loaded book.
 #[utoipa::path(
     get, path = "/api/chapter/{ci}", tag = "session",
-    params(("ci" = usize, Path, description = "chapter index")),
+    params(("ci" = usize, Path, description = "chapter index"), BookQuery),
     responses((status = 200, body = ChapterText), (status = 404, body = ApiError))
 )]
-pub async fn chapter(State(st): State<Arc<AppState>>, AxPath(ci): AxPath<usize>) -> Response {
-    let plan = st.session().plan.clone();
-    let Some(c) = plan.get(ci) else {
-        return err(StatusCode::NOT_FOUND, "range");
+pub async fn chapter(
+    State(st): State<Arc<AppState>>,
+    AxPath(ci): AxPath<usize>,
+    Query(q): Query<BookQuery>,
+) -> Response {
+    let asked = q.book.as_deref().map(cache::safe_key).unwrap_or_default();
+    let (plan, key) = {
+        let s = st.session();
+        (s.plan.clone(), s.key())
     };
-    Json(ChapterText {
-        i: ci,
-        title: c.title.clone(),
-        chunks: c.chunks.iter().map(|k| k.text.clone()).collect(),
-        paras: c.chunks.iter().map(|k| k.para).collect(),
+    if asked.is_empty() || Some(&asked) == key.as_ref() {
+        if let Some(c) = plan.get(ci) {
+            return Json(ChapterText {
+                i: ci,
+                title: c.title.clone(),
+                chunks: c.chunks.iter().map(|k| k.text.clone()).collect(),
+                paras: c.chunks.iter().map(|k| k.para).collect(),
+            })
+            .into_response();
+        }
+        if asked.is_empty() {
+            return err(StatusCode::NOT_FOUND, "range");
+        }
+    }
+    match tokio::task::spawn_blocking({
+        let work = st.cfg.work.clone();
+        move || crate::text::chapter_from_bundle(&work, &asked, ci)
     })
-    .into_response()
+    .await
+    {
+        Ok(Some((title, paras, chunks))) => Json(ChapterText {
+            i: ci,
+            title,
+            chunks,
+            paras,
+        })
+        .into_response(),
+        _ => err(StatusCode::NOT_FOUND, "range"),
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -241,6 +305,13 @@ pub struct OpenBody {
     pub chapter: usize,
     #[serde(default)]
     pub chunk: usize,
+    /// The book this is meant for. **Additive, and worth sending.** Playback is
+    /// one global session, so an open issued while the server holds a different
+    /// book moves the wrong book's render frontier and saves the position into
+    /// the wrong record. Supplied and mismatched, this is refused with a 409
+    /// instead; omitted, it means "whatever is loaded", exactly as before.
+    #[serde(default)]
+    pub book: Option<String>,
 }
 
 /// Select a chapter and start rendering from a given chunk.
@@ -249,12 +320,14 @@ pub struct OpenBody {
 /// under the playhead before anything else, and this sets the playhead.
 #[utoipa::path(
     post, path = "/api/open", tag = "session",
-    request_body = OpenBody, responses((status = 200, body = Ok2))
+    request_body = OpenBody,
+    responses((status = 200, body = Ok2),
+              (status = 409, body = ApiError, description = "the session holds another book"))
 )]
-pub async fn open_chapter(
-    State(st): State<Arc<AppState>>,
-    Json(body): Json<OpenBody>,
-) -> Json<Ok2> {
+pub async fn open_chapter(State(st): State<Arc<AppState>>, Json(body): Json<OpenBody>) -> Response {
+    if let Some(r) = wrong_book(&st, body.book.as_deref()) {
+        return r;
+    }
     let (ci, chunk, key) = {
         let mut s = st.session();
         s.chapter = body.chapter;
@@ -271,12 +344,40 @@ pub async fn open_chapter(
         json!({"key": key, "chapter": ci, "render_idx": chunk,
                "playhead": chunk, "status": "starting"}),
     );
-    ok()
+    ok().into_response()
+}
+
+/// Refuse an action aimed at a book the session is not holding.
+///
+/// The alternative is what the python server does: act on whatever is loaded,
+/// which silently drags another book's render frontier around and can file a
+/// position under the wrong name. A 409 is a thing the reader can react to; a
+/// wrong write is not.
+fn wrong_book(st: &Arc<AppState>, asked: Option<&str>) -> Option<Response> {
+    let asked = cache::safe_key(asked?);
+    if asked.is_empty() {
+        return None;
+    }
+    let have = st.session().key();
+    match have {
+        Some(k) if k == asked => None,
+        _ => Some(err(
+            StatusCode::CONFLICT,
+            format!(
+                "the session holds {}, not {asked}",
+                have.unwrap_or_else(|| "no book".into())
+            ),
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct PlayheadBody {
     pub chunk: usize,
+    /// See [`OpenBody::book`]: additive, and it stops a report meant for one
+    /// book from moving another one's frontier.
+    #[serde(default)]
+    pub book: Option<String>,
 }
 
 /// Report the playhead. Drags `render_idx` forward on a forward jump, never
@@ -284,12 +385,14 @@ pub struct PlayheadBody {
 /// that exist, so nothing is re-rendered.
 #[utoipa::path(
     post, path = "/api/playhead", tag = "session",
-    request_body = PlayheadBody, responses((status = 200, body = Ok2))
+    request_body = PlayheadBody,
+    responses((status = 200, body = Ok2),
+              (status = 409, body = ApiError, description = "the session holds another book"))
 )]
-pub async fn playhead(
-    State(st): State<Arc<AppState>>,
-    Json(body): Json<PlayheadBody>,
-) -> Json<Ok2> {
+pub async fn playhead(State(st): State<Arc<AppState>>, Json(body): Json<PlayheadBody>) -> Response {
+    if let Some(r) = wrong_book(&st, body.book.as_deref()) {
+        return r;
+    }
     {
         let mut s = st.session();
         s.playhead = body.chunk;
@@ -298,7 +401,7 @@ pub async fn playhead(
         }
     }
     save_position(&st, false);
-    ok()
+    ok().into_response()
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
