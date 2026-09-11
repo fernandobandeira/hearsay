@@ -85,7 +85,7 @@ ENV NARRATOR_MODELS=/models \
     NARRATOR_WEB=/web \
     KOKORO_VOICE=af_heart \
     WHISPER_MODEL=large-v3-turbo-q5_0 \
-    RUST_LOG=info,tower_http=warn
+    RUST_LOG=info,tower_http=warn,ort=warn
 
 COPY --from=web /build/dist /web
 COPY --from=build /src/target/release/narrator /usr/local/bin/narrator
