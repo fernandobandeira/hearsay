@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# The one entry point, mirroring ~/git/narrator's CLI so the muscle memory
+# carries over: build | up | down | logs | status | test | models | openapi |
+# client | listen-test | shell.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+IMAGE="${NARRATOR_IMAGE:-narrator-rs:latest}"
+NAME="${NARRATOR_NAME:-narrator-rs}"
+PORT="${NARRATOR_PORT:-7870}"
+VAULT="${NARRATOR_VAULT:-$HOME/git/obsidian-notes}"
+BOOKS="${NARRATOR_BOOKS_DIR:-$PWD/books}"
+WORK="${NARRATOR_WORK_DIR:-$PWD/work}"
+MODELS="${NARRATOR_MODELS:-$PWD/models}"
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  build)   exec docker build -t "$IMAGE" "$@" . ;;
+  buildx)  exec docker buildx build --platform linux/amd64,linux/arm64 -t "$IMAGE" "$@" . ;;
+  up)
+    mkdir -p "$WORK" "$BOOKS" "$MODELS"
+    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    # Bound to localhost: no auth, no TLS, wildcard CORS. Reach it over
+    # Tailscale, never by publishing this port.
+    exec docker run -d --name "$NAME" --restart unless-stopped \
+      -p "127.0.0.1:$PORT:7870" \
+      -v "$WORK:/work" \
+      -v "$BOOKS:/books:ro" \
+      -v "$MODELS:/models:ro" \
+      ${VAULT:+-v "$VAULT:/vault"} \
+      ${VAULT:+-e NARRATOR_VAULT=/vault} \
+      -e "KOKORO_VOICE=${KOKORO_VOICE:-af_heart}" \
+      -e "WHISPER_MODEL=${WHISPER_MODEL:-large-v3-turbo-q5_0}" \
+      -e "WHISPER_PROMPT=${WHISPER_PROMPT:-}" \
+      -e "LOOKAHEAD=${LOOKAHEAD:-80}" \
+      -e "PRERENDER_CHAPTERS=${PRERENDER_CHAPTERS:-2}" \
+      -e "MAX_AUDIO_GB=${MAX_AUDIO_GB:-5}" \
+      -e "MAX_CHAPTER_GB=${MAX_CHAPTER_GB:-20}" \
+      "$IMAGE" "$@" ;;
+  down)    exec docker rm -f "$NAME" ;;
+  logs)    exec docker logs -f "$NAME" "$@" ;;
+  shell)   exec docker exec -it "$NAME" bash ;;
+  status)  exec curl -s "http://127.0.0.1:$PORT/api/status" ;;
+  health)  exec curl -sS -o /dev/stdout -w '\n%{http_code}\n' "http://127.0.0.1:$PORT/healthz" ;;
+  test)    exec cargo test "$@" ;;
+  lint)    cargo fmt --check && exec cargo clippy --all-targets -- -D warnings ;;
+  models)  exec ./scripts/fetch-models.sh ;;
+  openapi) cargo build --release --bin narrator >/dev/null && exec ./target/release/narrator --openapi ;;
+  client)  exec ./scripts/gen-client.sh "$@" ;;
+  listen-test)
+    cargo build --release --bin listen_test
+    exec ./target/release/listen_test ;;
+  dev)
+    mkdir -p work books
+    exec env NARRATOR_WORK="$WORK" NARRATOR_BOOKS="$BOOKS" NARRATOR_MODELS="$MODELS" \
+      NARRATOR_WEB="$PWD/web" NARRATOR_VAULT="${VAULT}" RUST_LOG="${RUST_LOG:-info,tower_http=warn}" \
+      cargo run --release --bin narrator ;;
+  *)
+    sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1 ;;
+esac

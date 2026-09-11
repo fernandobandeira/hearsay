@@ -23,6 +23,13 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&spec)?);
         return Ok(());
     }
+    // `narrator --healthcheck` is the container's HEALTHCHECK: it asks the
+    // running server for /healthz over the loopback and exits 0 or 1. Written by
+    // hand against a TcpStream rather than pulling in an HTTP client or putting
+    // curl in the runtime image for one request.
+    if std::env::args().any(|a| a == "--healthcheck") {
+        std::process::exit(if healthcheck() { 0 } else { 1 });
+    }
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             // tower_http's per-request spans are noise at info level.
@@ -97,4 +104,31 @@ async fn shutdown(state: Arc<AppState>) {
     state.stop.store(true, std::sync::atomic::Ordering::SeqCst);
     state.run.set();
     state.build_ev.set();
+}
+
+/// One loopback GET of `/healthz`. Anything other than a 200 - including no
+/// answer at all - is unhealthy.
+fn healthcheck() -> bool {
+    use std::io::{Read, Write};
+    let port: u16 = std::env::var("NARRATOR_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7870);
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let timeout = std::time::Duration::from_secs(10);
+    let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(timeout));
+    let _ = s.set_write_timeout(Some(timeout));
+    if s.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    let Ok(n) = s.read(&mut buf) else {
+        return false;
+    };
+    buf[..n].starts_with(b"HTTP/1.1 200")
 }
