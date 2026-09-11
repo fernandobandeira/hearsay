@@ -272,6 +272,12 @@ pub async fn chapters_render(
     }
 }
 
+// The `Err` carries a built axum `Response` - that is the point: this helper
+// exists so the handler can `?`-style early-return a 400 it has already shaped.
+// `Response` is ~128 bytes, which trips `result_large_err`, but the value never
+// leaves the handler above (it is matched and returned one frame up), so boxing
+// it would buy an allocation and nothing else.
+#[allow(clippy::result_large_err)]
 async fn queue_chapters(
     st: &Arc<AppState>,
     body: &ChapterSetBody,
