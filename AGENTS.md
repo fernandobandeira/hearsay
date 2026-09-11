@@ -199,6 +199,15 @@ reader's waiting actually was. On the 1433-chapter *Lord of Mysteries*
 
 The cold parse being seventeen times faster is just Rust against ebooklib + BeautifulSoup + lxml; the second one is [the parse cache](#what-this-server-does-that-the-python-one-does-not).
 
+**Whisper is not measured yet.** A 4.3 s memo took 2m10s end to end, twice —
+but both runs happened while an emulated aarch64 `docker buildx` had the box at
+load 59 on 16 cores, and a second run with the model already resident was no
+faster, which is what saturation looks like rather than a warm-up cost. The
+number means nothing until it is taken on an idle machine, and the one that
+matters is the A1's anyway. Take it with
+`time curl -XPOST .../api/note` twice in a row (the first call pays a 574 MB
+model load) before trusting the voice-memo path to feel responsive.
+
 ## Config surface
 
 Every name the Python `AGENTS.md` documents, with the same default: `NARRATOR_PORT` (7870), `NARRATOR_VAULT`, `NARRATOR_WORK`, `NARRATOR_BOOKS`, `NARRATOR_WEB`, `BOOKS_SUBDIR`, `POSITIONS_SUBDIR` (`02 - Studies`), `NOTES_SUBDIR` (`05 - Fleeting`), `KOKORO_VOICE` (`af_heart`), `KOKORO_SPEED`, `LOOKAHEAD` (80), `PRERENDER_CHAPTERS` (2), `PREFETCH_WHILE_PAUSED`, `MAX_AUDIO_GB` (5), `MAX_CHAPTER_GB` (20), `SILENCE_S` (0.5), `WHISPER_MODEL`, `WHISPER_PROMPT`, `CHAPTER_BITRATE` (`64k`), `CHAPTER_GAP_S` (0.30), `CHAPTER_PARA_GAP_S` (0.60), `HLS_SEGMENT_S` (6), `TEXT_SHARD_BYTES`, `TEXT_SHARD_CHAPTERS`, `HEALTH_STALL_S` (300), `AUTOPACK`, `AUTOPACK_EVERY_S`, `NARRATOR_WATCH_BOOKS`, `NARRATOR_FAKE_TTS`, `SSE_HEARTBEAT_S`, `SSE_QUEUE`, `SSE_RENDER_MIN_S`, `SSE_RETRY_MS`.
