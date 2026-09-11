@@ -1,0 +1,208 @@
+{
+  "_comment": [
+    "The frozen HTTP contract, transcribed from narrator's AGENTS.md, app/server.py",
+    "and web/src/lib/types.ts - NOT generated from this server, so it can actually",
+    "catch this server drifting. Types: str, int, num, bool, obj, arr, null. A '?'",
+    "suffix means the value may also be null. '|' separates alternatives.",
+    "'extra' lists fields this server adds that the python one also sends but the",
+    "reader's hand-written type does not mention."
+  ],
+  "endpoints": {
+    "GET /api/books": {
+      "kind": "array",
+      "item": { "path": "str", "name": "str", "mb": "num" }
+    },
+    "POST /api/load": {
+      "kind": "object",
+      "fields": {
+        "title": "str",
+        "key": "str",
+        "total_min": "num",
+        "position": "obj?",
+        "chapters": "arr"
+      },
+      "array_item": {
+        "at": "chapters",
+        "fields": { "i": "int", "title": "str", "n": "int", "est_min": "num" }
+      }
+    },
+    "GET /api/chapter/{ci}": {
+      "kind": "object",
+      "fields": { "i": "int", "title": "str", "chunks": "arr", "paras": "arr" }
+    },
+    "POST /api/open": { "kind": "object", "fields": { "ok": "bool" } },
+    "POST /api/playhead": { "kind": "object", "fields": { "ok": "bool" } },
+    "POST /api/position": { "kind": "object", "fields": { "ok": "bool" } },
+    "POST /api/pause": {
+      "kind": "object",
+      "fields": { "ok": "bool", "still_rendering": "bool" }
+    },
+    "POST /api/resume": { "kind": "object", "fields": { "ok": "bool" } },
+    "POST /api/renderer": {
+      "kind": "object",
+      "fields": { "ok": "bool", "rendering": "bool" }
+    },
+    "POST /api/prerender": {
+      "kind": "object",
+      "fields": { "ok": "bool", "hours": "num?", "chapters_ahead": "int" }
+    },
+    "GET /api/status": {
+      "kind": "object",
+      "fields": {
+        "status": "str",
+        "error": "str?",
+        "chapter": "int",
+        "book": "str?",
+        "title": "str?",
+        "key": "str?",
+        "queue": "arr",
+        "building": "int?",
+        "build_error": "str?",
+        "pack_queue": "arr",
+        "pack_want": "arr",
+        "render_idx": "int",
+        "playhead": "int",
+        "total": "int",
+        "chapters": "int",
+        "model_ready": "bool",
+        "rtf": "num?",
+        "rendered_min": "num",
+        "voice": "str",
+        "prerender": "int?",
+        "prerender_chapters": "int",
+        "prerender_hours": "num?",
+        "prerender_span": "int",
+        "book_min": "num?",
+        "done_min": "num?",
+        "disk_gb": "num",
+        "disk_cap_gb": "num"
+      }
+    },
+    "GET /api/chapters": {
+      "kind": "object",
+      "fields": {
+        "book": "str?",
+        "key": "str?",
+        "title": "str?",
+        "chapter": "int",
+        "chapters": "arr",
+        "queue": "arr",
+        "building": "int?",
+        "build_error": "str?",
+        "chapters_gb": "num",
+        "chapters_cap_gb": "num"
+      },
+      "array_item": {
+        "at": "chapters",
+        "fields": {
+          "i": "int",
+          "title": "str",
+          "n": "int",
+          "rendered": "int",
+          "est_min": "num?",
+          "m4a": "bool",
+          "bytes": "int?",
+          "duration": "num?",
+          "queued": "bool",
+          "packing": "bool",
+          "pack_queued": "bool"
+        }
+      }
+    },
+    "GET /api/chapters (no book)": {
+      "kind": "object",
+      "fields": { "book": "null", "key": "null", "title": "null", "chapters": "arr" }
+    },
+    "POST /api/chapters/render": {
+      "kind": "object",
+      "fields": { "ok": "bool", "queue": "arr", "packing": "arr" }
+    },
+    "POST /api/chapters/build": {
+      "kind": "object",
+      "fields": {
+        "ok": "bool",
+        "built": "arr",
+        "building": "arr",
+        "rendering": "arr"
+      }
+    },
+    "POST /api/chapters/cancel": {
+      "kind": "object",
+      "fields": { "ok": "bool", "queue": "arr" }
+    },
+    "GET /api/book.json": {
+      "kind": "object",
+      "fields": {
+        "key": "str",
+        "name": "str",
+        "title": "str",
+        "total_min": "num",
+        "shards": "int",
+        "text_bytes": "int",
+        "chapters": "arr"
+      },
+      "array_item": {
+        "at": "chapters",
+        "fields": {
+          "i": "int",
+          "title": "str",
+          "n": "int",
+          "est_min": "num",
+          "shard": "int"
+        }
+      }
+    },
+    "GET /api/text/{s}.json": {
+      "kind": "object",
+      "fields": { "shard": "int", "from": "int", "to": "int", "chapters": "arr" },
+      "array_item": {
+        "at": "chapters",
+        "fields": { "i": "int", "paras": "arr", "chunks": "arr" }
+      }
+    },
+    "GET /api/chapters/{ci}.json": {
+      "kind": "object",
+      "fields": {
+        "chunks": "int",
+        "starts": "arr",
+        "duration": "num",
+        "gap": "num",
+        "para_gap": "num",
+        "bytes": "int",
+        "sample_rate": "int",
+        "built": "str"
+      },
+      "extra": ["book", "chapter", "title", "bitrate", "build_s"]
+    },
+    "GET /healthz": {
+      "kind": "object",
+      "fields": {
+        "ok": "bool",
+        "problems": "arr",
+        "status": "str",
+        "uptime_s": "num",
+        "model_ready": "bool",
+        "book": "str?",
+        "threads": "arr",
+        "since_progress_s": "num",
+        "stall_limit_s": "num",
+        "build_error": "str?",
+        "packing": "int?",
+        "queue": "int",
+        "live": "int"
+      }
+    },
+    "error body": { "kind": "object", "fields": { "error": "str" } }
+  },
+  "statuses": {
+    "GET /api/chapter/9999": 404,
+    "GET /api/chunk/0/9999.wav": 404,
+    "GET /api/chapters/9999.m4a": 404,
+    "GET /api/chapters/9999.json": 404,
+    "GET /api/chapters/9999.m3u8": 404,
+    "GET /api/text/99.json": 404,
+    "GET /api/hls/x/0/evil.sh": 404,
+    "POST /api/position (no book)": 400,
+    "POST /api/note (no audio)": 400
+  }
+}

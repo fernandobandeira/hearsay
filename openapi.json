@@ -1,0 +1,2514 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "narrator",
+    "description": "Self-hosted TTS book reader. One global session: the server holds one book, one chapter and one playhead across every client, which is why anything cacheable is scoped by ?book= and positions can be written by name. No auth, no TLS, wildcard CORS - it assumes a private machine reached over Tailscale.",
+    "license": {
+      "name": ""
+    },
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "paths": {
+    "/api/book.json": {
+      "get": {
+        "tags": [
+          "text"
+        ],
+        "summary": "The index: small (123 kB even for 1433 chapters) and always cached. It is\nwhat lets the reader show a book it cannot reach.",
+        "operationId": "book_index",
+        "parameters": [
+          {
+            "name": "book",
+            "in": "query",
+            "description": "The cache key. Omitted, it means the loaded book.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookIndex"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "text"
+        ],
+        "summary": "The index: small (123 kB even for 1433 chapters) and always cached. It is\nwhat lets the reader show a book it cannot reach.",
+        "operationId": "book_index",
+        "parameters": [
+          {
+            "name": "book",
+            "in": "query",
+            "description": "The cache key. Omitted, it means the loaded book.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookIndex"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/books": {
+      "get": {
+        "tags": [
+          "session"
+        ],
+        "summary": "`./books` merged with the vault's library, deduped by filename.",
+        "operationId": "books",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BookFile"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chapter/{ci}": {
+      "get": {
+        "tags": [
+          "session"
+        ],
+        "operationId": "chapter",
+        "parameters": [
+          {
+            "name": "ci",
+            "in": "path",
+            "description": "chapter index",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChapterText"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chapters": {
+      "get": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "Every chapter of the loaded book: chunks rendered / total, whether the packed\nm4a exists and how big it is.",
+        "operationId": "chapters_list",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChaptersResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chapters/build": {
+      "post": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "Pack now what is complete, queue the rest for rendering first.",
+        "operationId": "chapters_build",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChapterSetBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chapters/cancel": {
+      "post": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "Drop chapters from the queues. An empty body clears both.",
+        "operationId": "chapters_cancel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChapterSetBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CancelResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chapters/render": {
+      "post": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "Queue chapters for rendering, in the order given. `pack: true` also packs\neach one as it completes — that is what \"download offline\" asks for first.",
+        "operationId": "chapters_render",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChapterSetBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenderResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chapters/{ci}.json": {
+      "get": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "chunk index -> start second for the packed chapter. Without this the m4a is\none opaque blob and every reading position in the book is lost.",
+        "operationId": "chapter_manifest",
+        "parameters": [
+          {
+            "name": "ci",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "book",
+            "in": "query",
+            "description": "The cache key. Omitted, it means the loaded book.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Manifest"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "chunk index -> start second for the packed chapter. Without this the m4a is\none opaque blob and every reading position in the book is lost.",
+        "operationId": "chapter_manifest",
+        "parameters": [
+          {
+            "name": "ci",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "book",
+            "in": "query",
+            "description": "The cache key. Omitted, it means the loaded book.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Manifest"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chapters/{ci}.m3u8": {
+      "get": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "An HLS playlist for the packed chapter, built on first request.",
+        "description": "This is the streaming path: iOS plays it natively in a plain `<audio>`, so the\nOS owns buffering and segment retry — a blip re-fetches one six-second segment\ninstead of killing the whole load. The m4a stays the download format, because\nnative HLS bypasses the service worker and can never be the offline one.",
+        "operationId": "chapter_hls",
+        "parameters": [
+          {
+            "name": "ci",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "book",
+            "in": "query",
+            "description": "The cache key. Omitted, it means the loaded book.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/vnd.apple.mpegurl": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "An HLS playlist for the packed chapter, built on first request.",
+        "description": "This is the streaming path: iOS plays it natively in a plain `<audio>`, so the\nOS owns buffering and segment retry — a blip re-fetches one six-second segment\ninstead of killing the whole load. The m4a stays the download format, because\nnative HLS bypasses the service worker and can never be the offline one.",
+        "operationId": "chapter_hls",
+        "parameters": [
+          {
+            "name": "ci",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "book",
+            "in": "query",
+            "description": "The cache key. Omitted, it means the loaded book.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/vnd.apple.mpegurl": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chapters/{ci}.m4a": {
+      "get": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "The packed chapter: AAC-LC mono 64 kbit/s, 24 kHz, `+faststart`. **Serves\nbyte ranges** — iOS probes with a Range before it will play anything. This is\nthe *download* format.",
+        "operationId": "chapter_audio",
+        "parameters": [
+          {
+            "name": "ci",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "book",
+            "in": "query",
+            "description": "The cache key. Omitted, it means the loaded book.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "audio/mp4": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "byte range"
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "unsatisfiable range"
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "The packed chapter: AAC-LC mono 64 kbit/s, 24 kHz, `+faststart`. **Serves\nbyte ranges** — iOS probes with a Range before it will play anything. This is\nthe *download* format.",
+        "operationId": "chapter_audio",
+        "parameters": [
+          {
+            "name": "ci",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "book",
+            "in": "query",
+            "description": "The cache key. Omitted, it means the loaded book.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "audio/mp4": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "byte range"
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "unsatisfiable range"
+          }
+        }
+      }
+    },
+    "/api/chunk/{ci}/{i}.wav": {
+      "get": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "One rendered chunk. GET or HEAD; **404 means \"not rendered yet\", not an\nerror** — the reader polls this while the renderer catches up.",
+        "operationId": "chunk_wav",
+        "parameters": [
+          {
+            "name": "ci",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "i",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "audio/wav": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not rendered yet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "One rendered chunk. GET or HEAD; **404 means \"not rendered yet\", not an\nerror** — the reader polls this while the renderer catches up.",
+        "operationId": "chunk_wav",
+        "parameters": [
+          {
+            "name": "ci",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "i",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "audio/wav": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not rendered yet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/events": {
+      "get": {
+        "tags": [
+          "session"
+        ],
+        "operationId": "events",
+        "responses": {
+          "200": {
+            "description": "hello, then position/render/books/note events and heartbeats",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hls/{book}/{ci}/{name}": {
+      "get": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "One fMP4 segment (or the init segment) of a chapter's HLS rendition. `name`\nis validated against `init.mp4|segNNNNN.m4s`; anything else is a 404.",
+        "operationId": "hls_segment",
+        "parameters": [
+          {
+            "name": "book",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ci",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "video/mp4": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "chapters"
+        ],
+        "summary": "One fMP4 segment (or the init segment) of a chapter's HLS rendition. `name`\nis validated against `init.mp4|segNNNNN.m4s`; anything else is a 404.",
+        "operationId": "hls_segment",
+        "parameters": [
+          {
+            "name": "book",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ci",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "video/mp4": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/load": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Parse an EPUB and make it the session's book. Also writes `plan.json` and the\ntext bundle, both rebuilt from scratch: re-parsing can move chunk boundaries,\nand a stale shard would put every position in it on the wrong words.",
+        "operationId": "load",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoadBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoadResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "the file is not a readable EPUB",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/note": {
+      "post": {
+        "tags": [
+          "vault"
+        ],
+        "operationId": "note",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NoteBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "filed - the outbox may delete its copy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NoteResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "no book, no audio, or nothing heard",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "transcription or the vault write failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/open": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Select a chapter and start rendering from a given chunk.",
+        "description": "The opened chunk is *guaranteed* to render: the worker renders whatever is\nunder the playhead before anything else, and this sets the playhead.",
+        "operationId": "open_chapter",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok2"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/pause": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Pause playback. The time you are *not* listening is exactly when the buffer\nshould grow, so this stops audio, not the renderer — unless\n`PREFETCH_WHILE_PAUSED=0`.",
+        "operationId": "pause",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PauseResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/playhead": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Report the playhead. Drags `render_idx` forward on a forward jump, never\nbackwards — anything already on disk still plays, and the worker skips files\nthat exist, so nothing is re-rendered.",
+        "operationId": "playhead",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlayheadBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok2"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/position": {
+      "post": {
+        "tags": [
+          "vault"
+        ],
+        "summary": "Record a position for a *named* book without loading it.",
+        "description": "This is what the offline queue pushes on reconnect, possibly for a book the\nserver has since swapped out. Last write wins, which is the right rule for one\nreader on several devices. Fields not supplied are kept from the existing\nrecord.",
+        "operationId": "position",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PositionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok2"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/prerender": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "summary": "The old \"render ahead N hours\" target. Its UI is gone — the chapter manager\nreplaced it — but the endpoint stays for the CLI and anything else pointed\nat it.",
+        "operationId": "prerender",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrerenderBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrerenderResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/renderer": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Explicitly stop/start the render worker, independent of playback.",
+        "operationId": "renderer",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RendererBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RendererResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/resume": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "operationId": "resume",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok2"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/status": {
+      "get": {
+        "tags": [
+          "session"
+        ],
+        "summary": "The heartbeat. It is also how the reader notices the server came back.",
+        "operationId": "status",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/text/{s}.json": {
+      "get": {
+        "tags": [
+          "text"
+        ],
+        "summary": "One shard: a run of whole chapters, ~1.5 MB at most. Cache every shard and\nthe whole book is readable with no network and no rendered audio; cache none\nand the reader still lists it.",
+        "operationId": "book_text",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "shard index",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "book",
+            "in": "query",
+            "description": "The cache key. Omitted, it means the loaded book.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TextShard"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "text"
+        ],
+        "summary": "One shard: a run of whole chapters, ~1.5 MB at most. Cache every shard and\nthe whole book is readable with no network and no rendered audio; cache none\nand the reader still lists it.",
+        "operationId": "book_text",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "shard index",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "book",
+            "in": "query",
+            "description": "The cache key. Omitted, it means the loaded book.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TextShard"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "something that matters is wedged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiError": {
+        "type": "object",
+        "description": "Every error body in this API: `{\"error\": \"...\"}`, and nothing else. The\nreader's `get()` reads exactly this field.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "BookFile": {
+        "type": "object",
+        "required": [
+          "path",
+          "name",
+          "mb"
+        ],
+        "properties": {
+          "mb": {
+            "type": "number",
+            "format": "double"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path on the server — what `/api/load` takes back."
+          }
+        }
+      },
+      "BookIndex": {
+        "type": "object",
+        "required": [
+          "key",
+          "name",
+          "title",
+          "total_min",
+          "shards",
+          "text_bytes",
+          "chapters"
+        ],
+        "properties": {
+          "chapters": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChapMeta"
+            }
+          },
+          "key": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "shards": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "text_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string"
+          },
+          "total_min": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "BuildResult": {
+        "type": "object",
+        "required": [
+          "ok",
+          "built",
+          "building",
+          "rendering"
+        ],
+        "properties": {
+          "building": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Complete and handed to the packer now."
+          },
+          "built": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Already packed; nothing to do."
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "rendering": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Not complete; queued for rendering first."
+          }
+        }
+      },
+      "CancelResult": {
+        "type": "object",
+        "required": [
+          "ok",
+          "queue"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "queue": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      },
+      "ChapMeta": {
+        "type": "object",
+        "required": [
+          "i",
+          "title",
+          "n",
+          "est_min"
+        ],
+        "properties": {
+          "est_min": {
+            "type": "number",
+            "format": "double"
+          },
+          "i": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "n": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "shard": {
+            "type": "integer",
+            "description": "Which shard holds this chapter's words. Omitted entirely by `/api/load`,\nalways a number in `book.json` — never `null`, which is why the schema\noverrides utoipa's default nullable-because-Option rendering.",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "ChapterRow": {
+        "type": "object",
+        "required": [
+          "i",
+          "title",
+          "n",
+          "rendered",
+          "est_min",
+          "m4a",
+          "bytes",
+          "duration",
+          "queued",
+          "packing",
+          "pack_queued"
+        ],
+        "properties": {
+          "bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "duration": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "est_min": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "i": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "m4a": {
+            "type": "boolean",
+            "description": "Whether a *trustworthy* packed m4a exists. A manifest whose `chunks`\ndisagrees with the plan reports false: it points at the wrong words."
+          },
+          "n": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pack_queued": {
+            "type": "boolean"
+          },
+          "packing": {
+            "type": "boolean"
+          },
+          "queued": {
+            "type": "boolean",
+            "description": "Always present: a row only exists for a loaded book, and then the\nchapter manager's three flags always have an answer."
+          },
+          "rendered": {
+            "type": "integer",
+            "description": "How many of this chapter's chunks are on disk.",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "ChapterSetBody": {
+        "type": "object",
+        "properties": {
+          "chapters": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "force": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`/api/chapters/build` only: rebuild even if an m4a already exists."
+          },
+          "pack": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`/api/chapters/render` only: also pack each chapter as it completes."
+          }
+        }
+      },
+      "ChapterText": {
+        "type": "object",
+        "required": [
+          "i",
+          "title",
+          "chunks",
+          "paras"
+        ],
+        "properties": {
+          "chunks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "i": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "paras": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "What lets the reader re-form real paragraphs from chunks. Additive:\nexisting clients (the Obsidian plugin) only read title + chunks."
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "ChaptersResult": {
+        "type": "object",
+        "required": [
+          "book",
+          "key",
+          "title",
+          "chapters"
+        ],
+        "properties": {
+          "book": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "build_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "building": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Absent only in the \"no book loaded\" shape; `null` when nothing is being\npacked. The python server distinguishes those two and the reader's type\nsays `building?: number | null`, so the nesting is the contract.",
+            "minimum": 0
+          },
+          "chapter": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "chapters": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChapterRow"
+            }
+          },
+          "chapters_cap_gb": {
+            "type": "number",
+            "format": "double"
+          },
+          "chapters_gb": {
+            "type": "number",
+            "format": "double"
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "queue": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "required": [
+          "ok",
+          "problems",
+          "status",
+          "uptime_s",
+          "model_ready",
+          "book",
+          "threads",
+          "since_progress_s",
+          "stall_limit_s",
+          "build_error",
+          "packing",
+          "queue",
+          "live"
+        ],
+        "properties": {
+          "book": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "build_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "live": {
+            "type": "integer",
+            "description": "Open SSE streams.",
+            "minimum": 0
+          },
+          "model_ready": {
+            "type": "boolean"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "packing": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "problems": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "queue": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "since_progress_s": {
+            "type": "number",
+            "format": "double"
+          },
+          "stall_limit_s": {
+            "type": "number",
+            "format": "double"
+          },
+          "status": {
+            "type": "string"
+          },
+          "threads": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "uptime_s": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "LoadBody": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "max_chars": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "LoadResult": {
+        "type": "object",
+        "required": [
+          "title",
+          "key",
+          "total_min",
+          "position",
+          "chapters"
+        ],
+        "properties": {
+          "chapters": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChapMeta"
+            }
+          },
+          "key": {
+            "type": "string",
+            "description": "The cache directory name: the file stem, truncated to 50 characters."
+          },
+          "position": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Position",
+                "description": "The stored position for this book, or null if it has never been opened."
+              }
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "total_min": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "Manifest": {
+        "type": "object",
+        "required": [
+          "book",
+          "chapter",
+          "title",
+          "chunks",
+          "starts",
+          "duration",
+          "gap",
+          "para_gap",
+          "bitrate",
+          "sample_rate",
+          "bytes",
+          "built",
+          "build_s"
+        ],
+        "properties": {
+          "bitrate": {
+            "type": "string"
+          },
+          "book": {
+            "type": "string"
+          },
+          "build_s": {
+            "type": "number",
+            "format": "double"
+          },
+          "built": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "chapter": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "chunks": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "duration": {
+            "type": "number",
+            "format": "double"
+          },
+          "gap": {
+            "type": "number",
+            "format": "double"
+          },
+          "para_gap": {
+            "type": "number",
+            "format": "double"
+          },
+          "sample_rate": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "starts": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "double"
+            },
+            "description": "`starts[i]` is chunk `i`'s start second. `currentTime` maps back by\nbisecting this."
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "NoteBody": {
+        "type": "object",
+        "required": [
+          "audio"
+        ],
+        "properties": {
+          "audio": {
+            "type": "string",
+            "description": "base64 of the MediaRecorder blob."
+          },
+          "chapter": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Where the memo was recorded. Defaults to the session's own position.",
+            "minimum": 0
+          },
+          "chunk": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "mime": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "NoteResult": {
+        "type": "object",
+        "required": [
+          "ok",
+          "file",
+          "text",
+          "language"
+        ],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "The note's file name in the vault."
+          },
+          "language": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "Ok2": {
+        "type": "object",
+        "description": "`{\"ok\": true}` plus whatever else a handler wants to say.",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      },
+      "OpenBody": {
+        "type": "object",
+        "properties": {
+          "chapter": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "chunk": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "PauseResult": {
+        "type": "object",
+        "required": [
+          "ok",
+          "still_rendering"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "still_rendering": {
+            "type": "boolean",
+            "description": "Whether the renderer keeps filling the buffer while playback is stopped."
+          }
+        }
+      },
+      "PlayheadBody": {
+        "type": "object",
+        "required": [
+          "chunk"
+        ],
+        "properties": {
+          "chunk": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "Position": {
+        "type": "object",
+        "description": "One book's last position. Field order is the python dict's, because it is the\norder `json.dumps` writes and the file is diffed by git.",
+        "required": [
+          "chapter",
+          "chunk",
+          "chapter_title",
+          "chunks_total",
+          "chapters_total",
+          "updated"
+        ],
+        "properties": {
+          "chapter": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "chapter_title": {
+            "type": "string"
+          },
+          "chapters_total": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "chunk": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "chunks_total": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "updated": {
+            "type": "string"
+          }
+        }
+      },
+      "PositionBody": {
+        "type": "object",
+        "required": [
+          "book"
+        ],
+        "properties": {
+          "book": {
+            "type": "string"
+          },
+          "chapter": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "chapter_title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "chapters_total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "chunk": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "chunks_total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
+      "PrerenderBody": {
+        "type": "object",
+        "properties": {
+          "hours": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Hours of estimated audio to build ahead. 0 or null falls back to the\nstatic `PRERENDER_CHAPTERS`."
+          }
+        }
+      },
+      "PrerenderResult": {
+        "type": "object",
+        "required": [
+          "ok",
+          "hours",
+          "chapters_ahead"
+        ],
+        "properties": {
+          "chapters_ahead": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "hours": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      },
+      "RenderResult": {
+        "type": "object",
+        "required": [
+          "ok",
+          "queue",
+          "packing"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "packing": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Chapters that were already complete and went straight to the packer."
+          },
+          "queue": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      },
+      "RendererBody": {
+        "type": "object",
+        "properties": {
+          "on": {
+            "type": "boolean"
+          }
+        }
+      },
+      "RendererResult": {
+        "type": "object",
+        "required": [
+          "ok",
+          "rendering"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "rendering": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ShardChapter": {
+        "type": "object",
+        "required": [
+          "i",
+          "paras",
+          "chunks"
+        ],
+        "properties": {
+          "chunks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "i": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "paras": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "What lets the reader re-form real paragraphs from chunks — a wall of\none-sentence blocks is not a page."
+          }
+        }
+      },
+      "Status": {
+        "type": "object",
+        "required": [
+          "status",
+          "error",
+          "chapter",
+          "book",
+          "title",
+          "key",
+          "queue",
+          "building",
+          "build_error",
+          "pack_queue",
+          "pack_want",
+          "render_idx",
+          "playhead",
+          "total",
+          "chapters",
+          "model_ready",
+          "rtf",
+          "rendered_min",
+          "voice",
+          "prerender",
+          "prerender_chapters",
+          "prerender_hours",
+          "prerender_span",
+          "book_min",
+          "done_min",
+          "disk_gb",
+          "disk_cap_gb"
+        ],
+        "properties": {
+          "book": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "book_min": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "build_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "building": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "chapter": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "chapters": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "disk_cap_gb": {
+            "type": "number",
+            "format": "double"
+          },
+          "disk_gb": {
+            "type": "number",
+            "format": "double"
+          },
+          "done_min": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_ready": {
+            "type": "boolean"
+          },
+          "pack_queue": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "What the packer is about to do, not only what it is doing. Without it a\nchapter waiting to be packed looks idle."
+          },
+          "pack_want": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "playhead": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "prerender": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "prerender_chapters": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "prerender_hours": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "prerender_span": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "queue": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "render_idx": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rendered_min": {
+            "type": "number",
+            "format": "double"
+          },
+          "rtf": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "status": {
+            "type": "string"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "voice": {
+            "type": "string"
+          }
+        }
+      },
+      "TextShard": {
+        "type": "object",
+        "required": [
+          "shard",
+          "from",
+          "to",
+          "chapters"
+        ],
+        "properties": {
+          "chapters": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ShardChapter"
+            }
+          },
+          "from": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "shard": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "to": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "session",
+      "description": "The loaded book, the playhead and the renderer"
+    },
+    {
+      "name": "chapters",
+      "description": "Chapter audio: render, pack, stream, download"
+    },
+    {
+      "name": "text",
+      "description": "The book as text, for offline reading"
+    },
+    {
+      "name": "vault",
+      "description": "Writes into the Obsidian vault"
+    },
+    {
+      "name": "health",
+      "description": "A check that can actually fail"
+    }
+  ]
+}

@@ -44,7 +44,10 @@ default = ["stt"]
 stt = ["dep:whisper-rs"]
 
 [dev-dependencies]
+futures-util = "0.3"
+percent-encoding = "2"
 tempfile = "3"
+url = "2"
 
 [profile.release]
 opt-level = 3

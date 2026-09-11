@@ -23,29 +23,39 @@ pub struct ChapterRow {
     pub n: usize,
     /// How many of this chapter's chunks are on disk.
     pub rendered: usize,
+    #[schema(required = true)]
     pub est_min: Option<f64>,
     /// Whether a *trustworthy* packed m4a exists. A manifest whose `chunks`
     /// disagrees with the plan reports false: it points at the wrong words.
     pub m4a: bool,
+    #[schema(required = true)]
     pub bytes: Option<u64>,
+    #[schema(required = true)]
     pub duration: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub queued: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub packing: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pack_queued: Option<bool>,
+    /// Always present: a row only exists for a loaded book, and then the
+    /// chapter manager's three flags always have an answer.
+    pub queued: bool,
+    pub packing: bool,
+    pub pack_queued: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ChaptersResult {
+    #[schema(required = true)]
     pub book: Option<String>,
+    #[schema(required = true)]
     pub key: Option<String>,
+    #[schema(required = true)]
     pub title: Option<String>,
+    // Omitted in the "no book loaded" shape and a plain number otherwise; the
+    // value_type override keeps `null` out of the generated client, which the
+    // reader's hand-written type does not admit either.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = usize)]
     pub chapter: Option<usize>,
     pub chapters: Vec<ChapterRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Vec<usize>)]
     pub queue: Option<Vec<usize>>,
     /// Absent only in the "no book loaded" shape; `null` when nothing is being
     /// packed. The python server distinguishes those two and the reader's type
@@ -57,8 +67,10 @@ pub struct ChaptersResult {
     #[schema(value_type = Option<String>)]
     pub build_error: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = f64)]
     pub chapters_gb: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = f64)]
     pub chapters_cap_gb: Option<f64>,
 }
 
@@ -91,9 +103,9 @@ pub fn chapter_rows(st: &Arc<AppState>) -> Vec<ChapterRow> {
             m4a: size.is_some(),
             bytes: size,
             duration: None,
-            queued: None,
-            packing: None,
-            pack_queued: None,
+            queued: false,
+            packing: false,
+            pack_queued: false,
         };
         if size.is_some() {
             if let Some(man) = pack::read_manifest(&st.cfg.work, &key, ci) {
@@ -146,9 +158,9 @@ pub async fn chapters_list(State(st): State<Arc<AppState>>) -> Response {
     let rows = rows
         .into_iter()
         .map(|mut r| {
-            r.queued = Some(queue.contains(&r.i));
-            r.packing = Some(s.building == Some(r.i));
-            r.pack_queued = Some(bq.contains(&r.i) || want.contains(&r.i));
+            r.queued = queue.contains(&r.i);
+            r.packing = s.building == Some(r.i);
+            r.pack_queued = bq.contains(&r.i) || want.contains(&r.i);
             r
         })
         .collect();

@@ -24,8 +24,11 @@ pub struct ChapMeta {
     pub title: String,
     pub n: usize,
     pub est_min: f64,
-    /// Which shard holds this chapter's words. Only present in `book.json`.
+    /// Which shard holds this chapter's words. Omitted entirely by `/api/load`,
+    /// always a number in `book.json` — never `null`, which is why the schema
+    /// overrides utoipa's default nullable-because-Option rendering.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = usize)]
     pub shard: Option<usize>,
 }
 

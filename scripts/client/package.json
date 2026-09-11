@@ -1,0 +1,15 @@
+{
+  "name": "narrator-client-codegen",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pinned toolchain for generating the typed TS client from openapi.json and for the drift check against narrator/web's hand-written types.",
+  "scripts": {
+    "generate": "openapi-ts",
+    "drift": "node ../drift-check.mjs"
+  },
+  "devDependencies": {
+    "@hey-api/openapi-ts": "0.99.0",
+    "typescript": "5.9.3"
+  }
+}

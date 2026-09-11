@@ -27,11 +27,14 @@ pub struct Health {
     pub status: String,
     pub uptime_s: f64,
     pub model_ready: bool,
+    #[schema(required = true)]
     pub book: Option<String>,
     pub threads: Vec<String>,
     pub since_progress_s: f64,
     pub stall_limit_s: f64,
+    #[schema(required = true)]
     pub build_error: Option<String>,
+    #[schema(required = true)]
     pub packing: Option<usize>,
     pub queue: usize,
     /// Open SSE streams.
