@@ -98,8 +98,12 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
           itself, which is not a double count for exactly that reason. Without
           them the notch covers the Books header and the home indicator sits on
           the chapter action bar. */}
+      {/* No close button: the overlay closes it, and so does the back gesture.
+          A corner X costs a line of the header on a phone and sits exactly where
+          the chapter list wants to start. */}
       <SheetContent
         side="left"
+        showCloseButton={false}
         className="flex w-[min(400px,88vw)] flex-col gap-0 p-0
                    pt-[var(--sat)] pb-[var(--sab)] pl-[var(--sal)]"
       >

@@ -1069,7 +1069,7 @@
         },
         "responses": {
           "200": {
-            "description": "filed - the outbox may delete its copy",
+            "description": "filed - the outbox may delete its copy. The same body comes back for a memo already filed under this `id`, so a retry the server has already answered costs nothing",
             "content": {
               "application/json": {
                 "schema": {
@@ -1089,7 +1089,7 @@
             }
           },
           "404": {
-            "description": "`book` names a book with no text bundle here",
+            "description": "`book` names a book with no text bundle here, or - for an `id` sent with no audio, which asks whether that memo was filed - no note has been filed for it",
             "content": {
               "application/json": {
                 "schema": {

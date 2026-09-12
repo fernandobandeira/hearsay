@@ -87,9 +87,13 @@ pub struct NoteResult {
     post, path = "/api/note", tag = "vault",
     request_body = NoteBody,
     responses(
-        (status = 200, body = NoteResult, description = "filed - the outbox may delete its copy"),
+        (status = 200, body = NoteResult, description = "filed - the outbox may delete its copy. \
+            The same body comes back for a memo already filed under this `id`, so a retry the \
+            server has already answered costs nothing"),
         (status = 400, body = ApiError, description = "no book, no audio, or nothing heard"),
-        (status = 404, body = ApiError, description = "`book` names a book with no text bundle here"),
+        (status = 404, body = ApiError, description = "`book` names a book with no text bundle \
+            here, or - for an `id` sent with no audio, which asks whether that memo was filed - \
+            no note has been filed for it"),
         (status = 500, body = ApiError, description = "transcription or the vault write failed"),
     )
 )]
@@ -103,6 +107,18 @@ pub async fn note(State(st): State<Arc<AppState>>, Json(body): Json<NoteBody>) -
         return refuse(StatusCode::BAD_REQUEST, "no audio");
     };
     if audio.is_empty() {
+        // An `id` with no audio is a **probe**: "did my memo become a note?".
+        // It exists for the recording that ran out of retries on the phone while
+        // this server was quietly finishing it anyway — the reader can collect
+        // the confirmation, and delete its copy, without pushing the bytes up
+        // again. A memo that is not filed is a 404, which changes nothing about
+        // it: it stays in the outbox, which is where it belongs.
+        if let Some(id) = body.id.as_deref().and_then(queue::client_id) {
+            return match queue::filed(&st.cfg.work, &id) {
+                Some(f) => respond(Ok(f)),
+                None => refuse(StatusCode::NOT_FOUND, "no note filed for this memo"),
+            };
+        }
         return refuse(StatusCode::BAD_REQUEST, "no audio");
     }
     let id = queue::memo_id(body.id.as_deref(), &audio);
@@ -115,7 +131,7 @@ pub async fn note(State(st): State<Arc<AppState>>, Json(body): Json<NoteBody>) -
             tracing::info!("note {id}: already being transcribed, attaching");
             return respond(w.wait().await);
         }
-        queue::Claim::Mine(j) => j,
+        queue::Claim::Mine(j) => *j,
     };
 
     let (plan, session_title, bookpath, loaded_key, ci, i) = {
@@ -194,93 +210,143 @@ pub async fn note(State(st): State<Arc<AppState>>, Json(body): Json<NoteBody>) -
     };
 
     let stamp = chrono::Local::now();
+    let pending = queue::Pending {
+        stamp_ms: stamp.timestamp_millis(),
+        // The initial prompt biases whisper toward the words it will actually
+        // hear. Written down with the rest so a resumed memo is transcribed the
+        // same way this one would have been.
+        prompt: [
+            st.cfg.whisper_prompt.as_str(),
+            title.as_str(),
+            ctitle.as_str(),
+        ]
+        .iter()
+        .filter(|x| !x.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", "),
+        title,
+        name,
+        ctitle,
+        ctx,
+        ci,
+        i,
+        n,
+    };
+
     // A recording an earlier attempt already saved is reused, not copied: the
     // production failure this fix is about wrote the same 135 kB memo into
     // `notes-audio/` five times.
     let apath = match job.audio() {
-        Some(p) => p,
+        Some(p) => {
+            job.accept(&p, pending.clone());
+            p
+        }
         None => {
-            let adir = st.cfg.work.join("notes-audio");
-            if let Err(e) = std::fs::create_dir_all(&adir) {
-                return refuse(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("could not save audio: {e}"),
-                );
-            }
             let ext = if body.mime.as_deref().unwrap_or("").contains("webm") {
                 "webm"
             } else {
                 "ogg"
             };
-            let p = adir.join(format!("{}.{ext}", stamp.format("%Y%m%d%H%M%S")));
-            // Raw memo audio is never deleted — it lands before anything can fail.
-            if let Err(e) = std::fs::write(&p, &audio) {
+            let p = queue::audio_dir(&st.cfg.work)
+                .join(format!("{}.{ext}", stamp.format("%Y%m%d%H%M%S")));
+            // The work order before the bytes, and the bytes before anything that
+            // can fail: from here this server can finish the memo with no client
+            // and no memory of this request, and a recording that is on disk
+            // under its real name is always a complete one.
+            job.accept(&p, pending.clone());
+            if let Err(e) = queue::write_durable(&p, &audio) {
                 return refuse(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("could not save audio: {e}"),
                 );
             }
-            // Recorded against the memo's id before the slow part starts, so a
-            // restart mid-transcription finds this file instead of writing
-            // another one.
-            job.claim_audio(&p);
             p
         }
     };
 
-    let prompt = [
-        st.cfg.whisper_prompt.as_str(),
-        title.as_str(),
-        ctitle.as_str(),
-    ]
-    .iter()
-    .filter(|x| !x.is_empty())
-    .copied()
-    .collect::<Vec<_>>()
-    .join(", ");
-
     // From here the request owns nothing. The transcription is minutes of CPU on
     // the box and a phone does not stay awake for it; whatever happens to this
-    // connection, the task below files the note.
+    // connection — or to this process — the note gets written.
     let waiter = job.spawn(file_note(Filing {
         st: st.clone(),
         apath,
-        prompt,
-        stamp,
-        title,
-        name,
-        ctitle,
-        ctx,
-        ci,
-        i,
-        n,
+        pending,
     }));
     respond(waiter.wait().await)
 }
 
-/// Everything the detached half needs, owned — it outlives the request.
+/// Everything the detached half needs, owned — it outlives the request, and in
+/// [`resume_unfiled`] it is read back off disk with no request at all.
 struct Filing {
     st: Arc<AppState>,
     apath: std::path::PathBuf,
-    prompt: String,
-    stamp: chrono::DateTime<chrono::Local>,
-    title: String,
-    name: String,
-    ctitle: String,
-    ctx: String,
-    ci: usize,
-    i: usize,
-    n: usize,
+    pending: queue::Pending,
+}
+
+/// Sweep the queue for memos this server owes the vault, and finish them.
+///
+/// Called when the router is built, which is every process that serves the API
+/// and no process that merely prints the spec. The box is restarted often —
+/// deploys, the watchdog, a benchmark — and a restart used to kill a
+/// transcription outright: the recording sat in `notes-audio/` and nothing ever
+/// turned it into a note. Now the record beside it says what the note should be,
+/// so finishing it needs nobody.
+///
+/// One at a time, oldest first: whisper is serialized behind its own lock anyway
+/// and the box has two cores, so a queue of memos is a queue here too.
+pub fn resume_unfiled(st: Arc<AppState>) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        // `narrator --openapi` and anything else outside a runtime: nothing to
+        // resume onto, and nothing is lost by not trying.
+        tracing::debug!("notes: no runtime, not sweeping the memo queue");
+        return;
+    };
+    handle.spawn(async move {
+        let owed = queue::unfiled(&st.cfg.work);
+        if owed.is_empty() {
+            return;
+        }
+        tracing::warn!("notes: {} memo(s) unfiled, resuming", owed.len());
+        for m in owed {
+            let queue::Claim::Mine(mut job) = queue::claim(&st.cfg.work, &m.id) else {
+                // Filed by someone else, or a POST for it arrived first.
+                continue;
+            };
+            let n = job.resuming();
+            tracing::warn!(
+                "note {}: resuming ({}/{}) from {}",
+                m.id,
+                n,
+                queue::MAX_RESUMES,
+                m.audio.display()
+            );
+            let out = (*job)
+                .spawn(file_note(Filing {
+                    st: st.clone(),
+                    apath: m.audio,
+                    pending: m.pending,
+                }))
+                .wait()
+                .await;
+            if let Err(e) = out {
+                tracing::error!(
+                    "note {}: still unfiled ({}) — it stays queued",
+                    m.id,
+                    e.message
+                );
+            }
+        }
+    });
 }
 
 /// Transcribe the recording and write the note. Runs in a task of its own, so
 /// none of this is skipped by a client that stopped listening.
 async fn file_note(f: Filing) -> queue::Outcome {
-    let Filing {
-        st,
-        apath,
+    let Filing { st, apath, pending } = f;
+    let queue::Pending {
+        stamp_ms,
         prompt,
-        stamp,
         title,
         name,
         ctitle,
@@ -288,7 +354,14 @@ async fn file_note(f: Filing) -> queue::Outcome {
         ci,
         i,
         n,
-    } = f;
+    } = pending;
+    // The stamp the memo arrived with, not the one it is finally written at: a
+    // note resumed after a restart belongs to the moment the thought happened,
+    // and its file name is derived from it.
+    let stamp = match chrono::TimeZone::timestamp_millis_opt(&chrono::Local, stamp_ms) {
+        chrono::LocalResult::Single(t) => t,
+        _ => chrono::Local::now(),
+    };
     // `transcribe` stays exactly where it was — one blocking call, taking
     // whatever priority it takes — only now the task holding it is not the
     // request's.

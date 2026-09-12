@@ -19,8 +19,8 @@
  * UI entirely - see lib/download.ts. Nobody wants a rendered chapter they
  * cannot listen to offline, so download climbs the whole ladder itself: queue
  * the render, wait for it, ask for the pack, wait for it, store the m4a. And
- * picking chapters no longer means hitting a 14 px checkbox: "download…" or
- * "remove…" starts a mode in which whole rows toggle on a tap, with "next 5",
+ * picking chapters no longer means hitting a 14 px checkbox: "download…"
+ * starts a mode in which whole rows toggle on a tap, with "next 5",
  * "next 20" and "rest" for the case that is actually common, and a confirm bar
  * that says how many and roughly how big before anything happens. Outside a
  * mode a tap on a row does the obvious thing and opens that chapter.
@@ -28,7 +28,7 @@
 import {useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState} from 'react';
 import {
   Check, CircleDashed, Clock, CloudOff, Download, FileAudio, HardDriveDownload, Loader2,
-  PieChart, RotateCw, Trash2, Type,
+  PieChart, Type,
 } from 'lucide-react';
 import {Button} from '@/components/ui/button';
 import {Input} from '@/components/ui/input';
@@ -37,7 +37,6 @@ import {ScrollArea} from '@/components/ui/scroll-area';
 import {Skeleton} from '@/components/ui/skeleton';
 import {useQueryClient} from '@tanstack/react-query';
 import {fetchChapters, keys, useChapterActions, useChapters} from '@/lib/api';
-import {KEEP_BEHIND} from '@/lib/autotrim';
 import {chapterState, textMark, type ChapterStateKey, type Job, type TextMark} from '@/lib/chapterstate';
 import {chaptersWithText} from '@/lib/chaptertext';
 import {
@@ -46,7 +45,7 @@ import {
 } from '@/lib/download';
 import {centeredScrollTop, scrollTargetIndex} from '@/lib/drawernav';
 import {chosen, idle, rangeAfter, reduce} from '@/lib/selection';
-import {cachedChapters, downloadChapter, removeChapter} from '@/lib/offline';
+import {cachedChapters, downloadChapter} from '@/lib/offline';
 import {bytes as fmtBytes} from '@/lib/format';
 import {cn} from '@/lib/utils';
 import {useNarrator} from '@/state';
@@ -113,16 +112,12 @@ export function ChapterManager({open, active, onPick}: {
     () => chaptersWithText(n.index, book ?? '', n.textShards), [n.index, book, n.textShards]);
   const connected = n.conn !== 'offline';
 
-  /* Which rows the current mode may act on. Download skips what is already
-     here; remove can only touch what is. Threaded into every selection event so
-     a row that finished downloading mid-selection cannot stay picked. */
+  /* Which rows the mode may act on: what is not already here. Threaded into
+     every selection event so a row that finished downloading mid-selection
+     cannot stay picked. */
   const eligible = useMemo(() => {
     if (!sel.verb) return [];
-    return hits
-      .filter((r) => sel.verb === 'remove'
-        ? n.offlineChapters.has(r.i)
-        : !n.offlineChapters.has(r.i))
-      .map((r) => r.i);
+    return hits.filter((r) => !n.offlineChapters.has(r.i)).map((r) => r.i);
   }, [hits, sel.verb, n.offlineChapters]);
 
   /* Centring the chapter being read.
@@ -285,33 +280,13 @@ export function ChapterManager({open, active, onPick}: {
     }
   }
 
-  async function runRemove(cis: number[]) {
-    const key = n.book?.key;
-    if (!key) return;
-    setErr(null);
-    setRunning(true);
-    try {
-      for (const ci of cis) await removeChapter(key, ci);
-      await n.refreshOffline();
-    } finally {
-      setRunning(false);
-    }
-  }
-
   function confirm() {
-    const verb = sel.verb;
     const cis = picks;
     dispatch({t: 'cancel'});
-    if (!cis.length || !verb) return;
-    void (verb === 'download' ? runDownload(cis) : runRemove(cis));
+    if (!cis.length || !sel.verb) return;
+    void runDownload(cis);
   }
 
-  // ------------------------------------------------------------------ the line
-  const offlineBytes = rows
-    .filter((r) => n.offlineChapters.has(r.i))
-    .reduce((a, r) => a + (r.bytes ?? 0), 0);
-  const shards = n.index?.shards ?? 0;
-  const textDone = shards > 0 && n.textShards.size >= shards;
   const loadingRows = isPending && !rows.length;
   /* What a minute of audio weighs, from the server rather than from a constant
      in this file: CHAPTER_BITRATE is the box's to set, and an estimate computed
@@ -321,66 +296,6 @@ export function ChapterManager({open, active, onPick}: {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      {/* The two tiers, as one line of small print. */}
-      <div data-testid="tiers"
-           className="flex items-center gap-1.5 px-4 pb-1.5 text-[11px] text-muted-foreground">
-        <Type className="size-3 shrink-0" />
-        <span data-testid="text-state" className="min-w-0 truncate">
-          {n.textOptOut
-            ? 'text not saved'
-            : n.textBusy
-              ? `text ${n.textProgress?.done ?? n.textShards.size}/${n.textProgress?.total ?? shards}`
-              : textDone
-                ? `text ${n.index?.text_bytes ? fmtBytes(n.index.text_bytes) : 'saved'}`
-                : shards ? `text ${n.textShards.size}/${shards}` : 'text not saved'}
-        </span>
-        {/* Only the opt-in half lives here now. Giving the words back belongs to
-            the book rather than to this drawer - on the Books list it can take
-            the downloaded chapters with it in one act, and it can reach a book
-            that is not open, which this level never could.
-
-            The same button is the retry, and a stalled download is stated as a
-            retry rather than as an error. That is a decision, not a shrug: a
-            missing shard is a book that is partly here, not a fault - it heals
-            on the next reconnect by itself (state.tsx watches for that) and a
-            red error for something already fixing itself is noise on the one
-            surface that also has to say useful things. What was genuinely wrong
-            before was silence: the row said "text 7/12" whether the download was
-            still working or had given up on part of the book hours ago, with
-            nothing to press. So the count stays, the word "retry" appears only
-            when it has actually stopped short, and the tooltip says how much of
-            the book that is. The per-chapter marks in the list below say
-            *which* chapters, which is the part that decides a tap. */}
-        {(n.textOptOut || (!textDone && !n.textBusy)) && (
-          <button data-testid="text-save" onClick={() => n.saveText()}
-                  data-incomplete={n.textMissing.length ? '1' : undefined}
-                  title={n.textMissing.length
-                    ? `${n.textMissing.length} of ${shards} parts of the text could not be saved`
-                      + ' — the chapters in them may not open with no network. Tap to finish.'
-                    : "Keep the whole book's words on this device"}
-                  className="flex shrink-0 items-center gap-0.5 rounded p-1 text-muted-foreground/70
-                             transition-colors hover:text-foreground">
-            {n.textMissing.length
-              ? <><RotateCw className="size-3" />retry</>
-              : <HardDriveDownload className="size-3" />}
-          </button>
-        )}
-        <span data-testid="audio-state"
-              className="ml-auto flex shrink-0 items-center gap-1 tabular-nums">
-          <FileAudio className="size-3" />
-          {n.offlineChapters.size}/{rows.length}
-          {offlineBytes > 0 && ` · ${fmtBytes(offlineBytes)}`}
-        </span>
-      </div>
-      {/* Said once, quietly, and only where it is true: downloaded chapters
-          vanish from this list on their own, and a reader who has not been told
-          that reads it as a bug. */}
-      {n.offlineChapters.size > 0 && (
-        <div data-testid="audio-autotrim"
-             className="px-4 pb-1.5 text-right text-[10px] leading-relaxed text-muted-foreground/70">
-          chapters more than {KEEP_BEHIND} behind you are removed automatically
-        </div>
-      )}
       {n.textBusy && (
         <Progress data-testid="text-progress" className="mx-4 mb-1.5 h-px bg-white/[0.06]"
                   value={n.textProgress
@@ -419,8 +334,7 @@ export function ChapterManager({open, active, onPick}: {
                 data-state={s.key}
                 data-picked={picked ? '1' : undefined}
                 title={sel.verb
-                  ? can ? `tap to ${sel.verb === 'remove' ? 'remove' : 'download'} this chapter`
-                        : sel.verb === 'remove' ? 'not on this device' : 'already on this device'
+                  ? can ? 'tap to download this chapter' : 'already on this device'
                   // Whichever tier is the news. A chapter whose words are not
                   // here outranks anything the audio state has to say about it.
                   : mark ? `${mark.tip}\n${s.tip}` : s.tip}
@@ -481,7 +395,7 @@ export function ChapterManager({open, active, onPick}: {
         <div data-testid="confirm-bar" className="space-y-2 border-t border-border px-3 py-2">
           <div className="flex items-center gap-1">
             <span className="mr-auto text-[11px] text-muted-foreground">
-              tap rows to {sel.verb === 'remove' ? 'remove' : 'download'}
+              tap rows to download
             </span>
             {([['next 5', 5], ['next 20', 20], ['rest', null]] as const).map(([label, count]) => (
               <button
@@ -510,10 +424,9 @@ export function ChapterManager({open, active, onPick}: {
                 : 'none picked'}
             </span>
             <Button data-testid="sel-confirm" size="sm"
-                    variant={sel.verb === 'remove' ? 'outline' : 'default'}
                     disabled={!picks.length} onClick={confirm}>
-              {sel.verb === 'remove' ? <Trash2 className="size-3.5" /> : <Download className="size-3.5" />}
-              {sel.verb === 'remove' ? 'remove' : 'download'}
+              <Download className="size-3.5" />
+              download
             </Button>
           </div>
         </div>
@@ -524,12 +437,6 @@ export function ChapterManager({open, active, onPick}: {
                   title="Pick chapters to keep on this device. The server renders whatever needs it first.">
             {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Download className="size-3.5" />}
             download…
-          </Button>
-          <Button data-testid="start-remove" size="sm" variant="ghost"
-                  disabled={busy || !n.offlineChapters.size}
-                  onClick={() => dispatch({t: 'start', verb: 'remove'})}
-                  title="Give back the downloaded copies (the server keeps its files)">
-            <Trash2 className="size-3.5" /> remove…
           </Button>
           {err && (
             <span data-testid="chapter-error" className="ml-auto min-w-0 truncate text-[11px] text-destructive">

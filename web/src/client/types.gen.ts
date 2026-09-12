@@ -983,7 +983,7 @@ export type NoteErrors = {
      */
     400: ApiError;
     /**
-     * `book` names a book with no text bundle here
+     * `book` names a book with no text bundle here, or - for an `id` sent with no audio, which asks whether that memo was filed - no note has been filed for it
      */
     404: ApiError;
     /**
@@ -996,7 +996,7 @@ export type NoteError = NoteErrors[keyof NoteErrors];
 
 export type NoteResponses = {
     /**
-     * filed - the outbox may delete its copy
+     * filed - the outbox may delete its copy. The same body comes back for a memo already filed under this `id`, so a retry the server has already answered costs nothing
      */
     200: NoteResult;
 };

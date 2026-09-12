@@ -128,9 +128,14 @@ describe('two triggers, one drain', () => {
     // skipping exactly that memo.
     store.memos = [memo(), memo({id: 2, uid: 'stalled-memo', chunk: 99, tries: MAX_TRIES})];
     const d = deferred<ReturnType<typeof filed>>();
-    const fetch = vi.fn()
-      .mockImplementationOnce(() => d.promise)
-      .mockImplementation(async () => filed('second.md'));
+    let uploads = 0;
+    const fetch = vi.fn(async (_url: string, init: {body: string}) => {
+      const body = JSON.parse(init.body) as {audio?: string};
+      // The server has not filed the stalled one, so the probe answers nothing
+      // and only a hand retry can move it.
+      if (!body.audio) return {status: 404, json: async () => ({error: 'no note filed'})};
+      return uploads++ === 0 ? d.promise : filed('second.md');
+    });
     vi.stubGlobal('fetch', fetch);
 
     const auto = flushOutbox({online: true});
@@ -138,8 +143,12 @@ describe('two triggers, one drain', () => {
     d.resolve(filed());
     await Promise.all([auto, manual]);
 
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(sent(fetch.mock.calls[1]).id).toBe('stalled-memo');
+    // Three calls: the first memo, the stalled one's probe, and - because the
+    // manual retry was not swallowed - the stalled one's actual upload.
+    expect(fetch).toHaveBeenCalledTimes(3);
+    const last = sent(fetch.mock.calls[2]);
+    expect(last.id).toBe('stalled-memo');
+    expect(last.chunk).toBe(99);
     expect(store.deleted).toEqual([1, 2]);
   });
 
@@ -157,6 +166,34 @@ describe('two triggers, one drain', () => {
 
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(store.deleted).toEqual([1]);
+  });
+
+  test('a stalled memo collects its confirmation without re-uploading', async () => {
+    // The server finishes its own unfiled work now, so a memo that ran out of
+    // tries here may well already be a note. Asking is a few hundred bytes; the
+    // recording is not sent again unless the user asks by hand.
+    store.memos = [memo({tries: MAX_TRIES, uid: 'stalled-but-filed'})];
+    const fetch = vi.fn(async () => filed('it was filed all along.md'));
+    vi.stubGlobal('fetch', fetch);
+
+    await flushOutbox({online: true});
+
+    const body = sent(fetch.mock.calls[0]);
+    expect(body.id).toBe('stalled-but-filed');
+    expect(body.audio).toBe('');
+    expect(store.deleted).toEqual([1]);
+  });
+
+  test('a stalled memo the server has not filed is kept, untouched', async () => {
+    store.memos = [memo({tries: MAX_TRIES, uid: 'stalled-and-owed'})];
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      status: 404, json: async () => ({error: 'no note filed for this memo'}),
+    })));
+
+    await flushOutbox({online: true});
+
+    expect(store.deleted).toEqual([]);
+    expect(store.memos[0].tries).toBe(MAX_TRIES);   // a probe is not an attempt
   });
 
   test('a drain that has finished does not swallow the next one', async () => {

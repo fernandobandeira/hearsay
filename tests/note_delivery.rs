@@ -180,6 +180,96 @@ async fn a_client_that_stops_listening_still_gets_its_note_filed() {
 }
 
 #[tokio::test]
+async fn a_memo_the_last_process_could_not_file_is_finished_by_the_next_one() {
+    // The restart case, and the one the box does most: something killed the work
+    // between the recording landing and the note being written. Here it is the
+    // vault write failing (a file where the notes directory should be, which is
+    // what an unmounted vault looks like), because that is a failure a test can
+    // stage; a SIGTERM mid-transcription leaves the record in exactly the same
+    // state. Either way the memo is owed, and the *next* process pays it —
+    // without the phone, which is not required to ever come back.
+    let mut h = speaking().await;
+    h.load().await;
+    std::fs::write(&h.state.cfg.notes_dir, b"not a directory").expect("block the notes dir");
+    let body = json!({"audio": recorded("interrupted by a deploy"),
+                      "mime": "audio/webm", "id": "owed-across-a-restart"});
+
+    let (code, got) = h.post_json("/api/note", body.clone()).await;
+    assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{got}");
+    assert_eq!(
+        recordings(&h),
+        1,
+        "the recording landed before anything failed"
+    );
+    let record = h.work().join("notes-idem/c-owed-across-a-restart.json");
+    let owed = std::fs::read_to_string(&record).expect("the work order");
+    assert!(owed.contains("\"pending\""), "{owed}");
+    assert!(!owed.contains("\"filed\""), "{owed}");
+
+    // The vault comes back, and so does the server.
+    std::fs::remove_file(&h.state.cfg.notes_dir).expect("unblock");
+    h.restart().await;
+
+    assert!(
+        eventually(|| !notes(&h).is_empty()).await,
+        "a restarted server finishes what the last one started"
+    );
+    let filed = notes(&h);
+    assert_eq!(filed.len(), 1, "{filed:?}");
+    let md = std::fs::read_to_string(h.state.cfg.notes_dir.join(&filed[0])).expect("the note");
+    assert!(md.contains("interrupted by a deploy"), "{md}");
+
+    // Nothing is owed any more, and the phone - which heard only a 500 - gets
+    // the note when it next asks.
+    assert!(
+        eventually(|| std::fs::read_to_string(&record)
+            .map(|s| s.contains("\"filed\""))
+            .unwrap_or(false))
+        .await
+    );
+    let (code, got) = h.post_json("/api/note", body).await;
+    assert_eq!(code, StatusCode::OK, "{got}");
+    assert_eq!(got["file"], json!(filed[0]));
+    assert_eq!(notes(&h), filed, "still one note");
+    assert_eq!(recordings(&h), 1, "still one recording");
+}
+
+#[tokio::test]
+async fn a_memo_can_ask_whether_it_was_filed_without_uploading_itself_again() {
+    // For the recording that ran out of retries on the phone while this server
+    // was quietly finishing it: an id with no audio asks the question, and the
+    // answer is the note. 135 kB not spent, and the outbox can let go.
+    let h = speaking().await;
+    h.load().await;
+    let probe = json!({"audio": "", "id": "ask-about-me"});
+
+    let (code, got) = h.post_json("/api/note", probe.clone()).await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{got}");
+    assert!(
+        got["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no note"),
+        "{got}"
+    );
+    assert_eq!(recordings(&h), 0, "a probe records nothing");
+
+    let (_, filed) = h
+        .post_json(
+            "/api/note",
+            json!({"audio": recorded("said out loud"), "mime": "audio/webm", "id": "ask-about-me"}),
+        )
+        .await;
+    let (code, answer) = h.post_json("/api/note", probe).await;
+    assert_eq!(code, StatusCode::OK, "{answer}");
+    assert_eq!(answer, filed, "the probe answers with the note itself");
+
+    // A body with no audio and no id is what it always was: a 400.
+    let (code, got) = h.post_json("/api/note", json!({"audio": ""})).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{got}");
+}
+
+#[tokio::test]
 async fn a_memo_with_no_id_is_identified_by_its_own_bytes() {
     // Today's reader and the Obsidian plugin send no id. They are deduplicated
     // anyway, because the recording is the memo.

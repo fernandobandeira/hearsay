@@ -304,6 +304,13 @@ pub async fn json_file(path: &std::path::Path, cache: &str, missing: &str) -> Re
 pub struct ApiDoc;
 
 pub fn router(state: Arc<AppState>) -> (axum::Router, utoipa::openapi::OpenApi) {
+    // A voice memo the last process was transcribing when it was killed — a
+    // deploy, the watchdog, a restart nobody meant — is owed to the vault and
+    // nobody else can pay it: the phone is not required to come back. So every
+    // process that is about to serve this API finishes what the last one
+    // started. Here rather than in `boot` because this is the function every
+    // server path goes through and no other path does.
+    notes::resume_unfiled(state.clone());
     let (r, mut api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(session::books))
         .routes(routes!(session::load))

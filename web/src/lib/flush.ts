@@ -8,7 +8,7 @@
  */
 import * as db from './db';
 import {bookKey} from './offline';
-import {afterFailure, classify, nextAction, type OutboxCtx} from './outbox';
+import {afterFailure, classify, nextAction, type Memo, type OutboxCtx} from './outbox';
 import type {NoteResult} from './types';
 
 const toBase64 = (blob: Blob) => new Promise<string>((resolve) => {
@@ -63,9 +63,40 @@ export function flushOutbox(ctx: OutboxCtx): Promise<void> {
   return draining;
 }
 
+/**
+ * Ask whether a memo became a note, without pushing the recording up again.
+ *
+ * For the one that ran out of tries here while the server was quietly finishing
+ * it - which is now the normal end of a memo that was interrupted, because the
+ * server resumes its own unfiled work across a restart. An id and no audio is
+ * the question; the note is the answer, and only then is the copy deleted. A 404
+ * means "not filed", which changes nothing: it stays.
+ */
+async function collect(memo: Memo): Promise<boolean> {
+  if (!memo.uid) return false;
+  try {
+    const res = await fetch('/api/note', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({audio: '', id: memo.uid}),
+    });
+    const body = await res.json().catch(() => null);
+    if (classify(res.status, body) !== 'delivered') return false;
+    await db.deleteMemo(memo.id as number);
+    return true;
+  } catch {
+    return false;                        // still nothing answering; it keeps
+  }
+}
+
 async function sendQueued(ctx: OutboxCtx): Promise<void> {
   for (const memo of await db.allMemos()) {
-    if (nextAction(memo, ctx) !== 'send') continue;
+    const action = nextAction(memo, ctx);
+    // A memo that has run out of tries is not uploaded again until the user asks
+    // - but it may still collect a confirmation, which costs a few hundred bytes
+    // and is the only thing standing between it and being deleted.
+    if (action === 'stalled') { await collect(memo); continue; }
+    if (action !== 'send') continue;
     let status = 0;
     let body: unknown = null;
     try {
