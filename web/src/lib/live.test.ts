@@ -1,8 +1,9 @@
 import {QueryClient} from '@tanstack/react-query';
 import {describe, expect, test, vi} from 'vitest';
 import {
-  arbitrate, connectLive, parseEvent,
-  type EventSourceLike, type Here, type LiveEvent, type LiveState, type PositionEvent,
+  arbitrate, connectLive, lostSession, parseEvent,
+  type EventSourceLike, type HelloEvent, type Here, type LiveEvent, type LiveState,
+  type PositionEvent,
 } from './live';
 
 const pos = (p: Partial<PositionEvent> = {}): PositionEvent => ({
@@ -10,6 +11,32 @@ const pos = (p: Partial<PositionEvent> = {}): PositionEvent => ({
 });
 const here = (p: Partial<Here> = {}): Here => ({
   book: '01 - Lord of Mysteries.epub', chapter: 576, chunk: 40, playing: false, ...p,
+});
+
+const hello = (p: Partial<HelloEvent> = {}): HelloEvent =>
+  ({heartbeat_s: 15, book: '01 - Lord of Mysteries.epub', key: '01 - Lord of Mysteries',
+    chapter: 576, ...p});
+
+describe('lostSession - telling a restart from a gap', () => {
+  test('a hello naming no book, with a book open here, is a lost session', () => {
+    expect(lostSession(hello({book: null, key: null}), {key: '01 - Lord of Mysteries'}))
+      .toBe(true);
+  });
+
+  test('nothing open here: there is nothing to put back', () => {
+    expect(lostSession(hello({book: null, key: null}), {key: null})).toBe(false);
+  });
+
+  test('the same book is an ordinary reconnect', () => {
+    expect(lostSession(hello(), {key: '01 - Lord of Mysteries'})).toBe(false);
+  });
+
+  test('another book is another device, and not this one to undo', () => {
+    // Two readers healing a mismatch would take turns kicking each other's
+    // book out of the one server-side session.
+    expect(lostSession(hello({book: 'Sapiens (2011).epub', key: 'Sapiens (2011)'}),
+                       {key: '01 - Lord of Mysteries'})).toBe(false);
+  });
 });
 
 describe('arbitrate - what to do when the position moves somewhere else', () => {

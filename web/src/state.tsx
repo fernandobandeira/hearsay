@@ -28,7 +28,7 @@ import {
 } from './lib/api';
 import {loadChapterText, shardOf, type TextSources} from './lib/chaptertext';
 import {
-  arbitrate, connectLive, type LiveState, type PositionEvent,
+  arbitrate, connectLive, lostSession, type HelloEvent, type LiveState, type PositionEvent,
 } from './lib/live';
 import {isSane, type Manifest} from './lib/manifest';
 import {Player, type PlayMode} from './lib/player';
@@ -146,6 +146,11 @@ const readOptOut = (): string[] => {
 const writeOptOut = (l: string[]) => {
   try { localStorage.setItem(OPTOUT_KEY, JSON.stringify(l)); } catch { /* private mode */ }
 };
+
+/* The shortest gap between two attempts to put a lost server session back. A
+   `hello` arrives on every reconnect, and a tunnel that flaps would otherwise be
+   a `/api/load` per flap. */
+const HEAL_MIN_MS = 10_000;
 
 export function NarratorProvider({children}: {children: ReactNode}) {
   const qc = useQueryClient();
@@ -599,10 +604,42 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     void openChapterRef.current(verdict.chapter, verdict.chunk);
   }, []);
 
+  /* The other event that is not a refetch: a `hello` that names no book.
+     The server restarted and could not put its session back, and this reader is
+     sitting mid-chapter asking a session-scoped endpoint for audio it will not
+     serve. Nothing else here would ever re-load the book - loading is what
+     picking one from the library does - so without this the reader waits on a
+     404 that will never become a 200, silently, until someone re-opens the book
+     by hand. That is the stall Fernando saw around a deploy.
+
+     Re-loading is cheap (the server's parse cache makes it a plan read) and
+     idempotent, and the player's own once-a-second retry then simply succeeds:
+     nothing has to be restarted, the chunk it is waiting for finally arrives.
+     Rate-limited because `hello` fires on every reconnect, and a flapping tunnel
+     must not turn into a load per reconnect. */
+  const healedAt = useRef(0);
+  const onHello = useCallback((ev: HelloEvent) => {
+    const b = bookRef.current;
+    if (!b || !lostSession(ev, {key: b.key})) return;
+    const now = Date.now();
+    if (now - healedAt.current < HEAL_MIN_MS) return;
+    healedAt.current = now;
+    void (async () => {
+      try { await loadBook(b.path); } catch { return; }
+      void qc.invalidateQueries({queryKey: keys.chapters});
+      void qc.invalidateQueries({queryKey: keys.status});
+      // And where he actually is, or it renders ahead of chapter one.
+      void tellOpen(b.key, ciRef.current, idxRef.current).catch(() => {});
+    })();
+  }, [qc]);
+
   useEffect(() => connectLive(qc, {
     onState: setLive,
-    onEvent: (ev) => { if (ev.name === 'position') onPosition(ev.data); },
-  }), [qc, onPosition]);
+    onEvent: (ev) => {
+      if (ev.name === 'position') onPosition(ev.data);
+      else if (ev.name === 'hello') onHello(ev.data);
+    },
+  }), [qc, onPosition, onHello]);
 
   const follow = useCallback(() => {
     const to = moved;

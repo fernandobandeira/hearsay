@@ -213,6 +213,33 @@ export function arbitrate(ev: PositionEvent, here: Here, slack = SLACK): FollowV
   return here.playing ? {t: 'offer', ...to} : {t: 'follow', ...to};
 }
 
+// ---------------------------------------------------------- the restart check
+
+/**
+ * Has the server forgotten which book this reader is on?
+ *
+ * `hello` fires on connect *and on every reconnect*, which makes it the one
+ * place a restart is distinguishable from a gap: a gap comes back with the same
+ * session, a restart comes back with an empty one. That distinction matters
+ * because playback is a single server-side session and the per-chunk wav
+ * endpoint is scoped to it — with no book loaded, `/api/chunk/{ci}/{i}.wav`
+ * 404s, `/api/open` and `/api/playhead` answer 409, and a reader that was
+ * mid-chapter stalls on a chunk nobody is rendering. Nothing else the reader
+ * does re-loads a book: `/api/load` is what *picking* one does.
+ *
+ * The server restores its own session from disk now, so this should almost
+ * never fire; it is the backstop for the cases it cannot (the epub moved or was
+ * edited, a work directory that lost `session.json`).
+ *
+ * Deliberately narrow: **only** a `hello` naming *no* book counts. A `hello`
+ * naming a *different* book is another device having loaded one, which is the
+ * existing one-session-at-a-time behaviour and not this reader's to undo —
+ * healing that would be two devices taking turns kicking each other's book out.
+ */
+export function lostSession(ev: HelloEvent, here: {key: string | null}): boolean {
+  return !!here.key && ev.key === null;
+}
+
 // ------------------------------------------------------------- the connection
 
 export type LiveState = 'connecting' | 'live' | 'down';
