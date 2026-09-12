@@ -17,7 +17,53 @@ const toBase64 = (blob: Blob) => new Promise<string>((resolve) => {
   r.readAsDataURL(blob);
 });
 
-export async function flushOutbox(ctx: OutboxCtx): Promise<void> {
+/* One drain at a time.
+ *
+ * flush() is triggered from six places - recording a memo, the heartbeat
+ * recovering, onlineManager, visibilitychange, pagehide, focus - and returning
+ * to the PWA fires visibilitychange *and* focus. Unguarded, that is two drains
+ * reading the same outbox a millisecond apart and posting the same recording
+ * twice, which is exactly what production did. So concurrent callers get the
+ * drain that is already running rather than one of their own.
+ *
+ * What must not be lost in the coalescing is a caller asking for *more* than the
+ * running drain is doing: a manual retry (the user tapping "retry", which is the
+ * only thing that gets a stalled memo sent again) or a drain that started while
+ * offline. Those schedule exactly one follow-up pass instead of being dropped. */
+let draining: Promise<void> | null = null;
+let running: OutboxCtx | null = null;
+let queued: OutboxCtx | null = null;
+
+const widens = (now: OutboxCtx, next: OutboxCtx) =>
+  (!!next.manual && !now.manual) || (next.online && !now.online);
+
+const merge = (a: OutboxCtx | null, b: OutboxCtx): OutboxCtx =>
+  a ? {online: a.online || b.online, manual: a.manual || b.manual} : b;
+
+export function flushOutbox(ctx: OutboxCtx): Promise<void> {
+  if (draining) {
+    if (running && widens(running, ctx)) queued = merge(queued, ctx);
+    return draining;
+  }
+  draining = (async () => {
+    try {
+      let next: OutboxCtx | null = ctx;
+      while (next) {
+        running = next;
+        queued = null;
+        await sendQueued(next);
+        next = queued;
+      }
+    } finally {
+      draining = null;
+      running = null;
+      queued = null;
+    }
+  })();
+  return draining;
+}
+
+async function sendQueued(ctx: OutboxCtx): Promise<void> {
   for (const memo of await db.allMemos()) {
     if (nextAction(memo, ctx) !== 'send') continue;
     let status = 0;
@@ -33,6 +79,12 @@ export async function flushOutbox(ctx: OutboxCtx): Promise<void> {
           // Naming it lets the note quote the right book's text even when the
           // server has since loaded another one.
           ...(memo.book ? {book: bookKey({name: memo.book})} : {}),
+          // The memo's own id, so a retry of one the server already filed - the
+          // usual case, because the note takes minutes and the phone rarely
+          // waits - is answered with that note rather than transcribed again.
+          // A memo queued before ids existed simply sends none; the server then
+          // identifies it by the bytes.
+          ...(memo.uid ? {id: memo.uid} : {}),
         }),
       });
       status = res.status;

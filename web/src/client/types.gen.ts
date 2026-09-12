@@ -279,6 +279,17 @@ export type NoteBody = {
      */
     chapter?: number | null;
     chunk?: number | null;
+    /**
+     * A stable id for this recording, so posting it twice files one note.
+     * **Additive, and worth sending**: the reader only deletes its copy when it
+     * sees the 2xx, and on a slow box the phone is often gone by then — so the
+     * same memo arrives again. With an id, the second POST replays the first
+     * one's answer instead of spending another multi-minute transcription and
+     * filing a duplicate. Treated as a file name and ignored unless it is one;
+     * omitted, the recording's own bytes identify it, which is what
+     * deduplicates today's clients and the Obsidian plugin.
+     */
+    id?: string | null;
     mime?: string | null;
 };
 

@@ -62,12 +62,44 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #   amd64: x86-64-v3 (AVX, AVX2, FMA, F16C) - every Intel/AMD part since ~2013,
 #          which both this box and any plausible VPS are. Leaving these off as
 #          well costs whisper.cpp several times its speed for nothing.
-#   arm64: the ARMv8 baseline, which already mandates NEON. Not armv8.2+dotprod:
-#          the A1 has it, but naming it here would make the image A1-only, and a
-#          voice memo is not the hot path. Build on the box with
-#          `--build-arg GGML_NATIVE=ON` if that transcript ever feels slow.
+#   arm64: armv8.2-a+dotprod+fp16 - the same class of trade as x86-64-v3, and
+#          made for the same reason. This used to say "the ARMv8 baseline, which
+#          already mandates NEON", on the theory that a voice memo is not the hot
+#          path. It is not the hot path, but it was *unusable*: a 10-second memo
+#          took 311s and 473s to transcribe on the A1 at the default 2 threads,
+#          and 533s pinned to one - 31-53x slower than realtime, so every memo
+#          timed out in the outbox instead of landing in the vault.
 #
-# whisper-rs-sys passes every GGML_* variable straight through to cmake.
+#          The reason is that on ARM this ggml has no runtime dispatch. Every
+#          kernel choice is a preprocessor test: ggml_cpu_has_dotprod() in
+#          ggml/src/ggml-cpu/ggml-cpu.c is `#if defined(__ARM_FEATURE_DOTPROD)`,
+#          and the HWCAP sniffing in ggml-cpu/arch/arm/cpu-feats.cpp is compiled
+#          only under GGML_CPU_ALL_VARIANTS, which needs GGML_BACKEND_DL, which
+#          needs shared libs - and whisper-rs-sys builds static. So with no
+#          -march at all, ggml_vdotq_s32 falls back to the vmull_s8/vpaddlq_s16
+#          emulation in ggml-cpu-impl.h (six instructions where one `sdot` would
+#          do), and GGML_F16_VEC drops from 8-wide native fp16 FMA to 4-wide fp32
+#          with converts. Both are load-bearing for whisper: the first is every
+#          q5_0 x q8_0 matmul, the second the f16 attention and conv layers.
+#
+#          What this costs: the arm64 image now requires ARMv8.2-A with
+#          FEAT_DotProd and FEAT_FP16 - Neoverse-N1/N2 (so the Ampere Altra this
+#          runs on, and Graviton2 and later), Apple silicon, most server and
+#          phone parts from ~2019 on. `lscpu` says yes if it lists `asimddp` and
+#          `asimdhp`; the A1 lists both. It will SIGILL on an ARMv8.0 part such
+#          as a Raspberry Pi 4 (Cortex-A72). That is the same bet amd64 already
+#          makes with AVX2, and a SIGILL at least fails loudly.
+#
+#          GGML_NATIVE stays OFF: under QEMU "native" is QEMU's idea of a CPU,
+#          and a wrong instruction there is a SIGILL rather than a slow
+#          transcript. Naming the baseline is what makes the cross-build safe.
+#          `--build-arg GGML_NATIVE=ON` still works for a build on the box
+#          itself, and takes precedence over the baseline below.
+#
+# whisper-rs-sys passes every GGML_*, WHISPER_* and CMAKE_* environment variable
+# straight through to cmake as -D (build.rs, `for (key, value) in env::vars()`),
+# so GGML_CPU_ARM_ARCH lands on the ggml-cpu target as -march=... and nowhere
+# else - the Rust code itself stays on the generic baseline.
 ARG TARGETARCH
 ARG GGML_NATIVE=OFF
 ENV GGML_NATIVE=${GGML_NATIVE}
@@ -75,8 +107,12 @@ ENV GGML_NATIVE=${GGML_NATIVE}
 # from buildx; dpkg is the fallback for a plain `docker build`.
 RUN set -eux; \
     arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
-    if [ "${GGML_NATIVE}" = "OFF" ] && [ "$arch" = "amd64" ]; then \
+    if [ "${GGML_NATIVE}" != "OFF" ]; then \
+        echo '# GGML_NATIVE is on; ggml picks the flags' > /etc/ggml.sh; \
+    elif [ "$arch" = "amd64" ]; then \
         echo 'export GGML_AVX=ON GGML_AVX2=ON GGML_FMA=ON GGML_F16C=ON' > /etc/ggml.sh; \
+    elif [ "$arch" = "arm64" ]; then \
+        echo 'export GGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16' > /etc/ggml.sh; \
     else \
         echo '# ggml baseline for this arch' > /etc/ggml.sh; \
     fi; \

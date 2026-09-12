@@ -37,11 +37,43 @@ function db() {
   return dbp;
 }
 
+/**
+ * A memo's stable identity, minted the moment it is stored.
+ *
+ * The server is idempotent on it: a memo posted again - which is what happens
+ * every time the phone stops listening before the note is filed, and that is
+ * most times on a slow box - is answered with the note the first POST wrote
+ * instead of being transcribed a second time and filed twice. Kept to characters
+ * the server will accept as a file name; `randomUUID` is only defined in a
+ * secure context, so there is a fallback, and a memo that somehow gets no id at
+ * all still works (the server then identifies it by its own bytes).
+ */
+export function newUid(): string {
+  const c = globalThis.crypto;
+  if (typeof c?.randomUUID === 'function') return c.randomUUID();
+  if (typeof c?.getRandomValues === 'function') {
+    const b = c.getRandomValues(new Uint8Array(16));
+    return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export async function allMemos(): Promise<Memo[]> {
   return (await (await db())?.getAll('outbox')) ?? [];
 }
+/**
+ * Stored with an id if it has none: whoever records a memo does not have to know
+ * that the delivery contract needs one.
+ *
+ * Minted only for a memo that has never been stored (no IndexedDB key yet). A
+ * memo queued before ids existed keeps sending none, on purpose - it has already
+ * been posted under its content hash, which the server dedups by, and giving it
+ * a fresh identity now would make the next retry look like a different memo and
+ * file a second note.
+ */
 export async function putMemo(m: Memo): Promise<void> {
-  await (await db())?.put('outbox', m);
+  const fresh = m.uid === undefined && m.id === undefined;
+  await (await db())?.put('outbox', fresh ? {...m, uid: newUid()} : m);
 }
 export async function deleteMemo(id: number): Promise<void> {
   await (await db())?.delete('outbox', id);

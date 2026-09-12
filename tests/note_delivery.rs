@@ -91,6 +91,54 @@ async fn a_memo_is_filed_once_however_many_times_it_is_posted() {
 }
 
 #[tokio::test]
+async fn the_filed_body_is_what_the_contract_says_it_is() {
+    // `POST /api/note`'s 2xx shape could not be asserted before — with no
+    // transcriber in the suite every attempt stopped at a 500 — so the one
+    // response the whole outbox is built on was the one the contract fixture did
+    // not describe. It does now.
+    let p =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/api_contract.json");
+    let spec: Value =
+        serde_json::from_slice(&std::fs::read(&p).unwrap_or_default()).expect("the fixture");
+    let fields = &spec["endpoints"]["POST /api/note"]["fields"];
+
+    let h = speaking().await;
+    h.load().await;
+    let body = json!({"audio": recorded("contractually speaking"), "mime": "audio/webm",
+                      "id": "the-contract"});
+    for (attempt, want) in [
+        ("POST /api/note (filed)", StatusCode::OK),
+        (
+            "POST /api/note (already filed, posted again)",
+            StatusCode::OK,
+        ),
+    ] {
+        let (code, got) = h.post_json("/api/note", body.clone()).await;
+        assert_eq!(
+            code.as_u16() as u64,
+            spec["statuses"][attempt].as_u64().unwrap_or(0),
+            "{attempt}: {got}"
+        );
+        assert_eq!(code, want);
+        for (k, kind) in fields.as_object().into_iter().flatten() {
+            let v = &got[k.as_str()];
+            let ok = match kind.as_str().unwrap_or("") {
+                "bool" => v.is_boolean(),
+                "str" => v.is_string(),
+                _ => true,
+            };
+            assert!(ok, "{attempt}: {k} should be {kind}, got {v}");
+        }
+        // Nothing else: the outbox reads exactly these four.
+        assert_eq!(
+            got.as_object().map(|o| o.len()),
+            fields.as_object().map(|o| o.len()),
+            "{attempt}: {got}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_client_that_stops_listening_still_gets_its_note_filed() {
     // The production bug, reproduced: the request future is dropped while the
     // handler is waiting on the transcription. Before the fix that cancelled the
@@ -102,12 +150,15 @@ async fn a_client_that_stops_listening_still_gets_its_note_filed() {
     let body = json!({"audio": recorded("this thought must survive"),
                       "mime": "audio/webm", "id": "dropped-mid-flight"});
 
-    let dropped =
-        tokio::time::timeout(Duration::ZERO, h.post_json("/api/note", body.clone())).await;
+    // Polled once — far enough for the handler to hand the work to the runtime
+    // and start waiting on it — and then dropped, which is precisely what hyper
+    // does to a request whose connection has gone.
+    let mut inflight = Box::pin(h.post_json("/api/note", body.clone()));
     assert!(
-        dropped.is_err(),
+        futures_util::poll!(&mut inflight).is_pending(),
         "the request has to still be in flight when the client goes away"
     );
+    drop(inflight);
 
     // Nobody is listening any more. The note is written anyway.
     assert!(

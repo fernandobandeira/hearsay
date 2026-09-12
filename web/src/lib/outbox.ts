@@ -10,7 +10,8 @@
 export const MAX_TRIES = 5;
 
 export interface Memo {
-  id?: number;
+  id?: number;              // IndexedDB's own key
+  uid?: string;             // the memo's identity to the server, minted at record time
   blob: Blob;
   mime: string;
   book: string | null;      // the book it was recorded against

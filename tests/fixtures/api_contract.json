@@ -33,6 +33,10 @@
     "POST /api/open": { "kind": "object", "fields": { "ok": "bool" } },
     "POST /api/playhead": { "kind": "object", "fields": { "ok": "bool" } },
     "POST /api/position": { "kind": "object", "fields": { "ok": "bool" } },
+    "POST /api/note": {
+      "kind": "object",
+      "fields": { "ok": "bool", "file": "str", "text": "str", "language": "str" }
+    },
     "POST /api/pause": {
       "kind": "object",
       "fields": { "ok": "bool", "still_rendering": "bool" }
@@ -204,6 +208,8 @@
     "GET /api/hls/x/0/evil.sh": 404,
     "POST /api/position (no book)": 400,
     "POST /api/note (no audio)": 400,
-    "POST /api/note (unknown book)": 404
+    "POST /api/note (unknown book)": 404,
+    "POST /api/note (filed)": 200,
+    "POST /api/note (already filed, posted again)": 200
   }
 }
