@@ -15,11 +15,14 @@
 //! refused rather than filed wrong.
 //!
 //! And why the filing is *detached* from the request: on the 2-core box one memo
-//! is minutes of whisper, and a phone that locks its screen in that window takes
-//! the request future with it. Everything after the recording lands on disk
-//! therefore runs in a task the request does not own (`queue::Job::spawn`), and
-//! the handler only watches for its result. See [`queue`] for the other half —
-//! the identity that makes the reader's inevitable retry a replay rather than a
+//! is minutes of whisper — twenty is fine, latency is not the point here — and a
+//! phone that locks its screen in that window takes the request future with it.
+//! Everything after the recording lands on disk therefore runs in a task the
+//! request does not own (`queue::Job::spawn`), and the handler only watches for
+//! its result. If the *process* goes instead of the client, [`resume_unfiled`]
+//! picks the memo up at the next start, because the record on disk is a work
+//! order and not just a receipt. See [`queue`] for that half, and for the
+//! identity that makes the reader's inevitable retry a replay rather than a
 //! second transcription and a second note.
 
 mod queue;
