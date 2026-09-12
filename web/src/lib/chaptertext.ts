@@ -54,6 +54,34 @@ export function shardOf(
   return {shard: meta.shard, title: meta.title ?? ''};
 }
 
+/**
+ * Which chapters this device can produce the words for with no network at all.
+ *
+ * The whole-book text arrives in shards, and a shard that never made it onto the
+ * device takes every chapter in it with it - on the 1433-chapter novel that is a
+ * hundred-odd chapters at a time. The reader had no way to say so: every row in
+ * the chapter drawer looked equally openable, and offline the ones whose shard
+ * was missing were a dead tap with nothing to explain it. The index already
+ * carries `shard` per chapter and Cache Storage already knows which shards are
+ * here, so the answer costs one pass over the table of contents.
+ *
+ * `null` means "the index cannot say" - it is absent, or it belongs to another
+ * book and maps shards to the wrong words. Not knowing is not the same as not
+ * having, and a row must never claim either one on a guess.
+ *
+ * Note what this deliberately does *not* know: a chapter read before the network
+ * went away is in the chapter cache and opens fine whether or not its shard is
+ * here. So a chapter missing from this set is "may not open", never "cannot".
+ */
+export function chaptersWithText(
+  index: BookIndex | undefined, key: string, held: ReadonlySet<number>,
+): Set<number> | null {
+  if (!index || index.key !== key) return null;
+  const out = new Set<number>();
+  for (const c of index.chapters) if (c.shard != null && held.has(c.shard)) out.add(c.i);
+  return out;
+}
+
 const fromShard = (
   s: TextShard | null | undefined, ci: number, ref: ShardRef,
 ): ChapterWords | null => {

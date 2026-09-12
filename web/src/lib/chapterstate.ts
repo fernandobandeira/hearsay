@@ -33,6 +33,40 @@ export interface ChapterState {
   spin?: boolean;
 }
 
+/**
+ * The other tier, on the same row.
+ *
+ * `chapterState` is entirely about audio - render, pack, download - because that
+ * is the expensive half. The cheap half is the words, and until now the drawer
+ * only stated it per *book* ("text 7/12"), which says nothing about which
+ * chapters the missing five parts were. Offline those chapters are a dead tap.
+ *
+ * Stated as an absence rather than a presence, deliberately: the words being
+ * here is the norm and the whole point of taking them without asking, so a mark
+ * on every row would be noise. A mark means "these particular words are not
+ * saved", and what it means for the reader depends on whether there is a network
+ * to fetch them over - which is the only reason `connected` is a parameter.
+ *
+ * Two icons, both already in the drawer's vocabulary: the text tier's own `Type`
+ * when the words are merely not saved, and the connection badge's `CloudOff`
+ * when that actually stands between the reader and the chapter.
+ */
+export interface TextMark {
+  icon: 'text' | 'no-network';
+  tone: ChapterState['tone'];
+  tip: string;
+}
+
+export function textMark(saved: boolean | null, connected: boolean): TextMark | null {
+  // null is "the index cannot say", and a row must not claim on a guess.
+  if (saved !== false) return null;
+  return connected
+    ? {icon: 'text', tone: 'none',
+       tip: 'these words are not in the saved text — opening this chapter fetches them'}
+    : {icon: 'no-network', tone: 'part',
+       tip: 'these words are not in the saved text — with no network this chapter may not open'};
+}
+
 export function chapterState(
   r: ChapRow, offline: boolean, fmtBytes: (n: number) => string, job?: Job,
 ): ChapterState {

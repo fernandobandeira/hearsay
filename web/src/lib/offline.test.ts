@@ -12,6 +12,7 @@ import {
   audioBytes, bookKey, cachedChapters, cachedShards, downloadChapter, downloadText,
   heldBooks, removeBook, removeChapter, removeText,
 } from './offline';
+import {MAX_RETRIES} from './backoff';
 
 const ORIGIN = 'https://reader.test';
 const strip = (u: string) => u.replace(ORIGIN, '');
@@ -40,6 +41,19 @@ const held = (name: string, url: string) => cache(name).put(url, new Response('{
 let served: Map<string, () => Response>;
 const serve = (url: string, body: string, headers: Record<string, string> = {}) =>
   served.set(url, () => new Response(body, {status: 200, headers}));
+/** A URL that answers badly, or not at all - `status` 0 is a dead tunnel. */
+const fail = (url: string, status = 503, times = Infinity) => {
+  let left = times;
+  const was = served.get(url);
+  served.set(url, () => {
+    if (left-- <= 0 && was) return was();
+    if (status === 0) throw new TypeError('Failed to fetch');
+    return new Response('no', {status});
+  });
+};
+
+/** How many times each URL was asked for. */
+let hits: Map<string, number>;
 
 beforeEach(() => {
   store = new Map();
@@ -50,8 +64,11 @@ beforeEach(() => {
       return store.get(name) as unknown as Cache;
     },
   };
+  hits = new Map();
   (globalThis as {fetch?: unknown}).fetch = async (input: RequestInfo | URL) => {
-    const made = served.get(urlOf(input));
+    const u = urlOf(input);
+    hits.set(u, (hits.get(u) ?? 0) + 1);
+    const made = served.get(u);
     return made ? made() : new Response('nope', {status: 404});
   };
 });
@@ -126,6 +143,164 @@ describe('storing a response the python server gzipped', () => {
     serve('/api/chapter/1?book=lom', '{}', {'content-length': '2'});
     expect(await downloadChapter('lom', 1)).toBe(12345678);
     expect(await audioBytes('lom')).toBe(12345678);
+  });
+});
+
+/**
+ * The bug this suite was written for.
+ *
+ * `downloadText` was a plain loop with an unguarded `await put(...)` in it, so
+ * one shard failing threw out of the whole download and every later shard was
+ * simply never asked for. Nothing surfaced it, every later open stopped at the
+ * same shard, and on the 1433-chapter novel that left most of the book
+ * unreadable offline - while the chapters either side of the reader, whose shard
+ * was saved long ago, kept working. That asymmetry is what it looked like from
+ * the outside: the navbar arrows worked and the chapter drawer did not.
+ */
+describe('taking the whole book, one bad shard at a time', () => {
+  const index = '/api/book.json?book=lom';
+  const shardUrl = (s: number) => `/api/text/${s}.json?book=lom`;
+  const body = (s: number) => JSON.stringify({shard: s, from: s, to: s, chapters: []});
+  /** A book of `n` shards, every one of them answerable. */
+  const book = (n: number) => {
+    serve(index, JSON.stringify({shards: n}));
+    for (let s = 0; s < n; s++) serve(shardUrl(s), body(s));
+  };
+  /** No waiting in a test, but remember what the curve was asked for. */
+  const noWait = () => {
+    const attempts: number[] = [];
+    return {attempts, wait: async (a: number) => { attempts.push(a); }};
+  };
+
+  test('a shard that fails does not take the rest of the book with it', async () => {
+    book(5);
+    fail(shardUrl(2), 503);                       // and never recovers
+    const {wait} = noWait();
+
+    const r = await downloadText('lom', 5, {wait});
+    expect([...r.have].sort((a, b) => a - b)).toEqual([0, 1, 3, 4]);
+    expect(r.missing).toEqual([2]);
+    expect(r.stopped).toBe(false);
+    // The point: shards 3 and 4 are on the device, which is what the old loop
+    // could never manage.
+    expect(await cachedShards('lom')).toEqual(new Set([0, 1, 3, 4]));
+  });
+
+  test('a book that saved whole says so, with nothing missing', async () => {
+    book(3);
+    const r = await downloadText('lom', 3, {wait: noWait().wait});
+    expect(r.missing).toEqual([]);
+    expect(r.have).toEqual(new Set([0, 1, 2]));
+    expect(paths(TEXT_CACHE)).toContain(index);
+  });
+
+  test('the retry is the reader\'s one curve: five of them, then it is missing', async () => {
+    book(2);
+    fail(shardUrl(1), 503);
+    const {attempts, wait} = noWait();
+
+    const r = await downloadText('lom', 2, {wait});
+    // delayFor is called with the attempt index, 0 first - the same argument
+    // TanStack Query hands it. MAX_RETRIES waits means MAX_RETRIES+1 tries.
+    expect(attempts).toEqual([...Array(MAX_RETRIES).keys()]);
+    expect(hits.get(shardUrl(1))).toBe(MAX_RETRIES + 1);
+    expect(r.missing).toEqual([1]);
+  });
+
+  test('a blip is a blip: the second round gets it', async () => {
+    book(3);
+    fail(shardUrl(1), 0, 1);                      // one dead-tunnel failure
+    const {attempts, wait} = noWait();
+
+    const r = await downloadText('lom', 3, {wait});
+    expect(r.missing).toEqual([]);
+    expect(attempts).toEqual([0]);                // one wait, then done
+    expect(hits.get(shardUrl(1))).toBe(2);
+    // The good shards were never re-fetched to get there.
+    expect(hits.get(shardUrl(2))).toBe(1);
+  });
+
+  test('an answer is an answer: a 404 shard is not asked five more times', async () => {
+    book(3);
+    fail(shardUrl(1), 404);
+    const {attempts, wait} = noWait();
+
+    const r = await downloadText('lom', 3, {wait});
+    expect(hits.get(shardUrl(1))).toBe(1);
+    expect(attempts).toEqual([]);
+    expect(r.missing).toEqual([1]);               // still reported, still honest
+  });
+
+  test('the next open resumes on the missing shards and re-asks for nothing else', async () => {
+    book(4);
+    fail(shardUrl(2), 503);
+    await downloadText('lom', 4, {wait: noWait().wait});
+
+    // The blip is over.
+    hits.clear();
+    served.set(shardUrl(2), () => new Response(body(2), {status: 200}));
+    const r = await downloadText('lom', 4, {wait: noWait().wait});
+
+    expect(r.missing).toEqual([]);
+    expect(hits.get(shardUrl(2))).toBe(1);
+    for (const s of [0, 1, 3]) expect(hits.get(shardUrl(s))).toBeUndefined();
+  });
+
+  test('the index is retried too - without it no chapter knows its shard', async () => {
+    book(2);
+    fail(index, 503, 1);
+    const {wait} = noWait();
+
+    const r = await downloadText('lom', 2, {wait});
+    expect(hits.get(index)).toBe(2);
+    // ...and its failure never stopped the shards on the first pass.
+    expect(r.have).toEqual(new Set([0, 1]));
+    expect(paths(TEXT_CACHE)).toContain(index);
+  });
+
+  test('stop() still abandons promptly, and abandoning is not a verdict', async () => {
+    book(6);
+    let seen = 0;
+    const r = await downloadText('lom', 6, {
+      wait: noWait().wait,
+      onProgress: () => { seen++; },
+      stop: () => seen > 2,
+    });
+    expect(r.stopped).toBe(true);
+    expect(r.have.size).toBeLessThan(6);
+    // Everything it never got to is named, so a caller can resume - but the
+    // caller is told this was abandoned rather than short.
+    expect(r.missing.length).toBeGreaterThan(0);
+    expect(hits.get(shardUrl(5))).toBeUndefined();
+  });
+
+  /* The backoff is the one place an abandoned download could keep a book it is
+     no longer reading alive for fifteen seconds. It is checked before the wait,
+     not only inside the loop. */
+  test('stop() between rounds does not sit through the backoff', async () => {
+    book(2);
+    fail(shardUrl(0), 503);
+    fail(shardUrl(1), 503);
+    const {attempts, wait} = noWait();
+    let calls = 0;                     // the opening report, then one per shard
+    const r = await downloadText('lom', 2, {
+      wait, stop: () => calls >= 3, onProgress: () => { calls++; },
+    });
+    expect(hits.get(shardUrl(1))).toBe(1);        // the round was finished
+    expect(attempts).toEqual([]);                 // ...and then abandoned, unwaited
+    expect(r.stopped).toBe(true);
+    expect(r.missing).toEqual([0, 1]);
+  });
+
+  test('progress is reported against what Cache Storage holds, not what was asked', async () => {
+    book(3);
+    fail(shardUrl(0), 503);
+    const seen: [number, number][] = [];
+    await downloadText('lom', 3, {
+      wait: noWait().wait, onProgress: (done, total) => seen.push([done, total]),
+    });
+    expect(seen[0]).toEqual([0, 3]);
+    expect(seen[seen.length - 1]).toEqual([2, 3]);   // never 3 of 3
   });
 });
 

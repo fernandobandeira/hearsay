@@ -13,7 +13,7 @@
  * comment in index.css before changing any of these three class lists.
  */
 import {useEffect, useRef, useState} from 'react';
-import {BookOpen} from 'lucide-react';
+import {BookOpen, CloudOff} from 'lucide-react';
 import {FollowOffer, PlayerBar, TopBar, useAutoHide} from '@/components/Chrome';
 import {Library} from '@/components/Library';
 import {ChapterSkeleton, ReadingPage} from '@/components/ReadingPage';
@@ -65,6 +65,23 @@ export default function App() {
           />
         ) : busy ? (
           <ChapterSkeleton />
+        ) : n.book && n.message ? (
+          /* A chapter that could not be opened. The message used to go only to
+             the top bar, which hides itself after two seconds of stillness - so
+             a chapter picked from the drawer with its words not on the device
+             flashed an explanation and then sat on "Open the library to choose a
+             book", as if nothing had been asked for at all. The words are the
+             page, so when there are none the reason belongs on the page. */
+          <div data-testid="chapter-miss"
+               className="absolute inset-0 flex flex-col items-center justify-center gap-3
+                          px-6 text-center text-sm text-muted-foreground">
+            <CloudOff className="size-5" />
+            <span className="max-w-[28em]">{n.message}</span>
+            <button onClick={() => setDrawer(true)}
+                    className="border-b border-border pb-0.5 text-xs hover:text-foreground">
+              choose another chapter
+            </button>
+          </div>
         ) : (
           <button onClick={() => setDrawer(true)}
                   className="absolute inset-0 flex flex-col items-center justify-center gap-3

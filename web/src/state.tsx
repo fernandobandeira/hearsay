@@ -31,6 +31,7 @@ import {
   arbitrate, connectLive, lostSession, type HelloEvent, type LiveState, type PositionEvent,
 } from './lib/live';
 import {isSane, type Manifest} from './lib/manifest';
+import {openSequence} from './lib/opening';
 import {Player, type PlayMode} from './lib/player';
 import {
   bookKey, cachedChapters, cachedShards, downloadText, removeBook, removeChapter,
@@ -72,6 +73,13 @@ interface Ctx {
   textBusy: boolean;
   textProgress: TextProgress | null;
   textOptOut: boolean;
+  /**
+   * Shards the whole-book download could not save, after every retry it is
+   * allowed. Empty while it is still working, and empty for a run that was
+   * abandoned - see lib/offline.ts. It is what lets the drawer say a book is
+   * only partly here rather than looking like it is still counting.
+   */
+  textMissing: number[];
   /** true while the chapter's words are on their way: the page shows a skeleton */
   chapterLoading: boolean;
   /** true while the book itself is being opened */
@@ -169,6 +177,12 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const [textShards, setTextShards] = useState<Set<number>>(new Set());
   const [textBusy, setTextBusy] = useState(false);
   const [textProgress, setTextProgress] = useState<TextProgress | null>(null);
+  const [textMissing, setTextMissing] = useState<number[]>([]);
+  /* Bumped when the connection comes back with parts of the book still missing.
+     The download effect keys on it, because nothing else would ever restart it:
+     its other deps are the book, its index and the opt-out, none of which move
+     when a plane lands. */
+  const [textRetry, setTextRetry] = useState(0);
   const [optOut, setOptOut] = useState<string[]>(() => readOptOut());
   const [chapterLoading, setChapterLoading] = useState(false);
   const [bookLoading, setBookLoading] = useState(false);
@@ -186,6 +200,13 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const idxRef = useRef(0);
   const bookRef = useRef<OpenBook | null>(null);
   const indexRef = useRef<BookIndex | undefined>(undefined);
+  const textMissingRef = useRef<number[]>([]);
+  textMissingRef.current = textMissing;
+  /* Which open owns `chapterLoading`. One sequence for the life of the provider;
+     the rule, and the stuck skeleton it exists to prevent, is in lib/opening.ts. */
+  const openSeqRef = useRef<ReturnType<typeof openSequence> | null>(null);
+  if (!openSeqRef.current) openSeqRef.current = openSequence(setChapterLoading);
+  const openSeq = openSeqRef.current;
   ciRef.current = ci;
   idxRef.current = idx;
   bookRef.current = book;
@@ -284,7 +305,16 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const wasDown = useRef(false);
   useEffect(() => {
     if (conn !== 'online') { wasDown.current = true; return; }
-    if (wasDown.current) { wasDown.current = false; void flush(); }
+    if (!wasDown.current) return;
+    wasDown.current = false;
+    void flush();
+    /* And the other thing a gap leaves behind: parts of the book that could not
+       be saved while it was down. Nothing else would ever ask for them again -
+       the download runs off the book and its index, and neither moves when the
+       network comes back - so a book opened on a plane would stay half here
+       until it was closed and opened again. Only when something is actually
+       missing, so a healthy reconnect is not a download. */
+    if (textMissingRef.current.length) setTextRetry((n) => n + 1);
   }, [conn, flush]);
 
   useEffect(() => {
@@ -349,7 +379,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     idxRef.current = chunk;
     setChunks([]);
     setParas(null);
-    setChapterLoading(true);
+    const attempt = openSeq.begin();
 
     /* The endpoint may always be asked now: `/api/chapter/{ci}?book=` is served
        out of that book's own text bundle, whatever book the session holds. The
@@ -359,16 +389,18 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     const text = await loadChapterText(
       textSources(qc, b.key, target), target, shardOf(indexRef.current, b.key, target),
       !opts.cacheOnly, opts.cacheOnly);
-    // Another chapter (or book) was asked for while this one was in the air.
-    if (bookRef.current !== b || ciRef.current !== target) return false;
+    // Another chapter (or book) was asked for while this one was in the air. It
+    // owns the wait now, so this one paints nothing and releases nothing.
+    if (!attempt.current()) return false;
     if (!text) {
-      // An optimistic miss is not a failure: the real open is still coming.
+      // An optimistic miss is not a failure: the real open is still coming, and
+      // it is the one that owns the flag - see lib/opening.ts.
       if (opts.cacheOnly) return false;
-      setChapterLoading(false);
+      attempt.settle();
       setMessage('this chapter is not on the device');
       return false;
     }
-    setChapterLoading(false);
+    attempt.settle();
     setChunks(text.chunks);
     setParas(text.paras ?? null);
     setChapterTitle(text.title);
@@ -384,7 +416,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     void tellOpen(b.key, target, chunk).catch(() => {});
 
     const manifest = await loadManifest(qc, b.key, target, text.chunks.length);
-    if (bookRef.current !== b || ciRef.current !== target) return true;
+    if (!attempt.current()) return true;
     const downloaded = (await cachedChapters(b.key)).has(target);
     await player?.open({
       key: b.key, ci: target, chunkCount: text.chunks.length, manifest,
@@ -395,7 +427,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     // offline state with different answers.
     void refreshOffline().then(() => trimBehind(b.key, target));
     return true;
-  }, [qc, player, refreshOffline, trimBehind]);
+  }, [qc, player, refreshOffline, trimBehind, openSeq]);
 
   const goChapter = useCallback((d: number) => {
     const next = ciRef.current + d;
@@ -411,7 +443,11 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     let entry: LibEntry | undefined = lib[guessKey];
     let server: LoadResult['position'] = null;
     setBookLoading(true);
-    setChapterLoading(true);
+    /* Opening a book is an open too, and it has to be in the same sequence: it
+       holds the wait until one of its own `openChapter` calls takes it over, and
+       every way out of here has to release it or the reading view keeps its
+       skeleton. */
+    const attempt = openSeq.begin();
     setChunks([]);
     setParas(null);
     setMessage(null);
@@ -468,7 +504,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
       if (!entry) {
         setMessage('offline, and this book was never opened here');
         setBookLoading(false);
-        setChapterLoading(false);
+        attempt.settle();
         return;
       }
     }
@@ -495,11 +531,14 @@ export function NarratorProvider({children}: {children: ReactNode}) {
       const untouched = ciRef.current === fast.chapter && idxRef.current === fast.chunk;
       if (!untouched || (at.chapter === fast.chapter && at.chunk === fast.chunk)) {
         void tellOpen(open.key, ciRef.current, idxRef.current).catch(() => {});
+        // A no-op: the fast open superseded this attempt and already painted.
+        // Here so that every exit from this function releases the wait.
+        attempt.settle();
         return;
       }
     }
     await openChapter(at.chapter, at.chunk);
-  }, [qc, openChapter, refreshOffline]);
+  }, [qc, openChapter, refreshOffline, openSeq]);
 
   /* The table of contents arrives on its own schedule; when it does it carries the
      shard map, which is what makes the rest of the book readable offline. */
@@ -514,27 +553,43 @@ export function NarratorProvider({children}: {children: ReactNode}) {
 
   /* The book's words, taken whole - behind the reading view, never in front of it.
      Cheap next to the audio and the only reason the reader works with no network,
-     but 17 MB of it is not something to stare at a blank screen for. */
+     but 17 MB of it is not something to stare at a blank screen for.
+
+     What comes back is a verdict, not just a count: a run that finished short
+     says which shards it is short of, and that is what the drawer states. Taken
+     without being asked means it has to be honest about what it actually holds. */
   useEffect(() => {
     const k = book?.key;
     if (!k || !index || index.shards <= 0 || optOut.includes(k)) return;
     let alive = true;
     setTextBusy(true);
-    void downloadText(k, index.shards,
-                      (done, total) => { if (alive) setTextProgress({done, total}); },
-                      () => !alive)
-      .then((have) => { if (alive) setTextShards(have); })
+    void downloadText(k, index.shards, {
+      onProgress: (done, total) => { if (alive) setTextProgress({done, total}); },
+      stop: () => !alive,
+    })
+      .then((r) => {
+        if (!alive) return;
+        setTextShards(r.have);
+        // Abandoned is not a verdict - another book is being opened.
+        setTextMissing(r.stopped ? [] : r.missing);
+      })
       .catch(() => undefined)
       .finally(() => { if (alive) { setTextBusy(false); setTextProgress(null); } });
     return () => { alive = false; };
-  }, [book?.key, index, optOut]);
+  }, [book?.key, index, optOut, textRetry]);
 
+  /* Save the words, and the retry for a book that is only partly here: they are
+     the same act, so they are the same button. `optOut` is set to a fresh array
+     whether or not its contents change, because the identity is what re-runs the
+     download effect - and the effect resumes on the missing shards by itself. */
   const saveText = useCallback(() => {
     const k = bookRef.current?.key;
     if (!k) return;
     const next = readOptOut().filter((x) => x !== k);
     writeOptOut(next);
+    setTextMissing([]);
     setOptOut(next);            // re-runs the download effect
+    setTextRetry((n) => n + 1); // ...even when the opt-out list did not change
   }, []);
 
   /**
@@ -658,7 +713,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const value = useMemo<Ctx>(() => ({
     book, chapters, index, ci, chunks, paras, chapterTitle, idx, mode, playing, waiting,
     message, conn, offlineChapters, textShards, textBusy, textProgress, textOptOut,
-    chapterLoading, bookLoading, resumedAt, queued, fontScale,
+    textMissing, chapterLoading, bookLoading, resumedAt, queued, fontScale,
     status: status.data,
     moved, follow, dismissMoved,
     openBook, openChapter, goChapter, setIdx, toggle,
@@ -666,7 +721,8 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     setFontScale, refreshOffline, saveText, dropBook, flush, queueNote, player,
   }), [book, chapters, index, ci, chunks, paras, chapterTitle, idx, mode, playing, waiting,
        message, conn, offlineChapters, textShards, textBusy, textProgress, textOptOut,
-       chapterLoading, bookLoading, resumedAt, queued, fontScale, moved, follow, dismissMoved,
+       textMissing, chapterLoading, bookLoading, resumedAt, queued, fontScale, moved,
+       follow, dismissMoved,
        status.data, openBook, openChapter, goChapter, setIdx, toggle, setFontScale,
        refreshOffline, saveText, dropBook, flush, queueNote, player]);
 

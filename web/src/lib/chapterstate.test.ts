@@ -1,5 +1,5 @@
 import {describe, expect, test} from 'vitest';
-import {chapterState} from './chapterstate';
+import {chapterState, textMark} from './chapterstate';
 import type {ChapRow} from './types';
 
 const row = (p: Partial<ChapRow> = {}): ChapRow => ({
@@ -63,5 +63,35 @@ describe('chapterState - the four things that can have happened', () => {
       chapterState(row(), false, fmt, 'saving'),
     ];
     for (const s of all) expect(s.tip.length).toBeGreaterThan(10);
+  });
+});
+
+/**
+ * The other tier on the row. It appears only as an absence, and what the absence
+ * means depends on whether there is a network standing behind it.
+ */
+describe('textMark - whether this chapter\'s words are on the device', () => {
+  test('the words being here is the norm, so it says nothing at all', () => {
+    expect(textMark(true, true)).toBeNull();
+    expect(textMark(true, false)).toBeNull();
+  });
+
+  test('not knowing is not the same as not having', () => {
+    expect(textMark(null, true)).toBeNull();
+    expect(textMark(null, false)).toBeNull();
+  });
+
+  test('online, missing words are a fetch away: quiet, in the text tier\'s own icon', () => {
+    const m = textMark(false, true);
+    expect(m).toMatchObject({icon: 'text', tone: 'none'});
+    expect(m?.tip).toMatch(/not in the saved text/);
+  });
+
+  test('offline they are what stands between the reader and the chapter', () => {
+    const m = textMark(false, false);
+    expect(m).toMatchObject({icon: 'no-network', tone: 'part'});
+    // "may not open", never "cannot": a chapter read before the network went
+    // away is in the chapter cache and opens whatever its shard did.
+    expect(m?.tip).toMatch(/may not open/);
   });
 });

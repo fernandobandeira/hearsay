@@ -1,5 +1,7 @@
 import {describe, expect, test, vi} from 'vitest';
-import {loadChapterText, shardOf, type ChapterWords, type TextSources} from './chaptertext';
+import {
+  chaptersWithText, loadChapterText, shardOf, type ChapterWords, type TextSources,
+} from './chaptertext';
 import type {BookIndex, TextShard} from './types';
 
 const index = (key: string): BookIndex => ({
@@ -40,6 +42,37 @@ describe('shardOf - where a chapter\'s words live', () => {
     expect(shardOf(index('lom'), 'lom', 999)).toBeNull();
     const noShard = {...index('lom'), chapters: [{i: 0, title: 'One', n: 3, est_min: 4}]};
     expect(shardOf(noShard, 'lom', 0)).toBeNull();
+  });
+});
+
+/**
+ * Which rows in the chapter drawer are a dead tap, and which are not.
+ *
+ * A shard that never made it onto the device takes every chapter in it with it -
+ * a hundred-odd at a time on the big novel - and nothing in the reader said so.
+ */
+describe('chaptersWithText - the words this device can actually produce', () => {
+  test('a chapter is readable when the shard holding it is here', () => {
+    expect(chaptersWithText(index('lom'), 'lom', new Set([0])))
+      .toEqual(new Set([0, 1]));
+    expect(chaptersWithText(index('lom'), 'lom', new Set([0, 1])))
+      .toEqual(new Set([0, 1, 576]));
+  });
+
+  test('no shards is an empty answer, not a null one: it is known, and it is none', () => {
+    expect(chaptersWithText(index('lom'), 'lom', new Set())).toEqual(new Set());
+  });
+
+  test("an index that cannot say says null, and a row must not guess from it", () => {
+    expect(chaptersWithText(undefined, 'lom', new Set([0]))).toBeNull();
+    // Another book's index maps shards to entirely the wrong words.
+    expect(chaptersWithText(index('sapiens'), 'lom', new Set([0]))).toBeNull();
+  });
+
+  test('a chapter the index carries without a shard is never claimed', () => {
+    const partial = {...index('lom'),
+                     chapters: [{i: 0, title: 'One', n: 3, est_min: 4}]};
+    expect(chaptersWithText(partial, 'lom', new Set([0]))).toEqual(new Set());
   });
 });
 

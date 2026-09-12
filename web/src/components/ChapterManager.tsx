@@ -27,8 +27,8 @@
  */
 import {useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState} from 'react';
 import {
-  Check, CircleDashed, Clock, Download, FileAudio, HardDriveDownload, Loader2,
-  PieChart, Trash2, Type,
+  Check, CircleDashed, Clock, CloudOff, Download, FileAudio, HardDriveDownload, Loader2,
+  PieChart, RotateCw, Trash2, Type,
 } from 'lucide-react';
 import {Button} from '@/components/ui/button';
 import {Input} from '@/components/ui/input';
@@ -38,7 +38,8 @@ import {Skeleton} from '@/components/ui/skeleton';
 import {useQueryClient} from '@tanstack/react-query';
 import {fetchChapters, keys, useChapterActions, useChapters} from '@/lib/api';
 import {KEEP_BEHIND} from '@/lib/autotrim';
-import {chapterState, type ChapterStateKey, type Job} from '@/lib/chapterstate';
+import {chapterState, textMark, type ChapterStateKey, type Job, type TextMark} from '@/lib/chapterstate';
+import {chaptersWithText} from '@/lib/chaptertext';
 import {
   anyEstimated, buildVerdict, estimateBytes, isAction, jobFor, needsRender, phaseFor,
   renderAccepted, rowSignature, shouldReask,
@@ -60,6 +61,8 @@ const TONE = {
   ok: 'text-ok', work: 'text-work', part: 'text-part',
   done: 'text-foreground/50', none: 'text-muted-foreground/80',
 } as const;
+/** The text tier's two marks - see lib/chapterstate.ts's `textMark`. */
+const TEXT_ICON: Record<TextMark['icon'], typeof Type> = {text: Type, 'no-network': CloudOff};
 
 /** How long a single chapter may sit on one rung before we give up on it. */
 const RUNG_TIMEOUT_MS = 45 * 60_000;
@@ -100,6 +103,15 @@ export function ChapterManager({open, active, onPick}: {
   const hits = useMemo(
     () => rows.filter((r) => !filter || r.title.toLowerCase().includes(filter.toLowerCase())),
     [rows, filter]);
+
+  /* Which chapters' words are actually on this device.
+     This half of the row comes from the device alone - the index in Cache
+     Storage and the shards beside it - which is the point: offline the server
+     half of a row is simply absent, and "not rendered" is the only thing the
+     old row could say about a chapter that cannot even be read. */
+  const wordsHere = useMemo(
+    () => chaptersWithText(n.index, book ?? '', n.textShards), [n.index, book, n.textShards]);
+  const connected = n.conn !== 'offline';
 
   /* Which rows the current mode may act on. Download skips what is already
      here; remove can only touch what is. Threaded into every selection event so
@@ -325,12 +337,32 @@ export function ChapterManager({open, active, onPick}: {
         {/* Only the opt-in half lives here now. Giving the words back belongs to
             the book rather than to this drawer - on the Books list it can take
             the downloaded chapters with it in one act, and it can reach a book
-            that is not open, which this level never could. */}
+            that is not open, which this level never could.
+
+            The same button is the retry, and a stalled download is stated as a
+            retry rather than as an error. That is a decision, not a shrug: a
+            missing shard is a book that is partly here, not a fault - it heals
+            on the next reconnect by itself (state.tsx watches for that) and a
+            red error for something already fixing itself is noise on the one
+            surface that also has to say useful things. What was genuinely wrong
+            before was silence: the row said "text 7/12" whether the download was
+            still working or had given up on part of the book hours ago, with
+            nothing to press. So the count stays, the word "retry" appears only
+            when it has actually stopped short, and the tooltip says how much of
+            the book that is. The per-chapter marks in the list below say
+            *which* chapters, which is the part that decides a tap. */}
         {(n.textOptOut || (!textDone && !n.textBusy)) && (
           <button data-testid="text-save" onClick={() => n.saveText()}
-                  title="Keep the whole book's words on this device"
-                  className="shrink-0 rounded p-1 text-muted-foreground/70 transition-colors hover:text-foreground">
-            <HardDriveDownload className="size-3" />
+                  data-incomplete={n.textMissing.length ? '1' : undefined}
+                  title={n.textMissing.length
+                    ? `${n.textMissing.length} of ${shards} parts of the text could not be saved`
+                      + ' — the chapters in them may not open with no network. Tap to finish.'
+                    : "Keep the whole book's words on this device"}
+                  className="flex shrink-0 items-center gap-0.5 rounded p-1 text-muted-foreground/70
+                             transition-colors hover:text-foreground">
+            {n.textMissing.length
+              ? <><RotateCw className="size-3" />retry</>
+              : <HardDriveDownload className="size-3" />}
           </button>
         )}
         <span data-testid="audio-state"
@@ -375,6 +407,8 @@ export function ChapterManager({open, active, onPick}: {
           {hits.map((r) => {
             const s = chapterState(r, n.offlineChapters.has(r.i), fmtBytes, jobs[r.i]);
             const Icon = ICON[s.key];
+            const mark = textMark(wordsHere ? wordsHere.has(r.i) : null, connected);
+            const MarkIcon = mark ? TEXT_ICON[mark.icon] : null;
             const picked = sel.picked.has(r.i);
             const can = !sel.verb || eligible.includes(r.i);
             return (
@@ -387,7 +421,9 @@ export function ChapterManager({open, active, onPick}: {
                 title={sel.verb
                   ? can ? `tap to ${sel.verb === 'remove' ? 'remove' : 'download'} this chapter`
                         : sel.verb === 'remove' ? 'not on this device' : 'already on this device'
-                  : s.tip}
+                  // Whichever tier is the news. A chapter whose words are not
+                  // here outranks anything the audio state has to say about it.
+                  : mark ? `${mark.tip}\n${s.tip}` : s.tip}
                 onClick={() => sel.verb
                   ? dispatch({t: 'toggle', ci: r.i, eligible})
                   : onPick(r.i)}
@@ -411,6 +447,15 @@ export function ChapterManager({open, active, onPick}: {
                   </span>
                 )}
                 <span className="min-w-0 flex-1 truncate font-light">{r.title}</span>
+                {/* The text tier, and only when it has something to say: the
+                    words of this chapter are not in the copy on this device. */}
+                {mark && MarkIcon && (
+                  <span data-testid="chapter-text-mark"
+                        data-mark={mark.icon}
+                        className={cn('flex shrink-0 items-center', TONE[mark.tone])}>
+                    <MarkIcon className="size-3" aria-label={mark.tip} />
+                  </span>
+                )}
                 <span data-testid="chapter-state"
                       className={cn('flex shrink-0 items-center gap-1 text-[10px] tabular-nums tracking-wide',
                                     TONE[s.tone])}>

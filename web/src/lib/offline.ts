@@ -12,7 +12,10 @@
  *          network at all, on chapters that have never been rendered.
  *   audio  per chapter, explicit, tens of MB each. Always the second step.
  */
-import {chapterAudioUrl, chapterManifestUrl, chapterTextUrl, bookIndexUrl, textShardUrl} from './api';
+import {
+  ApiError, chapterAudioUrl, chapterManifestUrl, chapterTextUrl, bookIndexUrl, textShardUrl,
+} from './api';
+import {delayFor, isRetryable, MAX_RETRIES, statusOf} from './backoff';
 
 export const AUDIO_CACHE = 'narrator-audio';   // must match the Workbox rule
 export const TEXT_CACHE = 'narrator-text';     // book.json + the shards
@@ -110,38 +113,115 @@ export async function cachedShards(key: string | null): Promise<Set<number>> {
   return out;
 }
 
+/** What a whole-book text download actually achieved. */
+export interface TextSave {
+  /** the shards on this device now - asked of Cache Storage, never counted */
+  have: Set<number>;
+  /** the ones that are still not, after every retry the policy allows */
+  missing: number[];
+  /** how many there are altogether */
+  shards: number;
+  /**
+   * Abandoned by `stop()` rather than finished. `missing` is then a snapshot of
+   * where it got to, not a verdict on the book - another book is being opened
+   * and what this one is short of is nobody's news.
+   */
+  stopped: boolean;
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** The shards of a book that this device does not hold, in order. */
+const absent = (have: ReadonlySet<number>, shards: number): number[] => {
+  const out: number[] = [];
+  for (let s = 0; s < shards; s++) if (!have.has(s)) out.push(s);
+  return out;
+};
+
 /**
  * Take the whole book's words, in the background.
  *
- * The index plus every shard, one at a time, with a callback so the drawer can
- * show it happening. Shards already held are skipped, so this is safe to call on
- * every open - and `stop` lets it be abandoned the moment another book is opened
- * or the reader opts out, because 17 MB of a 1433-chapter novel is not something
- * to keep fetching for a book nobody is reading any more.
+ * The index plus every shard, with a callback so the drawer can show it
+ * happening. Shards already held are skipped, so this is safe to call on every
+ * open - and `stop` lets it be abandoned the moment another book is opened or
+ * the reader opts out, because 17 MB of a 1433-chapter novel is not something to
+ * keep fetching for a book nobody is reading any more.
  *
  * Nothing waits on this. The chapter in front of the eyes comes from its own
  * endpoint; this is the copy that makes the *rest* of the book work with no
  * network at all.
+ *
+ * **One shard's failure is not the book's.** This used to be a plain loop with
+ * an unguarded `await put(...)` in it, so the first tunnel blip threw straight
+ * out of the whole download and every later shard was simply never asked for.
+ * The caller swallowed it, so the drawer sat at "7 of 12" with no error and no
+ * retry, every later open resumed and stopped at the same shard, and on the
+ * 1433-chapter novel that left most of the book unreadable with no network -
+ * while the chapters either side of the reader, whose shard was saved long ago,
+ * kept working perfectly. That asymmetry is what the bug looked like from the
+ * outside: the navbar arrows worked and the chapter drawer did not.
+ *
+ * So each shard is attempted on its own, failures are collected rather than
+ * thrown, and the collection is retried in rounds on the reader's one retry
+ * curve (lib/backoff.ts - same base, same factor, same five attempts as every
+ * request). A failure that will fail the same way next time (a 404, a 400) is
+ * not retried at all; only the round waits, so a bad shard never holds up a
+ * good one. The result says what is actually held, which is what makes the
+ * drawer able to be honest about a book taken without being asked.
  */
 export async function downloadText(
   key: string,
   shards: number,
-  onProgress?: (done: number, total: number) => void,
-  stop?: () => boolean,
-): Promise<Set<number>> {
+  opts: {
+    onProgress?: (done: number, total: number) => void;
+    stop?: () => boolean;
+    /** the pause between rounds; injected by the tests, the shared curve otherwise */
+    wait?: (attempt: number) => Promise<void>;
+  } = {},
+): Promise<TextSave> {
+  const {onProgress, stop} = opts;
+  const wait = opts.wait ?? ((attempt: number) => sleep(delayFor(attempt)));
   const c = await open(TEXT_CACHE);
-  if (!c) return new Set();
-  let have = await cachedShards(key);
+  const have = await cachedShards(key);
+  const gaveUp = (missing: number[]): TextSave =>
+    ({have, missing: [...missing].sort((a, b) => a - b), shards, stopped: true});
+  if (!c) return {have, missing: absent(have, shards), shards, stopped: false};
   onProgress?.(have.size, shards);
-  await put(c, bookIndexUrl(key)).catch(() => 0);
-  for (let s = 0; s < shards; s++) {
-    if (stop?.()) return have;
-    if (have.has(s)) { onProgress?.(have.size, shards); continue; }
-    await put(c, textShardUrl(key, s));
-    have = await cachedShards(key);
-    onProgress?.(have.size, shards);
+
+  // The index is in the rounds too: without it nothing can say which shard holds
+  // a chapter, so a book with every shard and no index is still not readable.
+  // "Settled" rather than "saved", because a 404 is an answer as much as a 200 is
+  // and neither is worth five more asks.
+  let indexSettled = false;
+  let todo = absent(have, shards);
+  for (let round = 0; ; round++) {
+    if (!indexSettled) indexSettled = await put(c, bookIndexUrl(key))
+      .then(() => true, (e: unknown) => !isRetryable(statusOf(e)));
+    const failed: number[] = [];
+    for (let i = 0; i < todo.length; i++) {
+      if (stop?.()) return gaveUp([...failed, ...todo.slice(i)]);
+      const s = todo[i];
+      try {
+        await put(c, textShardUrl(key, s));
+        have.add(s);
+      } catch (e) {
+        // Worth asking again, or answered for good? A 404 shard means the bundle
+        // was rebuilt with a different shape, and five more asks will say so.
+        if (isRetryable(statusOf(e))) failed.push(s);
+      }
+      onProgress?.(have.size, shards);
+    }
+    todo = failed;
+    if ((indexSettled && !todo.length) || round >= MAX_RETRIES) break;
+    if (stop?.()) return gaveUp(todo);
+    await wait(round);
   }
-  return have;
+
+  // The verdict comes from Cache Storage rather than from the bookkeeping above:
+  // a quota eviction during the download is exactly the case where counting what
+  // was stored and asking what is stored give different answers.
+  const held = await cachedShards(key);
+  return {have: held, missing: absent(held, shards), shards, stopped: false};
 }
 
 /**
@@ -269,7 +349,9 @@ export async function requestPersistence(): Promise<boolean> {
  */
 async function put(c: Cache, url: string): Promise<number> {
   const res = await fetch(url, {cache: 'no-store'});
-  if (!res.ok) throw new Error(`${url.split('?')[0]} → ${res.status}`);
+  // ApiError rather than Error, so the retry policy can read the status off it:
+  // a 503 is a blip worth repeating and a 404 is an answer. See lib/backoff.ts.
+  if (!res.ok) throw new ApiError(res.status, `${url.split('?')[0]} → ${res.status}`);
   if (res.headers.get('content-encoding')) {
     const body = await res.blob();
     const headers = new Headers(res.headers);
