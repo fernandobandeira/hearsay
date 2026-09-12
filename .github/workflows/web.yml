@@ -17,6 +17,14 @@ on:
       - '.github/workflows/web.yml'
   workflow_dispatch:
 
+# One run per branch. Fernando pushes in bursts (seventeen runs in three hours
+# on 2026-09-11); without this a superseded push keeps a free amd64 runner, a
+# free arm64 runner and a four-minute cache export busy for nothing, and two
+# runs race to write the same buildx cache scope.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   packages: write
