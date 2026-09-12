@@ -22,9 +22,9 @@ import {
 } from 'react';
 import {onlineManager, useQueryClient} from '@tanstack/react-query';
 import {
-  awaitedRetry, bookIndexUrl, chapterManifestUrl, chapterTextUrl, keys, get, loadBook,
-  openChapter as tellOpen, reportPlayhead, tellPause, tellResume, textShardUrl, useBookIndex,
-  useStatus,
+  awaitedRetry, bookIndexUrl, chapterManifestUrl, chapterTextUrl, fetchChapters, keys, get,
+  loadBook, openChapter as tellOpen, reportPlayhead, tellPause, tellResume, textShardUrl,
+  useBookIndex, useStatus,
 } from './lib/api';
 import {loadChapterText, shardOf, type TextSources} from './lib/chaptertext';
 import {
@@ -34,8 +34,9 @@ import {isSane, type Manifest} from './lib/manifest';
 import {openSequence} from './lib/opening';
 import {Player, type PlayMode} from './lib/player';
 import {
-  bookKey, cachedChapters, cachedShards, downloadText, removeBook, removeChapter,
+  bookKey, cachedChapters, cachedShards, downloadChapter, downloadText, removeBook, removeChapter,
 } from './lib/offline';
+import {reconcile} from './lib/reconcile';
 import {chaptersToTrim, furthestReached, KEEP_BEHIND} from './lib/autotrim';
 import {clampResume, resolveResume, type Resume} from './lib/resume';
 import * as db from './lib/db';
@@ -108,6 +109,13 @@ interface Ctx {
   nudge: (s: number) => void;
   setFontScale: (n: number) => void;
   refreshOffline: () => Promise<void>;
+  /**
+   * Catch up on downloads the server finished while this device was away - see
+   * lib/reconcile.ts. Runs itself on every way back into the app; exposed so a
+   * finished download run can settle its own pending record through the same
+   * code path rather than a second one.
+   */
+  sweepDownloads: () => Promise<void>;
   saveText: () => void;
   /** Give a whole book back: its words and every chapter downloaded for it. */
   dropBook: (key: string) => Promise<void>;
@@ -341,6 +349,66 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     setOfflineChapters(await cachedChapters(k));
     setTextShards(await cachedShards(k));
   }, []);
+
+  /**
+   * The foreground reconciliation sweep - lib/reconcile.ts, bound to this app.
+   *
+   * A download is two halves and only one of them can happen here. The server
+   * takes the order (`pack: true`) and finishes it whatever happens to this
+   * device, restart included; copying the m4a into Cache Storage is the device's
+   * half, and iOS suspends the device's half within seconds of the screen going
+   * off. So every way back into the app asks the one question that closes the
+   * gap: of the chapters still pending, which are packed and not here yet?
+   *
+   * Guarded against overlapping runs rather than queued: two sweeps would fetch
+   * the same chapters twice, and the second one's answer is the same as the
+   * first's by the time it lands.
+   */
+  const sweeping = useRef(false);
+  const sweepDownloads = useCallback(async () => {
+    if (sweeping.current) return;
+    sweeping.current = true;
+    try {
+      const out = await reconcile({
+        pending: db.allDownloads,
+        rows: async (key) => (await fetchChapters(key)).chapters,
+        stored: cachedChapters,
+        fetchChapter: downloadChapter,
+        save: db.putDownload,
+        drop: db.deleteDownload,
+      });
+      if (out.some((b) => b.fetched.length)) {
+        await refreshOffline();
+        void qc.invalidateQueries({queryKey: keys.chapters});
+      }
+    } catch {
+      // A sweep that cannot run is a sweep that runs on the next way in. There
+      // is nothing to report: the pending record is untouched.
+    } finally {
+      sweeping.current = false;
+    }
+  }, [refreshOffline, qc]);
+
+  /* Every way back in. `visibilitychange` and `focus` are the app being opened
+     or switched to, the online manager is the network returning, and the call
+     below is the app *starting* - a cold launch after the phone killed the tab
+     mid-download, which is the case this whole thing exists for. The other
+     trigger is `hello` off the live stream; it is in `onHello`, because a
+     reconnect is a gap whether or not the tab was ever hidden. */
+  useEffect(() => {
+    const go = () => {
+      if (document.visibilityState === 'visible') void sweepDownloads();
+    };
+    document.addEventListener('visibilitychange', go);
+    window.addEventListener('focus', go);
+    const un = onlineManager.subscribe((online) => { if (online) void sweepDownloads(); });
+    void sweepDownloads();
+    return () => {
+      document.removeEventListener('visibilitychange', go);
+      window.removeEventListener('focus', go);
+      un();
+    };
+  }, [sweepDownloads]);
 
   /**
    * Give back the chapters he has left behind.
@@ -674,6 +742,12 @@ export function NarratorProvider({children}: {children: ReactNode}) {
      must not turn into a load per reconnect. */
   const healedAt = useRef(0);
   const onHello = useCallback((ev: HelloEvent) => {
+    /* A `hello` is the stream saying "this connection is new", which on a
+       reconnect means a gap - and a gap is exactly when the server finished
+       packing chapters this device asked for and nobody was here to store them.
+       Unconditional, and cheap when there is nothing pending: one IndexedDB
+       read. */
+    void sweepDownloads();
     const b = bookRef.current;
     if (!b || !lostSession(ev, {key: b.key})) return;
     const now = Date.now();
@@ -686,7 +760,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
       // And where he actually is, or it renders ahead of chapter one.
       void tellOpen(b.key, ciRef.current, idxRef.current).catch(() => {});
     })();
-  }, [qc]);
+  }, [qc, sweepDownloads]);
 
   useEffect(() => connectLive(qc, {
     onState: setLive,
@@ -718,13 +792,13 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     moved, follow, dismissMoved,
     openBook, openChapter, goChapter, setIdx, toggle,
     nudge: (s: number) => player?.nudge(s),
-    setFontScale, refreshOffline, saveText, dropBook, flush, queueNote, player,
+    setFontScale, refreshOffline, sweepDownloads, saveText, dropBook, flush, queueNote, player,
   }), [book, chapters, index, ci, chunks, paras, chapterTitle, idx, mode, playing, waiting,
        message, conn, offlineChapters, textShards, textBusy, textProgress, textOptOut,
        textMissing, chapterLoading, bookLoading, resumedAt, queued, fontScale, moved,
        follow, dismissMoved,
        status.data, openBook, openChapter, goChapter, setIdx, toggle, setFontScale,
-       refreshOffline, saveText, dropBook, flush, queueNote, player]);
+       refreshOffline, sweepDownloads, saveText, dropBook, flush, queueNote, player]);
 
   // A handle for the dev console and for driving the reader from a headless
   // browser. Dev only: the production bundle has no such door.

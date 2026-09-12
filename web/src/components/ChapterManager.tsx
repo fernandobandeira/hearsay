@@ -48,6 +48,7 @@ import {
 import {centeredScrollTop, scrollTargetIndex} from '@/lib/drawernav';
 import {chosen, idle, rangeAfter, reduce} from '@/lib/selection';
 import {cachedChapters, downloadChapter} from '@/lib/offline';
+import * as db from '@/lib/db';
 import {bytes as fmtBytes} from '@/lib/format';
 import {cn} from '@/lib/utils';
 import {useNarrator} from '@/state';
@@ -208,15 +209,28 @@ export function ChapterManager({open, active, onPick}: {
     try {
       let fresh = await poll().catch(() => rows);
       const held = await cachedChapters(key);
+      /* What was asked for, written down before anything is asked of the server.
+         This ladder is a foreground process and the phone will suspend it: the
+         record in IndexedDB is what lets the next foreground finish the job
+         (lib/reconcile.ts), and it has to exist before the first await or a
+         selection confirmed as the screen locks is a selection nobody remembers. */
+      await db.addDownload({
+        key, path: n.book?.path, chapters: cis.filter((ci) => !held.has(ci)), ts: Date.now(),
+      }).catch(() => {});
+
       const toRender = needsRender(fresh.filter((r) => cis.includes(r.i)), held);
-      // The whole selection's renders go up in one call, and the queue that
-      // comes back is the receipt each chapter's loop starts from.
+      /* The whole selection's renders go up in one call, and the queue that
+         comes back is the receipt each chapter's loop starts from. `pack: true`
+         is the other half: it makes the call a standing order the server
+         finishes on its own, so the rungs below are a *fast path* for an app
+         that stays open rather than the only way a chapter ever gets packed. */
       let queued: RenderResult | null = null;
       if (toRender.length) {
         for (const ci of toRender) job(ci, 'queued');
-        queued = await actions.render.mutateAsync(toRender).catch((e: unknown) => {
-          throw new Error(`could not queue the render: ${msg(e)}`);
-        });
+        queued = await actions.render.mutateAsync({chapters: toRender, pack: true})
+          .catch((e: unknown) => {
+            throw new Error(`could not queue the render: ${msg(e)}`);
+          });
       }
 
       for (const ci of cis) {
@@ -249,7 +263,8 @@ export function ChapterManager({open, active, onPick}: {
               break;
             }
             if (phase === 'queue-render' && shouldReask({acked: ack.render, ...still})) {
-              ack.render = renderAccepted(await actions.render.mutateAsync([ci]), ci);
+              ack.render = renderAccepted(
+                await actions.render.mutateAsync({chapters: [ci], pack: true}), ci);
               changedAt = Date.now();
             }
             if (phase === 'request-pack' && shouldReask({acked: ack.pack, ...still})) {
@@ -278,6 +293,11 @@ export function ChapterManager({open, active, onPick}: {
       setErr(msg(e));
     } finally {
       await n.refreshOffline();
+      /* What this run stored comes off the pending record, and anything it did
+         not reach stays on it. Through the sweep rather than a second bit of
+         bookkeeping here, so there is exactly one answer to "what is still
+         wanted" and it is computed from Cache Storage either way. */
+      await n.sweepDownloads();
       setRunning(false);
     }
   }

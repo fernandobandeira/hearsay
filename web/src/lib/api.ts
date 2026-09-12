@@ -232,9 +232,20 @@ export function useChapterActions(book: string | null) {
   const bump = () => void qc.invalidateQueries({queryKey: keys.chapters});
   const on = book ?? undefined;
   return {
-    render: useMutation<RenderResult, Error, number[]>({
-      mutationFn: (chapters) =>
-        call(sdk.chaptersRender({body: {chapters, book: on}})),
+    /**
+     * Queue renders, and - with `pack` - leave a standing order to pack each one
+     * as it completes.
+     *
+     * `pack: true` is what makes a download survive the app being closed. Without
+     * it the server renders all night and packs nothing, because packing was the
+     * client's move and iOS suspends the client seconds after the screen goes
+     * off. With it the server chains render -> pack itself and writes the order
+     * to disk, so a restart does not cancel it either. See src/intents.rs and
+     * lib/reconcile.ts, which is the device half of the same promise.
+     */
+    render: useMutation<RenderResult, Error, {chapters: number[]; pack?: boolean}>({
+      mutationFn: ({chapters, pack}) =>
+        call(sdk.chaptersRender({body: {chapters, pack, book: on}})),
       onSuccess: bump,
     }),
     build: useMutation<BuildResult, Error, number[]>({
