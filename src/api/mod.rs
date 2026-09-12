@@ -368,6 +368,69 @@ pub fn router(state: Arc<AppState>) -> (axum::Router, utoipa::openapi::OpenApi) 
     (app, spec)
 }
 
+// ------------------------------------------------------- serving the reader
+// A deploy has to be visible on the *first* relaunch of the PWA, and without an
+// explicit `Cache-Control` it is not. tower-http's ServeDir sets `last-modified`
+// and nothing about freshness, which leaves every response heuristically
+// cacheable: WebKit then reuses a stored copy for a fraction of its
+// last-modified age with no request at all. That bit for real — a reader fix
+// shipped, the box laid the new build down correctly, and the iPhone kept
+// painting the old layout, because the two files that bootstrap everything
+// (`index.html` and `sw.js`) were both being served out of the phone's cache.
+// A stale `sw.js` is the worse half: the service worker is what would have
+// noticed the new build, so a stale one cannot update itself.
+//
+// So the split, decided on the request path because that is where the name is
+// known before anything has been opened:
+//
+// - `assets/*` is Vite's hashed build output (`index-uhN6I5NN.js`). The name
+//   changes when the bytes do, so a year and `immutable` are free and correct —
+//   that is the entire point of content hashing, and it keeps the expensive
+//   half of the shell off the wire.
+// - Everything else — `index.html` and every SPA fallback path (which is most
+//   of the site, the PWA launching at `/` included), `sw.js`, `registerSW.js`,
+//   `workbox-*.js`, the manifest, the icons — is `no-cache`: *store it, but ask
+//   before using it*. The revalidation is a 304 of a few hundred bytes and it is
+//   what makes a deploy land immediately. Not `no-store`, which would forbid
+//   keeping the shell at all and take the offline reader with it.
+
+/// The `Cache-Control` a path under the reader should carry.
+fn web_cache_control(path: &str) -> header::HeaderValue {
+    if is_hashed_asset(path) {
+        header::HeaderValue::from_static("public, max-age=31536000, immutable")
+    } else {
+        header::HeaderValue::from_static("no-cache")
+    }
+}
+
+/// Is this one of Vite's content-hashed build assets?
+///
+/// `assets/<name>-<hash><ext>`, the hash being eight characters of rollup's
+/// base64url alphabet. The hash is checked rather than assumed from the
+/// directory, and the check is deliberately biased: a hashed file this fails to
+/// recognise merely revalidates, while an *un*hashed file pinned for a year is a
+/// stale reader nothing on the device can fix.
+fn is_hashed_asset(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/assets/") else {
+        return false;
+    };
+    let name = rest.rsplit('/').next().unwrap_or(rest);
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    if ext.is_empty() {
+        return false;
+    }
+    // Counted from the end, so a hash that happens to contain a `-` still lines
+    // up against the separator.
+    let b = stem.as_bytes();
+    b.len() >= 9
+        && b[b.len() - 9] == b'-'
+        && b[b.len() - 8..]
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'-')
+}
+
 /// `GET /` and everything else falls through to the built reader.
 fn web_service(dir: &std::path::Path) -> axum::routing::MethodRouter {
     let dir = dir.to_path_buf();
@@ -378,13 +441,29 @@ fn web_service(dir: &std::path::Path) -> axum::routing::MethodRouter {
     axum::routing::any_service(tower::service_fn(move |req: Request| {
         let mut serve = serve.clone();
         let index = index.clone();
+        // Read off the request, before the response exists: the SPA fallback
+        // answers an unknown path with index.html, so by the time there is a
+        // response there is nothing left to say which file was asked for.
+        let cache = web_cache_control(req.uri().path());
         async move {
             if !index.exists() {
                 return Ok::<_, std::convert::Infallible>(not_built());
             }
             use tower::ServiceExt;
             match ServiceExt::<Request>::oneshot(&mut serve, req).await {
-                Ok(r) => Ok(r.into_response()),
+                Ok(r) => {
+                    let mut r = r.into_response();
+                    // Insert, never overwrite — if the inner service ever grows
+                    // an opinion of its own (this tower-http has none), it knows
+                    // more about that file than a path prefix does. Applied to
+                    // whatever came back, so the 304s and 206s carry it too: a
+                    // header only on the 200 would be a header the client stops
+                    // seeing the moment caching starts working.
+                    r.headers_mut()
+                        .entry(header::CACHE_CONTROL)
+                        .or_insert(cache);
+                    Ok(r)
+                }
                 Err(_) => Ok(not_built()),
             }
         }
@@ -420,5 +499,49 @@ mod tests {
         // An unknown unit is ignored, not rejected.
         assert_eq!(parse_range("items=0-5", 100), None);
         assert_eq!(parse_range("nonsense", 100), None);
+    }
+
+    #[test]
+    fn only_vites_hashed_output_is_pinned_forever() {
+        // The three files a real `npm run build` puts in web/dist/assets.
+        for p in [
+            "/assets/index-uhN6I5NN.js",
+            "/assets/index-CO5pRAZL.css",
+            "/assets/flush-5A8NmuWf.js",
+        ] {
+            assert!(is_hashed_asset(p), "{p} should be immutable");
+        }
+        // A hash carrying base64url's own `-` still lines up, because the
+        // separator is found by counting back from the extension.
+        assert!(is_hashed_asset("/assets/index-CO5p-AZL.js"));
+        // Everything the shell is made of, and anything under assets/ that does
+        // not actually carry a hash: a revalidation, not a year.
+        for p in [
+            "/",
+            "/index.html",
+            "/sw.js",
+            "/registerSW.js",
+            "/workbox-c85e56c8.js",
+            "/manifest.webmanifest",
+            "/icon-512.png",
+            "/some/deep/route",
+            "/assets/logo.svg",
+            "/assets/index.js",
+            "/assets/index-short.js",
+            "/assets/noextension",
+            "/assets/index-uhN6I5NN.js.map",
+        ] {
+            assert!(!is_hashed_asset(p), "{p} should not be immutable");
+        }
+    }
+
+    #[test]
+    fn the_shell_revalidates_and_the_assets_do_not() {
+        assert_eq!(web_cache_control("/"), "no-cache");
+        assert_eq!(web_cache_control("/sw.js"), "no-cache");
+        assert_eq!(
+            web_cache_control("/assets/index-uhN6I5NN.js"),
+            "public, max-age=31536000, immutable"
+        );
     }
 }
