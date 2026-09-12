@@ -4,16 +4,18 @@
  * Two things changed after the phone review, and both were about the list being
  * the point and everything around it being in the way.
  *
- * **The two tiers are one line.** They used to be two bordered cards with a
- * label, a sentence and a badge each - 133 px of a 852 px screen, restating per
- * book what every chapter row already says per chapter. They are now one line
- * of small print: what the text copy costs, its save affordance, and how many
- * chapters are on the device. (Giving a copy *back* is the Books list's job now:
- * it takes the words and every downloaded chapter in one act, for any book this
- * device holds, open or not.) The caption explaining the verbs, the
- * "server has 2.5h of 331.3h rendered" line and the text-size row all went with
- * them; text size lives in the top bar's `T` now, and the pipeline figures live
- * in the diagnostics corner at the bottom of the Books level.
+ * **Nothing above the list but the filter.** It used to carry two bordered
+ * cards, then one line of small print - what the text copy weighs, how many
+ * chapters are on the device, and a caption saying that chapters far behind the
+ * playhead are trimmed - and every one of those restated per book what a
+ * chapter row already says per chapter, on the one screen that is *about* those
+ * rows. They are gone: book name, filter, list. The hairline under the filter
+ * while the words are downloading is what is left, because it is the only one of
+ * them that says something is happening right now. Text size lives in the top
+ * bar's `T`, the pipeline figures live in the diagnostics corner at the bottom
+ * of the Books level, and giving a copy back - the words and every downloaded
+ * chapter in one act, for any book this device holds, open or not - is the Books
+ * list's job.
  *
  * **Download is one action and selection is a mode.** "Render" is gone from the
  * UI entirely - see lib/download.ts. Nobody wants a rendered chapter they

@@ -7,3 +7,8 @@ node_modules
 scripts/golden/.venv
 /scripts/client/node_modules
 /scripts/client/package-lock.json
+
+# Agent scratch: worktrees and local settings, never part of the image or the
+# history. A nested checkout under .claude/worktrees is a working copy, not a
+# change to this one.
+.claude/
