@@ -112,8 +112,7 @@ fn is_safe_id(s: &str) -> bool {
         && s.len() <= ID_MAX
         && s != "."
         && s != ".."
-        && s
-            .chars()
+        && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
@@ -254,10 +253,8 @@ impl Job {
             // job. Degrading beats a panic on the one path that must not lose a
             // memo.
             None => {
-                let (_, rx) = watch::channel(Some(Err(Failed::new(
-                    500,
-                    "note job was already finished",
-                ))));
+                let (_, rx) =
+                    watch::channel(Some(Err(Failed::new(500, "note job was already finished"))));
                 return Waiter(rx);
             }
         };
@@ -330,9 +327,9 @@ pub struct Waiter(watch::Receiver<Option<Outcome>>);
 impl Waiter {
     pub async fn wait(mut self) -> Outcome {
         match self.0.wait_for(|v| v.is_some()).await {
-            Ok(v) => v.clone().unwrap_or_else(|| {
-                Err(Failed::new(500, "the note task ended without a result"))
-            }),
+            Ok(v) => v
+                .clone()
+                .unwrap_or_else(|| Err(Failed::new(500, "the note task ended without a result"))),
             // The sender is gone without a value. `Drop` makes this unreachable;
             // a 500 keeps the recording queued if it ever happens anyway.
             Err(_) => Err(Failed::new(500, "the note task ended without a result")),

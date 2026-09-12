@@ -102,11 +102,8 @@ async fn a_client_that_stops_listening_still_gets_its_note_filed() {
     let body = json!({"audio": recorded("this thought must survive"),
                       "mime": "audio/webm", "id": "dropped-mid-flight"});
 
-    let dropped = tokio::time::timeout(
-        Duration::ZERO,
-        h.post_json("/api/note", body.clone()),
-    )
-    .await;
+    let dropped =
+        tokio::time::timeout(Duration::ZERO, h.post_json("/api/note", body.clone())).await;
     assert!(
         dropped.is_err(),
         "the request has to still be in flight when the client goes away"
