@@ -84,6 +84,10 @@ pub struct Config {
     pub autopack: bool,
     pub autopack_every_s: f64,
     pub watch_books: bool,
+    /// `QUEUE_RESUME_DELAY_S` — how long after startup the render worker may act
+    /// on a wishlist left over from the last process. See
+    /// [`crate::wishlist::RESUME_DELAY_S`] for why it is not zero.
+    pub queue_resume_delay_s: f64,
 
     pub sse_heartbeat_s: f64,
     pub sse_queue: usize,
@@ -179,6 +183,7 @@ impl Config {
             autopack: flag("AUTOPACK", true),
             autopack_every_s: num("AUTOPACK_EVERY_S", 5.0),
             watch_books: flag("NARRATOR_WATCH_BOOKS", true),
+            queue_resume_delay_s: num("QUEUE_RESUME_DELAY_S", crate::wishlist::RESUME_DELAY_S),
 
             sse_heartbeat_s: num("SSE_HEARTBEAT_S", 15.0),
             sse_queue: num("SSE_QUEUE", 64),
@@ -200,6 +205,9 @@ impl Config {
         c.fake_tts = true;
         c.watch_books = false;
         c.autopack = false;
+        // A test that restarts a server is not waiting ten seconds to find out
+        // whether the queue came back with it.
+        c.queue_resume_delay_s = 0.05;
         c
     }
 }

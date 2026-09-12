@@ -44,6 +44,15 @@ pub struct ChapterRow {
     pub queued: bool,
     pub packing: bool,
     pub pack_queued: bool,
+    /// Present, and `true`, only for a chapter the server has stopped taking up
+    /// at startup: it was asked for, it has been picked back up by five restarts
+    /// without a single chunk of it landing, and something about it is not
+    /// working. Still wanted, no longer tried — asking for the chapter again is
+    /// the retry and clears this. Absent is the ordinary answer, and absent
+    /// rather than `false` so a 1433-row response pays nothing for it, which is
+    /// why it is not a plain `bool` like its three neighbours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -144,6 +153,7 @@ pub fn chapter_rows(st: &Arc<AppState>) -> Vec<ChapterRow> {
             queued: false,
             packing: false,
             pack_queued: false,
+            parked: None,
         };
         if size.is_some() {
             if let Some(man) = pack::read_manifest(&st.cfg.work, &key, ci) {
@@ -202,6 +212,11 @@ pub async fn chapters_list(
     let rows = tokio::task::spawn_blocking(move || chapter_rows(&st2))
         .await
         .unwrap_or_default();
+    // Before the session lock, and outside the row memo: a parked chapter is in
+    // neither of the three queues by definition, so the memoised scan cannot
+    // know about it, and a restart must not be able to make the drawer look like
+    // nothing was ever asked for.
+    let parked = st.wishlist().parked();
     let s = st.session();
     let (queue, want, bq) = (s.queue.clone(), s.build_want.clone(), s.pack_queue.clone());
     let total = rows.len();
@@ -217,6 +232,7 @@ pub async fn chapters_list(
             r.queued = queue.contains(&r.i);
             r.packing = s.building == Some(r.i);
             r.pack_queued = bq.contains(&r.i) || want.contains(&r.i);
+            r.parked = parked.contains(&r.i).then_some(true);
             r
         })
         .collect();
@@ -364,6 +380,12 @@ async fn queue_chapters(
             }
         }
     }
+    // Written down before the answer goes out. A 200 here is Fernando walking
+    // away from the phone believing the box has the night's work, and the queue
+    // used to live only in this process's memory — a deploy ten seconds later
+    // and none of it had ever happened. Asking also clears any parking record
+    // for these chapters: the button is the retry.
+    crate::wishlist::asked(st, &want);
     st.run.set();
     render::ensure_render_thread(st);
     Ok(RenderResult {
@@ -434,6 +456,8 @@ pub async fn chapters_build(
         .await
         .unwrap_or_default();
     let force = body.force.unwrap_or(false);
+    // `want` is consumed below; the wishlist wants the same list at the end.
+    let all = want.clone();
     let (mut building, mut rendering, mut done) = (Vec::new(), Vec::new(), Vec::new());
     let mut refused = Vec::new();
     // Asked-for indices that no chapter answers to. `wanted()` drops them, and
@@ -484,6 +508,11 @@ pub async fn chapters_build(
             return e;
         }
     }
+    // Including the ones that went straight to the packer: a chapter that is
+    // already rendered never passes through `queue_chapters`, so this is the
+    // only place its intent is written down. Without it, a kill between here and
+    // ffmpeg finishing would lose a "download this chapter" that answered 200.
+    crate::wishlist::asked(&st, &all);
     Json(BuildResult {
         ok: true,
         built: done,
@@ -514,32 +543,38 @@ pub async fn chapters_cancel(
     if let Some(r) = super::session::wrong_book(&st, body.book.as_deref()) {
         return r;
     }
-    let mut s = st.session();
-    let n = s.plan.len();
-    let want = body
-        .chapters
-        .as_ref()
-        .filter(|c| !c.is_empty())
-        .map(|_| wanted(&body, n));
-    match want {
-        None => {
-            s.queue.clear();
-            s.build_want.clear();
-            s.pack_queue.clear();
-        }
-        Some(w) => {
-            s.queue.retain(|c| !w.contains(c));
-            for c in &w {
-                s.build_want.remove(c);
+    let (queue, want) = {
+        let mut s = st.session();
+        let n = s.plan.len();
+        let want = body
+            .chapters
+            .as_ref()
+            .filter(|c| !c.is_empty())
+            .map(|_| wanted(&body, n));
+        match &want {
+            None => {
+                s.queue.clear();
+                s.build_want.clear();
+                s.pack_queue.clear();
             }
-            let building = s.building;
-            s.pack_queue
-                .retain(|c| !w.contains(c) || Some(*c) == building);
+            Some(w) => {
+                s.queue.retain(|c| !w.contains(c));
+                for c in w {
+                    s.build_want.remove(c);
+                }
+                let building = s.building;
+                s.pack_queue
+                    .retain(|c| !w.contains(c) || Some(*c) == building);
+            }
         }
-    }
-    Json(CancelResult {
-        ok: true,
-        queue: s.queue.clone(),
-    })
-    .into_response()
+        (s.queue.clone(), want)
+    };
+    // A cancel has to reach the disk for the same reason the request did: the
+    // file is what the next boot believes, and a cancel that only happened in
+    // memory would be undone by the next restart — the very bug this is the
+    // other half of. It also clears any parking record, so a chapter that was
+    // parked and then cancelled leaves the list entirely rather than lingering
+    // as a row nobody asked for.
+    crate::wishlist::cancelled(&st, want.as_deref());
+    Json(CancelResult { ok: true, queue }).into_response()
 }

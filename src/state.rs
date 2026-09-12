@@ -197,6 +197,11 @@ pub struct AppState {
     /// and the drawer polls it.
     pub chstat: Mutex<Option<(Instant, String, Vec<crate::api::chapters::ChapterRow>)>>,
     pub autopack_at: Mutex<Option<Instant>>,
+
+    /// What the three queues above do not say about themselves: how many
+    /// restarts each chapter has been picked back up by, and which have run out.
+    /// The queues stay where they are; see [`crate::wishlist`].
+    pub wishlist: Mutex<crate::wishlist::Wishlist>,
 }
 
 impl AppState {
@@ -223,6 +228,7 @@ impl AppState {
             started_at: Instant::now(),
             chstat: Mutex::new(None),
             autopack_at: Mutex::new(None),
+            wishlist: Mutex::new(crate::wishlist::Wishlist::default()),
         })
     }
 
@@ -234,6 +240,18 @@ impl AppState {
             Ok(g) => g,
             Err(p) => {
                 tracing::error!("session lock was poisoned; continuing with its contents");
+                p.into_inner()
+            }
+        }
+    }
+
+    /// The wishlist's bookkeeping. Always taken *before* the session lock, never
+    /// after — see [`crate::wishlist::save`] for what the order is protecting.
+    pub fn wishlist(&self) -> std::sync::MutexGuard<'_, crate::wishlist::Wishlist> {
+        match self.wishlist.lock() {
+            Ok(g) => g,
+            Err(p) => {
+                tracing::error!("wishlist lock was poisoned; continuing with its contents");
                 p.into_inner()
             }
         }

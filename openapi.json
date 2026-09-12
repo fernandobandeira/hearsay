@@ -1787,6 +1787,13 @@
           "packing": {
             "type": "boolean"
           },
+          "parked": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Present, and `true`, only for a chapter the server has stopped taking up\nat startup: it was asked for, it has been picked back up by five restarts\nwithout a single chunk of it landing, and something about it is not\nworking. Still wanted, no longer tried — asking for the chapter again is\nthe retry and clears this. Absent is the ordinary answer, and absent\nrather than `false` so a 1433-row response pays nothing for it, which is\nwhy it is not a plain `bool` like its three neighbours."
+          },
           "queued": {
             "type": "boolean",
             "description": "Always present: a row only exists for a loaded book, and then the\nchapter manager's three flags always have an answer."

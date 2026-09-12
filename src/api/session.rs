@@ -186,6 +186,24 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
         s.pack_queue.clear();
     }
 
+    // ... and then this book's own wishlist back, if it has one.
+    //
+    // Clearing the queues above is right — they are indices into the plan that
+    // has just been replaced — but on its own it would quietly undo the thing
+    // `wishlist` exists for. The reader re-opens the book it was on when the app
+    // starts, which is an `/api/load`, so a 74-chapter download that a restart
+    // had just picked back up would be wiped by a phone coming out of a pocket.
+    // The list is the book's, not the session's: it comes back with the book,
+    // and switching to something else for ten minutes no longer costs it.
+    let taken = crate::wishlist::adopt(&st);
+    if !taken.is_empty() {
+        // Queued work is what starts the worker, exactly as the POST that
+        // created the list would have.
+        tracing::info!("load: {} chapter(s) still wanted for {key}", taken.len());
+        st.run.set();
+        render::ensure_render_thread(&st);
+    }
+
     // Drop the plan next to the cached audio: `narrator export` packs the
     // streaming cache into an .m4b from it without the container, and the stamp
     // beside it is what lets the next load skip the parse entirely.

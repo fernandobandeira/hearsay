@@ -120,6 +120,16 @@ export type ChapterRow = {
     pack_queued: boolean;
     packing: boolean;
     /**
+     * Present, and `true`, only for a chapter the server has stopped taking up
+     * at startup: it was asked for, it has been picked back up by five restarts
+     * without a single chunk of it landing, and something about it is not
+     * working. Still wanted, no longer tried — asking for the chapter again is
+     * the retry and clears this. Absent is the ordinary answer, and absent
+     * rather than `false` so a 1433-row response pays nothing for it, which is
+     * why it is not a plain `bool` like its three neighbours.
+     */
+    parked?: boolean | null;
+    /**
      * Always present: a row only exists for a loaded book, and then the
      * chapter manager's three flags always have an answer.
      */

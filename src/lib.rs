@@ -21,6 +21,7 @@ pub mod text;
 pub mod tts;
 pub mod vault;
 pub mod watch;
+pub mod wishlist;
 
 /// Everything the process reads back out of its work directory before it starts
 /// serving — the state a restart would otherwise have thrown away.
@@ -49,5 +50,30 @@ pub fn boot(st: &std::sync::Arc<state::AppState>) {
             );
         }
         None => tracing::info!("no previous session to restore"),
+    }
+    // The chapters someone asked for and did not get. Strictly after the session
+    // restore: a wishlist is chapter indices into one book's plan, so with no
+    // book there is nothing it could be applied to — and applying it to the
+    // wrong one is the failure worth designing against, not the one worth
+    // risking. See `wishlist::resume`.
+    if let Some(r) = wishlist::resume(st) {
+        if !r.parked.is_empty() {
+            tracing::error!(
+                "queue: {} chapter(s) parked after {} attempts: {:?}",
+                r.parked.len(),
+                wishlist::MAX_ATTEMPTS,
+                r.parked
+            );
+        }
+        if !r.queued.is_empty() {
+            tracing::info!(
+                "queue restored: {} chapter(s) still wanted, starting in {:.0}s",
+                r.queued.len(),
+                st.cfg.queue_resume_delay_s
+            );
+            // Deliberately not here and now: the box has two cores and the memo
+            // sweep may be about to want one of them.
+            wishlist::start_soon(st, r.queued.len());
+        }
     }
 }

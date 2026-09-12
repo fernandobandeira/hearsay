@@ -196,6 +196,20 @@ fn render_one(st: &AppState, key: &str, ci: usize, i: usize, chunks: &[Chunk]) -
     true
 }
 
+/// Render one chunk and record what it means — to the failure backoff, and to
+/// the wishlist's poison counter.
+///
+/// A chapter that is putting audio on disk is not the chapter the parking rule
+/// is about, however many restarts it has lived through, so any chunk that lands
+/// clears its count. Cheap: a map lookup that almost always finds nothing.
+fn attempt(st: &Arc<AppState>, key: &str, ci: usize, i: usize, chunks: &[Chunk], bo: &mut Backoff) {
+    let ok = render_one(st, key, ci, i, chunks);
+    bo.record(ok);
+    if ok {
+        crate::wishlist::progress(st, ci);
+    }
+}
+
 fn exists(st: &AppState, key: &str, ci: usize, i: usize) -> bool {
     cache::chunk_path(&st.cfg.work, key, ci, i).exists()
 }
@@ -229,13 +243,26 @@ fn next_queued(st: &Arc<AppState>, key: &str) -> Option<(usize, usize)> {
         let s = st.session();
         (s.queue.clone(), s.plan.clone())
     };
+    // An item that leaves the queue has to leave the file too, before the worker
+    // moves on to the next one: a restart in between would put a chapter that is
+    // finished back on the list. Harmless for a render — the chunks are there and
+    // it leaves again immediately — but it also un-does a cancel that was
+    // processed in the same pass, and that is work on a book nobody asked for.
+    let mut changed = false;
+    let done = |st: &Arc<AppState>, changed: bool| {
+        if changed {
+            crate::wishlist::save(st);
+        }
+    };
     for cj in q {
         if cj >= plan.len() {
             st.session().queue.retain(|c| *c != cj);
+            changed = true;
             continue;
         }
         let n = plan[cj].chunks.len();
         if let Some(j) = first_missing(st, key, cj, 0, n) {
+            done(st, changed);
             return Some((cj, j));
         }
         let want = {
@@ -243,11 +270,13 @@ fn next_queued(st: &Arc<AppState>, key: &str) -> Option<(usize, usize)> {
             s.queue.retain(|c| *c != cj);
             s.build_want.contains(&cj)
         };
+        changed = true;
         render_event(st, "complete", cj, n, n, "queued");
         if want {
             enqueue_build(st, cj);
         }
     }
+    done(st, changed);
     None
 }
 
@@ -390,7 +419,7 @@ fn worker(st: Arc<AppState>) {
         //    is missing the reader is stalled on it right now.
         if ph < n && !exists(&st, &key, ci, ph) {
             st.session().status = "rendering".into();
-            bo.record(render_one(&st, &key, ci, ph, chunks));
+            attempt(&st, &key, ci, ph, chunks, &mut bo);
             render_event(&st, "progress", ci, ph + 1, n, "rendering");
             continue;
         }
@@ -405,7 +434,7 @@ fn worker(st: Arc<AppState>) {
                 s.status = "rendering".into();
                 s.prerender = None;
             }
-            bo.record(render_one(&st, &key, ci, i, chunks));
+            attempt(&st, &key, ci, i, chunks, &mut bo);
             let next = {
                 let mut s = st.session();
                 // Only advance if nothing moved the hint while we were rendering:
@@ -440,13 +469,14 @@ fn worker(st: Arc<AppState>) {
                 s.prerender = Some(cj);
             }
             let qn = plan.get(cj).map(|c| c.chunks.len()).unwrap_or(0);
-            bo.record(render_one(
+            attempt(
                 &st,
                 &key,
                 cj,
                 j,
                 plan.get(cj).map(|c| c.chunks.as_slice()).unwrap_or(&[]),
-            ));
+                &mut bo,
+            );
             render_event(&st, "progress", cj, j + 1, qn, "queued");
             pre += 1;
             if pre % 25 == 0 {
@@ -488,13 +518,14 @@ fn worker(st: Arc<AppState>) {
                     s.prerender = Some(cj);
                 }
                 let an = plan.get(cj).map(|c| c.chunks.len()).unwrap_or(0);
-                bo.record(render_one(
+                attempt(
                     &st,
                     &key,
                     cj,
                     j,
                     plan.get(cj).map(|c| c.chunks.as_slice()).unwrap_or(&[]),
-                ));
+                    &mut bo,
+                );
                 render_event(&st, "progress", cj, j + 1, an, "prerendering");
                 pre += 1;
                 if pre % 25 == 0 {
@@ -597,6 +628,11 @@ fn builder(st: Arc<AppState>) {
             s.build_want.remove(&ci);
             s.chapter
         };
+        // Whether it packed or not. A failed encode already leaves the queues
+        // here rather than being retried forever in this process, and the file
+        // has to say the same thing — a pack that fails on every restart is the
+        // one loop a durable queue could otherwise run until someone noticed.
+        crate::wishlist::save(&st);
         let keep: HashSet<String> = [format!("{key}/ch{cur:03}")].into_iter().collect();
         chapters::gc(&st.cfg, &keep);
     }
