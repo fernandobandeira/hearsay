@@ -240,7 +240,7 @@ export function useChapterActions(book: string | null) {
      * it the server renders all night and packs nothing, because packing was the
      * client's move and iOS suspends the client seconds after the screen goes
      * off. With it the server chains render -> pack itself and writes the order
-     * to disk, so a restart does not cancel it either. See src/intents.rs and
+     * to disk, so a restart does not cancel it either. See src/wishlist.rs and
      * lib/reconcile.ts, which is the device half of the same promise.
      */
     render: useMutation<RenderResult, Error, {chapters: number[]; pack?: boolean}>({

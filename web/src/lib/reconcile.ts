@@ -10,7 +10,7 @@
  *
  * The server's half no longer stops with it: `pack: true` on the render call is
  * a download intent the server writes down and finishes on its own, restart
- * included (see `src/intents.rs`). So by the time the app is opened again the
+ * included (see `src/wishlist.rs`). So by the time the app is opened again the
  * chapters are usually sitting there packed, and the only thing left undone is
  * the one step that can only happen on the device - copying the m4a into Cache
  * Storage.
