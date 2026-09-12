@@ -15,22 +15,77 @@
  * the one step that can only happen on the device - copying the m4a into Cache
  * Storage.
  *
- * This module is that step, run on every way back into the app: visibility,
- * focus, the network returning, and a `hello` off the live stream (which fires
- * on every reconnect and therefore *is* the "we were away" signal for a tab that
- * never went hidden). It asks three questions and intersects the answers.
+ * This module is that step - and, since the round that follows, the *whole*
+ * device-side half of a download rather than a catch-up pass beside it. It runs
+ * on every way back into the app (visibility, focus, the network returning, a
+ * `hello` off the live stream) and on a short timer while the app is open, and
+ * every pass asks the same four questions and acts on the answers.
  *
  *     what was asked for   the pending selection, in IndexedDB beside the outbox
  *                          so it survives the app being killed
+ *     what the server owes the standing order, re-derived from the rows: which
+ *                          chapters still need rendering, which need packing
  *     what is ready        the server's rows: `m4a` true means packed
  *     what is here         Cache Storage, asked rather than remembered - a quota
  *                          eviction has to read as missing
  *
- * Everything else about a download is unchanged, deliberately. Polling stays as
- * the fallback for a session with no live stream, and the ladder still runs in
- * the drawer while the app is open. This is the catch-up pass, not a replacement.
+ * **Why it took over the drawer's ladder.** The drawer used to climb a per-chapter
+ * ladder of its own - queue the render, poll, ask for the pack, poll, store - in
+ * component state, one chapter at a time, with a single `err` string for the
+ * whole run. Three of the four things he reported came out of that: the ladder
+ * dies with the component and with the app, so a restart left a selection with
+ * nobody driving it; a chapter that failed mid-run set `err` and was dropped,
+ * and the next chapter's failure overwrote the message, so a chapter looked
+ * *skipped*; and nothing outside the run ever asked the server for a pack, so a
+ * chapter that finished rendering an hour later sat there packed and unstored
+ * until the app happened to be re-opened.
+ *
+ * There is one queue now, it is on disk, and this is the only thing that drives
+ * it. The drawer writes the selection down and gets out of the way.
  */
+import {phaseFor} from './download';
 import type {ChapRow} from './types';
+
+/**
+ * How many chapters are copied onto the device at once.
+ *
+ * One at a time was leaving the wifi mostly idle: each chapter is a single ~6 MB
+ * GET, and the box - two ARM cores, busy synthesizing - answers one of those far
+ * below the link's capacity, so the transfer spends most of its life waiting
+ * rather than moving. Three overlap without turning the phone's radio or the
+ * server's disk into the new bottleneck, and they are three *separate* files, so
+ * nothing has to be packed together to get the parallelism.
+ *
+ * Deliberately not larger. The A1 is also rendering while this runs, every
+ * connection is a byte-range-capable read off the same disk, and a chapter that
+ * is stored is only useful once it is *whole* - twelve half-finished downloads
+ * are worth less than three finished ones when the screen goes off mid-sweep.
+ */
+export const PARALLEL = 3;
+
+/**
+ * How often the standing order is repeated to the server, at most.
+ *
+ * The order is durable on both sides - `queue.json` there, `downloads` here - so
+ * repeating it is housekeeping rather than the mechanism, and its one job is to
+ * survive a server that lost its queue. A sweep runs every few seconds while the
+ * app is open, and re-posting a 74-chapter order at that rate would be an
+ * fsync-per-tick on the box for nothing.
+ */
+export const ORDER_EVERY_MS = 120_000;
+
+/**
+ * How often a sweep runs while the app is open and visible.
+ *
+ * The event that should drive it is the live stream's `render` with `kind:
+ * "packed"`, and it does - this is the floor under it, for a session whose
+ * stream never came up (an old browser, a proxy that will not pass
+ * `text/event-stream`) and for the gap between a chapter finishing and anybody
+ * noticing. A pass with nothing to do is one IndexedDB read and one
+ * `/api/chapters`, which the drawer already polls harder than this while it
+ * is open.
+ */
+export const SWEEP_EVERY_MS = 20_000;
 
 /** A download selection this device has not finished storing. */
 export interface PendingDownload {
@@ -63,6 +118,67 @@ export function toFetch(
   const packed = new Set(rows.filter((r) => r.m4a).map((r) => r.i));
   return sorted(pending.chapters.filter((ci) => packed.has(ci) && !stored.has(ci)));
 }
+
+/**
+ * What the *server* still has to be asked for, out of a pending selection.
+ *
+ * The other half of the durable queue, and the half that was missing. `pack:
+ * true` makes a render call a standing order the server finishes on its own, so
+ * a selection placed last night is normally packed by morning - but only for the
+ * chapters that call covered. Two kinds slip out of it:
+ *
+ *   never ordered    the app was killed between writing the selection down and
+ *                    posting it, or the post was lost. The record is on the
+ *                    device and nothing on the server knows about it.
+ *   already rendered a chapter whose chunks all had audio at the time needed no
+ *                    render, so it was never in a `pack: true` call - it needs
+ *                    the packer asked directly.
+ *
+ * Recomputing both from the rows on every sweep means the order is re-derived
+ * from disk truth on each pass rather than remembered, which is the same rule
+ * the server's own render worker follows. Both endpoints are idempotent.
+ */
+export function toOrder(
+  pending: Pick<PendingDownload, 'chapters'>,
+  rows: readonly ChapRow[],
+  stored: ReadonlySet<number>,
+): {render: number[]; build: number[]} {
+  const byIndex = new Map(rows.map((r) => [r.i, r]));
+  const render: number[] = [];
+  const build: number[] = [];
+  for (const ci of sorted(pending.chapters)) {
+    if (stored.has(ci)) continue;
+    const row = byIndex.get(ci);
+    // No row at all is not "wait and see": the rows are the whole book, so a
+    // chapter missing from them is a chapter the server has never been told
+    // about. Ask for it.
+    if (!row) { render.push(ci); continue; }
+    const phase = phaseFor(row, false);
+    if (phase === 'queue-render') render.push(ci);
+    else if (phase === 'request-pack') build.push(ci);
+  }
+  return {render, build};
+}
+
+/**
+ * Is it worth repeating the standing order?
+ *
+ * Yes when it has changed - a chapter finished rendering and now wants packing,
+ * or a new selection arrived - because that is a different ask. Yes when it has
+ * been `everyMs` since the last one, which is the case this exists for: a server
+ * that restarted and came back without the queue. Otherwise no: the order is on
+ * disk at both ends and saying it again changes nothing.
+ */
+export function shouldOrder(
+  {want, last, sinceMs}: {want: string; last: string | null; sinceMs: number},
+  everyMs = ORDER_EVERY_MS,
+): boolean {
+  return !want ? false : want !== last || sinceMs >= everyMs;
+}
+
+/** The order as one comparable string, for `shouldOrder`. */
+export const orderSignature = (o: {render: number[]; build: number[]}): string =>
+  o.render.length || o.build.length ? `r${o.render.join(',')}|b${o.build.join(',')}` : '';
 
 /**
  * What is left of the order after a sweep: everything not on this device.
@@ -105,6 +221,8 @@ export interface SweepBook {
   failed: number[];
   /** Still wanted, so the next sweep picks them up. */
   left: number[];
+  /** The standing order this pass placed, if it placed one. */
+  ordered?: string;
 }
 
 export interface SweepDeps {
@@ -120,8 +238,45 @@ export interface SweepDeps {
   save: (p: PendingDownload) => Promise<void>;
   /** Forget a selection that is. */
   drop: (key: string) => Promise<void>;
+  /**
+   * Repeat the standing order to the server: render these (with `pack: true`),
+   * pack those. Called only when `shouldOrder` says the ask has changed or has
+   * gone stale, and its failure is not the sweep's - the storing half still runs.
+   */
+  order?: (key: string, o: {render: number[]; build: number[]}) => Promise<unknown>;
+  /** Remembered per book, so an unchanged order is not repeated every few seconds. */
+  lastOrder?: (key: string) => {sig: string | null; sinceMs: number};
+  /** Called after `order` succeeds, with what was ordered. */
+  onOrdered?: (key: string, sig: string) => void;
+  /** Called when a chapter's copy starts and ends, so the row can say so. */
+  onFetching?: (key: string, ci: number, active: boolean) => void;
   /** Called after anything actually landed, so the UI can re-read its state. */
   onStored?: (key: string, ci: number) => void;
+  /** How many chapters to copy at once. */
+  parallel?: number;
+}
+
+/**
+ * Run `n` workers over one list, keeping the results in the list's order.
+ *
+ * A pool rather than chunked batches: a batch of three waits for its slowest
+ * member before starting the next three, which on a link this variable is most
+ * of the time. Each worker takes the next index the moment it is free.
+ */
+async function pool<T>(
+  items: readonly T[], n: number, work: (item: T) => Promise<boolean>,
+): Promise<boolean[]> {
+  const out = new Array<boolean>(items.length);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await work(items[i]);
+    }
+  };
+  await Promise.all(Array.from({length: Math.max(1, Math.min(n, items.length))}, worker));
+  return out;
 }
 
 /**
@@ -133,24 +288,48 @@ export interface SweepDeps {
  * rows cannot be fetched at all is not a failure either: the sweep still settles
  * whatever is already in Cache Storage, so a download finished by an earlier
  * sweep stops being pending even with no network.
+ *
+ * Books are swept one after another and chapters within a book in parallel. That
+ * asymmetry is deliberate: chapters of the book being read are what somebody is
+ * waiting for, and spreading the link across two books would make both later.
  */
 export async function reconcile(deps: SweepDeps): Promise<SweepBook[]> {
   const out: SweepBook[] = [];
   for (const p of await deps.pending()) {
     const stored = await deps.stored(p.key).catch(() => new Set<number>());
     const rows = await deps.rows(p.key).catch(() => null);
-    const fetched: number[] = [];
-    const failed: number[] = [];
 
-    for (const ci of rows ? toFetch(p, rows, stored) : []) {
-      try {
-        await deps.fetchChapter(p.key, ci);
-        fetched.push(ci);
-        deps.onStored?.(p.key, ci);
-      } catch {
-        failed.push(ci);
+    /* The server's half first, so a chapter that needs rendering is ordered on
+       this pass rather than on the next one - the order is what runs while the
+       phone is asleep, and it costs one POST. Its failure is not the sweep's:
+       whatever is already packed still gets stored below. */
+    let ordered: string | undefined;
+    if (rows && deps.order) {
+      const want = toOrder(p, rows, stored);
+      const sig = orderSignature(want);
+      const {sig: last, sinceMs} = deps.lastOrder?.(p.key) ?? {sig: null, sinceMs: Infinity};
+      if (shouldOrder({want: sig, last, sinceMs})) {
+        const ok = await deps.order(p.key, want).then(() => true, () => false);
+        if (ok) { ordered = sig; deps.onOrdered?.(p.key, sig); }
       }
     }
+
+    const wanted = rows ? toFetch(p, rows, stored) : [];
+    const fetched: number[] = [];
+    const failed: number[] = [];
+    const results = await pool(wanted, deps.parallel ?? PARALLEL, async (ci) => {
+      deps.onFetching?.(p.key, ci, true);
+      try {
+        await deps.fetchChapter(p.key, ci);
+        deps.onStored?.(p.key, ci);
+        return true;
+      } catch {
+        return false;
+      } finally {
+        deps.onFetching?.(p.key, ci, false);
+      }
+    });
+    wanted.forEach((ci, i) => (results[i] ? fetched : failed).push(ci));
 
     // Ask the device again rather than trusting the loop above.
     const after = fetched.length
@@ -159,7 +338,7 @@ export async function reconcile(deps: SweepDeps): Promise<SweepBook[]> {
     const left = remaining(p, after);
     if (left.length) await deps.save({...p, chapters: left});
     else await deps.drop(p.key);
-    out.push({key: p.key, fetched, failed, left});
+    out.push({key: p.key, fetched, failed, left, ordered});
   }
   return out;
 }

@@ -17,6 +17,36 @@ import {
 } from './api';
 import {delayFor, isRetryable, MAX_RETRIES, statusOf} from './backoff';
 
+/**
+ * The header that tells the service worker to keep its hands off.
+ *
+ * **The bug this exists for, and it is the one that lost his downloads.** Every
+ * URL this module stores is also matched by a Workbox runtime rule - that is the
+ * point of the rules: they are what serves a cached chapter back to `<audio>`
+ * with no network. But they matched the *download* too, so a deliberate save ran
+ * the body through two consumers at once: the strategy put its own copy into
+ * `narrator-audio` inside `event.waitUntil`, and the page then put `res.clone()`
+ * of the same streaming body into the same entry. On WebKit that is not merely
+ * wasteful. It fails two ways, both of which he saw in one sitting:
+ *
+ *   the visible one   the strategy's put rejects and the whole interception goes
+ *                     with it - `TypeError: FetchEvent.respondWith received an
+ *                     error` in the page, one chapter of a run dead, the next
+ *                     chapter's error overwriting the message so it looks like a
+ *                     chapter was simply skipped.
+ *   the quiet one     both puts appear to succeed, one of them holding a body
+ *                     that never finished arriving. The entry reads back fine
+ *                     for the rest of the session and is gone after a restart -
+ *                     chapters shown as saved at 09:03 and as merely packed at
+ *                     09:05, with nothing in this reader having deleted them.
+ *
+ * So a deliberate store carries this header, the runtime rules skip anything
+ * carrying it (see web/vite.config.ts), and exactly one consumer - `put` below -
+ * writes the entry, from a body it has already read to the end.
+ */
+export const STORE_HEADER = 'x-narrator-store';
+const STORE_INIT: RequestInit = {cache: 'no-store', headers: {[STORE_HEADER]: '1'}};
+
 export const AUDIO_CACHE = 'narrator-audio';   // must match the Workbox rule
 export const TEXT_CACHE = 'narrator-text';     // book.json + the shards
 /**
@@ -64,7 +94,20 @@ export function bookKey(b: {path?: string; name?: string; key?: string}): string
   return base.replace(/(?!^)\.[^.]+$/, '').slice(0, 50);
 }
 
-/** Chapter indices whose audio is held on this device, for one book. */
+/**
+ * Chapter indices whose audio is held on this device, for one book.
+ *
+ * A key in the cache is not quite the same claim as a chapter that will play.
+ * An entry can be there and be empty - a write that was interrupted, a body that
+ * never finished arriving - and an empty entry is worse than no entry at all: it
+ * reads as downloaded, so nothing re-fetches it, and it plays silence. So a key
+ * only counts if the entry behind it is still matchable and does not declare
+ * itself to be zero bytes.
+ *
+ * Only an *explicit* zero disqualifies. A stored response with no
+ * `content-length` at all is one this module cannot judge, and guessing it is
+ * broken would re-download a chapter that is perfectly fine.
+ */
 export async function cachedChapters(key: string | null): Promise<Set<number>> {
   const out = new Set<number>();
   const c = await open(AUDIO_CACHE);
@@ -73,7 +116,11 @@ export async function cachedChapters(key: string | null): Promise<Set<number>> {
     const u = new URL(req.url);
     if (u.searchParams.get('book') !== key) continue;
     const m = /^\/api\/chapters\/(\d+)\.m4a$/.exec(u.pathname);
-    if (m) out.add(Number(m[1]));
+    if (!m) continue;
+    const res = await c.match(req, MATCH);
+    if (!res) continue;
+    if (res.headers.get('content-length') === '0') continue;
+    out.add(Number(m[1]));
   }
   return out;
 }
@@ -250,16 +297,42 @@ export async function removeText(key: string): Promise<void> {
  * Three URLs make a chapter listenable with no network: its audio, the
  * chunk->time manifest that keeps reading positions meaningful, and its text.
  * Returns the size of the audio.
+ *
+ * **Retried here rather than by the caller.** A chapter is tens of megabytes over
+ * a tunnel from a phone, and the failures are the ordinary ones - the tunnel
+ * blips, the box is busy packing, the radio hands over. The queue above would
+ * pick a failure up on its next pass anyway, but a pass is seconds to a minute
+ * away and the reader is usually watching the row; a blip should look like a
+ * slightly slower download, not like a chapter that quietly did not come. Only
+ * failures worth repeating are repeated - a 404 means the server has no such
+ * file and five more asks will say so - and the curve is the reader's one retry
+ * policy, the same one every request uses.
+ *
+ * The audio is what is retried. The manifest and the words are small, and a
+ * chapter whose m4a is stored is already the expensive part of the job: they get
+ * one attempt each inside the same round.
  */
-export async function downloadChapter(key: string, ci: number): Promise<number> {
+export async function downloadChapter(
+  key: string, ci: number,
+  opts: {wait?: (attempt: number) => Promise<void>; attempts?: number} = {},
+): Promise<number> {
   const audio = await open(AUDIO_CACHE);
   // The chapter's words go where the Workbox rule for them reads from.
   const text = await open(CHAPTER_CACHE);
   if (!audio) throw new Error('this browser will not store offline audio');
-  const size = await put(audio, chapterAudioUrl(key, ci));
-  await put(audio, chapterManifestUrl(key, ci));
-  if (text) await put(text, chapterTextUrl(key, ci)).catch(() => 0);
-  return size;
+  const wait = opts.wait ?? ((attempt: number) => sleep(delayFor(attempt)));
+  const attempts = opts.attempts ?? MAX_RETRIES;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const size = await putVerified(audio, chapterAudioUrl(key, ci));
+      await put(audio, chapterManifestUrl(key, ci));
+      if (text) await put(text, chapterTextUrl(key, ci)).catch(() => 0);
+      return size;
+    } catch (e) {
+      if (attempt >= attempts || !isRetryable(statusOf(e))) throw e;
+      await wait(attempt);
+    }
+  }
 }
 
 export async function removeChapter(key: string, ci: number): Promise<void> {
@@ -333,34 +406,57 @@ export async function requestPersistence(): Promise<boolean> {
 /**
  * Store one URL, and measure what was actually stored.
  *
- * The wire is not always what the browser hands back. This reader is
- * interchangeable between the rust server and the python one, and the python one
- * serves `/api/book.json` and `/api/text/*.json` gzipped: `fetch` decodes the
- * body but leaves `Content-Encoding: gzip` and the *compressed* `Content-Length`
- * on the response object. Storing that response verbatim puts a decoded body in
- * Cache Storage under headers claiming it is gzip - which a consumer is entitled
- * to act on - and the size accounting would report the compressed number.
+ * Three things have to be true of the entry this leaves behind, and each of them
+ * was once not:
  *
- * So when an encoding is declared, the body is buffered and re-stored with those
- * two headers stripped, and the blob's own size is the answer. Only text takes
- * that path: it is a few hundred kB at most, and the m4a - tens of MB, never
- * gzipped - keeps the streaming clone and the header size rather than being read
- * into memory just to be measured.
+ * **One writer.** The request carries `STORE_HEADER`, so the service worker's
+ * runtime rules ignore it and this `put` is the only thing writing the entry.
+ * See the header's own note - two writers on one streaming body is what lost the
+ * chapters.
+ *
+ * **A body that has finished arriving.** The response is read to the end into a
+ * Blob and the Blob is what is stored. A `res.clone()` handed to `Cache.put` is
+ * a stream the browser finishes on its own time and may not finish at all, and a
+ * half-written entry is indistinguishable from a whole one until the next launch
+ * throws it away. Reading first costs the chapter's size in memory for a moment
+ * - 6 MB on his book - and buys an entry that is either there or threw.
+ *
+ * **Headers that describe the bytes actually stored.** This reader is
+ * interchangeable between the rust server and the python one, and both serve the
+ * text bundle gzipped: `fetch` decodes the body but leaves `Content-Encoding:
+ * gzip` and the *compressed* `Content-Length` on the response object. Storing
+ * that verbatim puts a decoded body under headers claiming it is gzip, which a
+ * consumer is entitled to act on.
+ *
+ * Returns the size of what was stored, from the Blob rather than from a header.
  */
 async function put(c: Cache, url: string): Promise<number> {
-  const res = await fetch(url, {cache: 'no-store'});
+  const res = await fetch(url, STORE_INIT);
   // ApiError rather than Error, so the retry policy can read the status off it:
   // a 503 is a blip worth repeating and a 404 is an answer. See lib/backoff.ts.
-  if (!res.ok) throw new ApiError(res.status, `${url.split('?')[0]} → ${res.status}`);
-  if (res.headers.get('content-encoding')) {
-    const body = await res.blob();
-    const headers = new Headers(res.headers);
-    headers.delete('content-encoding');
-    headers.delete('content-length');
-    await c.put(url, new Response(body, {status: res.status, statusText: res.statusText, headers}));
-    return body.size;
-  }
-  const size = Number(res.headers.get('content-length') ?? 0);
-  await c.put(url, res.clone());
+  if (!res.ok) throw new ApiError(res.status, `${url.split('?')[0]} \u2192 ${res.status}`);
+  const body = await res.blob();
+  const headers = new Headers(res.headers);
+  headers.delete('content-encoding');
+  headers.set('content-length', String(body.size));
+  await c.put(url, new Response(body, {
+    status: res.status, statusText: res.statusText, headers,
+  }));
+  return body.size;
+}
+
+/**
+ * Store one URL and then ask whether it is really there.
+ *
+ * `Cache.put` resolving is not the same claim as "this entry exists": a quota
+ * refusal can surface here, and on WebKit a write can be accepted and dropped.
+ * The read-back is one cache lookup against tens of megabytes of transfer, and
+ * without it a download run reports success for a chapter that will be missing
+ * at the next launch - which is precisely the report he could not trust.
+ */
+async function putVerified(c: Cache, url: string): Promise<number> {
+  const size = await put(c, url);
+  const back = await c.match(url, MATCH);
+  if (!back) throw new ApiError(0, `${url.split('?')[0]} did not stay in the cache`);
   return size;
 }

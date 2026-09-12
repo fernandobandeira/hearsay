@@ -8,7 +8,7 @@
  */
 import {afterEach, beforeEach, describe, expect, test} from 'vitest';
 import {
-  AUDIO_CACHE, CHAPTER_CACHE, TEXT_CACHE,
+  AUDIO_CACHE, CHAPTER_CACHE, STORE_HEADER, TEXT_CACHE,
   audioBytes, bookKey, cachedChapters, cachedShards, downloadChapter, downloadText,
   heldBooks, removeBook, removeChapter, removeText,
 } from './offline';
@@ -54,6 +54,10 @@ const fail = (url: string, status = 503, times = Infinity) => {
 
 /** How many times each URL was asked for. */
 let hits: Map<string, number>;
+/** Every request made, with its init - what proves the store marker is set. */
+let asked: [string, RequestInit | undefined][];
+const header = (init: RequestInit | undefined, name: string): string | null =>
+  new Headers(init?.headers).get(name);
 
 beforeEach(() => {
   store = new Map();
@@ -65,9 +69,13 @@ beforeEach(() => {
     },
   };
   hits = new Map();
-  (globalThis as {fetch?: unknown}).fetch = async (input: RequestInfo | URL) => {
+  asked = [];
+  (globalThis as {fetch?: unknown}).fetch = async (
+    input: RequestInfo | URL, init?: RequestInit,
+  ) => {
     const u = urlOf(input);
     hits.set(u, (hits.get(u) ?? 0) + 1);
+    asked.push([u, init]);
     const made = served.get(u);
     return made ? made() : new Response('nope', {status: 404});
   };
@@ -79,11 +87,11 @@ afterEach(() => {
 
 describe('the chapter endpoint has its own cache', () => {
   test("a downloaded chapter's words are filed where its Workbox rule reads", async () => {
-    serve('/api/chapters/3.m4a?book=lom', 'audio', {'content-length': '4096'});
+    serve('/api/chapters/3.m4a?book=lom', 'audio', {'content-length': '5'});
     serve('/api/chapters/3.json?book=lom', '{"chunks":3}', {'content-length': '12'});
     serve('/api/chapter/3?book=lom', '{"chunks":[]}', {'content-length': '13'});
 
-    expect(await downloadChapter('lom', 3)).toBe(4096);
+    expect(await downloadChapter('lom', 3)).toBe(5);
     expect(paths(AUDIO_CACHE))
       .toEqual(['/api/chapters/3.json?book=lom', '/api/chapters/3.m4a?book=lom']);
     expect(paths(CHAPTER_CACHE)).toEqual(['/api/chapter/3?book=lom']);
@@ -119,7 +127,7 @@ describe('the chapter endpoint has its own cache', () => {
   });
 });
 
-describe('storing a response the python server gzipped', () => {
+describe('what actually goes into the cache', () => {
   const shard = JSON.stringify({shard: 0, from: 0, to: 9, chapters: []});
 
   test('the encoding headers come off, and the size is the body, not the wire', async () => {
@@ -133,16 +141,77 @@ describe('storing a response the python server gzipped', () => {
     expect(await cachedShards('lom')).toEqual(new Set([0]));
     const stored = await cache(TEXT_CACHE).match('/api/text/0.json?book=lom');
     expect(stored?.headers.get('content-encoding')).toBeNull();
-    expect(stored?.headers.get('content-length')).toBeNull();
+    // Not deleted but *corrected*: the wire said 31 compressed bytes and the
+    // entry holds the decoded ones, so the header now describes what is stored.
+    expect(stored?.headers.get('content-length')).toBe(String(shard.length));
     expect(await stored?.text()).toBe(shard);
   });
 
-  test('audio is never gzipped, so it is measured from the header and not read', async () => {
+  test('a lying content-length does not become the recorded size', async () => {
+    // A header is a claim; the Blob is the bytes. The size this reports is what
+    // the drawer shows and what the storage accounting adds up, so it has to be
+    // the second one - and reading the body to the end is also what makes the
+    // entry whole rather than a stream the browser may never finish.
     serve('/api/chapters/1.m4a?book=lom', 'x'.repeat(10), {'content-length': '12345678'});
     serve('/api/chapters/1.json?book=lom', '{}', {'content-length': '2'});
     serve('/api/chapter/1?book=lom', '{}', {'content-length': '2'});
-    expect(await downloadChapter('lom', 1)).toBe(12345678);
-    expect(await audioBytes('lom')).toBe(12345678);
+    expect(await downloadChapter('lom', 1)).toBe(10);
+    expect(await audioBytes('lom')).toBe(10);
+  });
+
+  test('the deliberate save is marked, so the service worker leaves it alone', async () => {
+    // Two writers on one streaming body is what lost his downloads - the Workbox
+    // rule caching the same response the page was cloning. The rules skip
+    // anything carrying this header (web/vite.config.ts); this is the half of
+    // that contract that lives in the reader.
+    serve('/api/chapters/4.m4a?book=lom', 'audio');
+    serve('/api/chapters/4.json?book=lom', '{}');
+    serve('/api/chapter/4?book=lom', '{}');
+    await downloadChapter('lom', 4);
+    for (const [url, init] of asked)
+      if (url.startsWith('/api/chapters/4')) expect(header(init, STORE_HEADER)).toBe('1');
+    expect(asked.some(([u]) => u.startsWith('/api/chapters/4.m4a'))).toBe(true);
+  });
+
+  test('a put the cache did not keep is a failed download, not a silent one', async () => {
+    // `Cache.put` resolving is not the same claim as "the entry exists": a quota
+    // refusal surfaces here, and on WebKit a write can be accepted and dropped.
+    // Reporting success for an entry that will be missing at the next launch is
+    // exactly the report he could not trust.
+    serve('/api/chapters/5.m4a?book=lom', 'audio');
+    serve('/api/chapters/5.json?book=lom', '{}');
+    serve('/api/chapter/5?book=lom', '{}');
+    cache(AUDIO_CACHE).put = async () => {};      // accepted, stored nowhere
+    await expect(downloadChapter('lom', 5, {wait: async () => {}, attempts: 0}))
+      .rejects.toThrow(/did not stay in the cache/);
+  });
+
+  test('an entry that is there and empty reads as missing, not as downloaded', async () => {
+    // The worst shape a cache entry can be in: present, so nothing re-fetches
+    // it, and empty, so it plays silence. An interrupted write leaves exactly
+    // this, and it is indistinguishable from a finished one by key alone.
+    await cache(AUDIO_CACHE).put('/api/chapters/8.m4a?book=lom',
+                                 new Response('', {headers: {'content-length': '0'}}));
+    expect(await cachedChapters('lom')).toEqual(new Set());
+
+    // One with no length header at all is not judged: it is simply unknown, and
+    // throwing away a good chapter over a missing header would be worse.
+    await cache(AUDIO_CACHE).put('/api/chapters/9.m4a?book=lom', new Response('audio'));
+    expect(await cachedChapters('lom')).toEqual(new Set([9]));
+  });
+
+  test('a blip is retried; an answer is not', async () => {
+    serve('/api/chapters/6.m4a?book=lom', 'audio');
+    serve('/api/chapters/6.json?book=lom', '{}');
+    serve('/api/chapter/6?book=lom', '{}');
+    fail('/api/chapters/6.m4a?book=lom', 503, 2);          // twice, then it works
+    expect(await downloadChapter('lom', 6, {wait: async () => {}})).toBe(5);
+    expect(hits.get('/api/chapters/6.m4a?book=lom')).toBe(3);
+
+    // A 404 means the server has no such file. Five more asks will say so.
+    fail('/api/chapters/7.m4a?book=lom', 404);
+    await expect(downloadChapter('lom', 7, {wait: async () => {}})).rejects.toThrow();
+    expect(hits.get('/api/chapters/7.m4a?book=lom')).toBe(1);
   });
 });
 

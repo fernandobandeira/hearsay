@@ -19,13 +19,29 @@
  *
  * **Download is one action and selection is a mode.** "Render" is gone from the
  * UI entirely - see lib/download.ts. Nobody wants a rendered chapter they
- * cannot listen to offline, so download climbs the whole ladder itself: queue
- * the render, wait for it, ask for the pack, wait for it, store the m4a. And
- * picking chapters no longer means hitting a 14 px checkbox: "download…"
- * starts a mode in which whole rows toggle on a tap, with "next 5",
- * "next 20" and "rest" for the case that is actually common, and a confirm bar
- * that says how many and roughly how big before anything happens. Outside a
- * mode a tap on a row does the obvious thing and opens that chapter.
+ * cannot listen to offline, so a download means the whole pipeline: render the
+ * chapter, pack it, put the file on this device. And picking chapters no longer
+ * means hitting a 14 px checkbox: "download…" starts a mode in which whole rows
+ * toggle on a tap, with "next 5", "next 20" and "rest" for the case that is
+ * actually common, and a confirm bar that says how many and roughly how big
+ * before anything happens. Outside a mode a tap on a row does the obvious thing
+ * and opens that chapter.
+ *
+ * **What this component does not do any more is run the download.** It used to:
+ * confirming a selection started a foreground ladder here, per chapter, in
+ * component state - queue the render, poll, ask for the pack, poll, store, next
+ * chapter. Everything wrong with that was a consequence of where it lived. It
+ * died with the drawer and with the app, so a selection outlived its driver; it
+ * walked chapters one at a time, so a 6 MB file had the whole link to itself and
+ * used a fraction of it; and a chapter that failed set one shared `err` string
+ * and was dropped, with the next chapter's failure overwriting the message - so
+ * a failed chapter looked *skipped*, which is exactly how he reported it.
+ *
+ * Confirming now writes the selection to the durable queue and returns.
+ * lib/reconcile.ts drives it from there, on a timer, on a live `packed` event
+ * and on every cold launch, three chapters at a time. The rows below read that
+ * queue rather than a local job map, which is why a chapter still says "queued"
+ * after the app has been closed and re-opened.
  */
 import {useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState} from 'react';
 import {
@@ -37,22 +53,16 @@ import {Input} from '@/components/ui/input';
 import {Progress} from '@/components/ui/progress';
 import {ScrollArea} from '@/components/ui/scroll-area';
 import {Skeleton} from '@/components/ui/skeleton';
-import {useQueryClient} from '@tanstack/react-query';
-import {fetchChapters, keys, useChapterActions, useChapters} from '@/lib/api';
-import {chapterState, textMark, type ChapterStateKey, type Job, type TextMark} from '@/lib/chapterstate';
+import {useChapters} from '@/lib/api';
+import {chapterState, textMark, type ChapterStateKey, type TextMark} from '@/lib/chapterstate';
 import {chaptersWithText} from '@/lib/chaptertext';
-import {
-  anyEstimated, buildVerdict, estimateBytes, isAction, jobFor, needsRender, phaseFor,
-  renderAccepted, rowSignature, shouldReask,
-} from '@/lib/download';
+import {anyEstimated, estimateBytes, queueJob} from '@/lib/download';
 import {centeredScrollTop, scrollTargetIndex} from '@/lib/drawernav';
 import {chosen, idle, rangeAfter, reduce} from '@/lib/selection';
-import {cachedChapters, downloadChapter} from '@/lib/offline';
-import * as db from '@/lib/db';
 import {bytes as fmtBytes} from '@/lib/format';
 import {cn} from '@/lib/utils';
 import {useNarrator} from '@/state';
-import type {ChapRow, RenderResult} from '@/lib/types';
+import type {ChapRow} from '@/lib/types';
 
 /** One icon per state, so a glance down the list reads as a picture. */
 const ICON: Record<ChapterStateKey, typeof Check> = {
@@ -66,9 +76,6 @@ const TONE = {
 /** The text tier's two marks - see lib/chapterstate.ts's `textMark`. */
 const TEXT_ICON: Record<TextMark['icon'], typeof Type> = {text: Type, 'no-network': CloudOff};
 
-/** How long a single chapter may sit on one rung before we give up on it. */
-const RUNG_TIMEOUT_MS = 45 * 60_000;
-
 export function ChapterManager({open, active, onPick}: {
   /** the drawer is up: what gates the chapters query */
   open: boolean;
@@ -77,19 +84,15 @@ export function ChapterManager({open, active, onPick}: {
   onPick: (ci: number) => void;
 }) {
   const n = useNarrator();
-  const qc = useQueryClient();
   /* Every call here names the book. The server refuses (409) anything aimed at a
      book it is not holding, which is what closed the one race this drawer could
      not close itself: the poll says chapter 74 needs rendering, the server picks
      up a new epub, the tap lands on the other novel. */
   const book = n.book?.key ?? null;
   const {data, isPending} = useChapters(open && !!n.book, book);
-  const actions = useChapterActions(book);
   const [sel, dispatch] = useReducer(reduce, idle);
   const [filter, setFilter] = useState('');
-  const [jobs, setJobs] = useState<Record<number, Job>>({});
   const [err, setErr] = useState<string | null>(null);
-  const [running, setRunning] = useState(false);
 
   const rows = useMemo(() => {
     const byIndex = new Map<number, ChapRow>();
@@ -120,8 +123,13 @@ export function ChapterManager({open, active, onPick}: {
      cannot stay picked. */
   const eligible = useMemo(() => {
     if (!sel.verb) return [];
-    return hits.filter((r) => !n.offlineChapters.has(r.i)).map((r) => r.i);
-  }, [hits, sel.verb, n.offlineChapters]);
+    // Not what is already here, and not what is already on order: picking a
+    // chapter the queue is working on would be a second ask for the same file,
+    // and the row already says it is coming.
+    return hits
+      .filter((r) => !n.offlineChapters.has(r.i) && !n.queuedChapters.has(r.i))
+      .map((r) => r.i);
+  }, [hits, sel.verb, n.offlineChapters, n.queuedChapters]);
 
   /* Centring the chapter being read.
      Once per visit to this level, never while he is scrolling: `done` is armed
@@ -174,131 +182,26 @@ export function ChapterManager({open, active, onPick}: {
   const pickedRows = useMemo(
     () => rows.filter((r) => sel.picked.has(r.i)), [rows, sel.picked]);
 
-  // ------------------------------------------------------------------- the run
+  // --------------------------------------------------------------- the order
   /**
-   * Climb lib/download.ts's ladder for every picked chapter.
+   * Confirming a selection places an order and returns.
    *
-   * The whole selection's renders are queued in one call first, so the server's
-   * worker is never idle while this device is busy storing an earlier chapter;
-   * then each chapter is walked rung by rung.
+   * That is the whole of it now. The queue in lib/reconcile.ts tells the server
+   * what to render and pack, waits however many hours that takes, copies each
+   * chapter onto the device three at a time, and retries what fails - on a
+   * timer, on the live stream's `packed` event and on every cold launch, none of
+   * which need this drawer, this component, or the app to still be open.
    *
-   * It does its own polling rather than reading the rows this component
-   * rendered with, and that is not a detail: the rungs are minutes apart, the
-   * drawer is the thing he closes to go back to reading, and closing it
-   * unmounts this component and switches off `useChapters`. The old version
-   * closed over `data` and waited on a snapshot that could never change, so it
-   * could only ever time out. Writing each poll back into the query cache keeps
-   * the list in front of him live for free, and the run survives the drawer.
+   * The one thing worth reporting here is the order being refused outright (a
+   * 409: the server is holding another book), because that is the only failure
+   * a tap can cause. Everything after it is the queue's, and the rows say it.
    */
-  async function runDownload(cis: number[]) {
-    const key = n.book?.key;
-    if (!key) return;
+  async function order(cis: number[]) {
     setErr(null);
-    setRunning(true);
-
-    const poll = async (): Promise<ChapRow[]> => {
-      const r = await fetchChapters(key);
-      qc.setQueryData(keys.chapters, r);
-      return r.chapters;
-    };
-    const job = (ci: number, next: Job | null) => setJobs((j) => {
-      if (!next) { const {[ci]: _drop, ...rest} = j; return rest; }
-      return j[ci] === next ? j : {...j, [ci]: next};
-    });
-
     try {
-      let fresh = await poll().catch(() => rows);
-      const held = await cachedChapters(key);
-      /* What was asked for, written down before anything is asked of the server.
-         This ladder is a foreground process and the phone will suspend it: the
-         record in IndexedDB is what lets the next foreground finish the job
-         (lib/reconcile.ts), and it has to exist before the first await or a
-         selection confirmed as the screen locks is a selection nobody remembers. */
-      await db.addDownload({
-        key, path: n.book?.path, chapters: cis.filter((ci) => !held.has(ci)), ts: Date.now(),
-      }).catch(() => {});
-
-      const toRender = needsRender(fresh.filter((r) => cis.includes(r.i)), held);
-      /* The whole selection's renders go up in one call, and the queue that
-         comes back is the receipt each chapter's loop starts from. `pack: true`
-         is the other half: it makes the call a standing order the server
-         finishes on its own, so the rungs below are a *fast path* for an app
-         that stays open rather than the only way a chapter ever gets packed. */
-      let queued: RenderResult | null = null;
-      if (toRender.length) {
-        for (const ci of toRender) job(ci, 'queued');
-        queued = await actions.render.mutateAsync({chapters: toRender, pack: true})
-          .catch((e: unknown) => {
-            throw new Error(`could not queue the render: ${msg(e)}`);
-          });
-      }
-
-      for (const ci of cis) {
-        if (held.has(ci)) { job(ci, null); continue; }
-        const t0 = Date.now();
-        /* Whether each ask has been *acknowledged*, and when this chapter's row
-           last changed.
-
-           Both endpoints now say what they did with each chapter - the render
-           queue comes back in the render response, and build reports per-chapter
-           refusals with a reason. So an acknowledged ask is simply waited on,
-           and the repeat is kept for the case it was meant for: a row that has
-           not moved at all for ninety seconds, which is what a lost call or a
-           restarted server looks like from here. (This used to re-ask every
-           twenty seconds, blind, because the responses said nothing.) */
-        const ack = {render: renderAccepted(queued, ci), pack: false};
-        let sig = rowSignature(fresh.find((r) => r.i === ci));
-        let changedAt = Date.now();
-        try {
-          for (;;) {
-            const row = fresh.find((r) => r.i === ci);
-            const now = rowSignature(row);
-            if (now !== sig) { sig = now; changedAt = Date.now(); }
-            const still = {sinceChangeMs: Date.now() - changedAt};
-            const phase = phaseFor(row, false);
-            job(ci, jobFor(phase));
-            if (phase === 'stored') break;
-            if (phase === 'store') {
-              await downloadChapter(key, ci);
-              break;
-            }
-            if (phase === 'queue-render' && shouldReask({acked: ack.render, ...still})) {
-              ack.render = renderAccepted(
-                await actions.render.mutateAsync({chapters: [ci], pack: true}), ci);
-              changedAt = Date.now();
-            }
-            if (phase === 'request-pack' && shouldReask({acked: ack.pack, ...still})) {
-              const verdict = buildVerdict(await actions.build.mutateAsync([ci]), ci);
-              if (verdict.t === 'impossible')
-                throw new Error(`the server will not pack it (${verdict.reason})`);
-              // "taken" and "rendering" are both an answer: stop asking.
-              ack.pack = verdict.t !== 'unknown';
-              changedAt = Date.now();
-            }
-            if (Date.now() - t0 > RUNG_TIMEOUT_MS)
-              throw new Error('the server never finished it');
-            // A rung where the client just acted is re-read straight away; a
-            // rung where the server is working gets the drawer's own cadence.
-            await sleep(isAction(phase) ? 300 : 1500);
-            fresh = await poll().catch(() => fresh);
-          }
-        } catch (e) {
-          setErr(`chapter ${ci + 1}: ${msg(e)}`);
-        } finally {
-          job(ci, null);
-          await n.refreshOffline();
-        }
-      }
+      await n.queueDownload(cis);
     } catch (e) {
       setErr(msg(e));
-    } finally {
-      await n.refreshOffline();
-      /* What this run stored comes off the pending record, and anything it did
-         not reach stays on it. Through the sweep rather than a second bit of
-         bookkeeping here, so there is exactly one answer to "what is still
-         wanted" and it is computed from Cache Storage either way. */
-      await n.sweepDownloads();
-      setRunning(false);
     }
   }
 
@@ -306,7 +209,7 @@ export function ChapterManager({open, active, onPick}: {
     const cis = picks;
     dispatch({t: 'cancel'});
     if (!cis.length || !sel.verb) return;
-    void runDownload(cis);
+    void order(cis);
   }
 
   const loadingRows = isPending && !rows.length;
@@ -314,7 +217,10 @@ export function ChapterManager({open, active, onPick}: {
      in this file: CHAPTER_BITRATE is the box's to set, and an estimate computed
      at the wrong rate is wrong by exactly that ratio. */
   const perMin = n.status?.bitrate_bytes_per_min;
-  const busy = running || Object.keys(jobs).length > 0;
+  /* The button spins while this device has anything queued for this book - not
+     while some run in this component is alive, because there is no run any more
+     and the queue outlives every component that ever touched it. */
+  const busy = n.queuedChapters.size > 0;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -342,7 +248,14 @@ export function ChapterManager({open, active, onPick}: {
             </div>
           )}
           {hits.map((r) => {
-            const s = chapterState(r, n.offlineChapters.has(r.i), fmtBytes, jobs[r.i]);
+            /* The row's badge comes from the durable queue and the row the server
+               reported, in that order - never from component state. A chapter
+               asked for last night still says "queued" on a phone that has been
+               closed and re-opened since, which is the thing the old job map
+               could not do. */
+            const s = chapterState(
+              r, n.offlineChapters.has(r.i), fmtBytes,
+              queueJob(r, n.queuedChapters.has(r.i), n.savingChapters.has(r.i)) ?? undefined);
             const Icon = ICON[s.key];
             const mark = textMark(wordsHere ? wordsHere.has(r.i) : null, connected);
             const MarkIcon = mark ? TEXT_ICON[mark.icon] : null;
@@ -356,7 +269,9 @@ export function ChapterManager({open, active, onPick}: {
                 data-state={s.key}
                 data-picked={picked ? '1' : undefined}
                 title={sel.verb
-                  ? can ? 'tap to download this chapter' : 'already on this device'
+                  ? can ? 'tap to download this chapter'
+                        : n.queuedChapters.has(r.i) ? 'already in the download queue'
+                        : 'already on this device'
                   // Whichever tier is the news. A chapter whose words are not
                   // here outranks anything the audio state has to say about it.
                   : mark ? `${mark.tip}\n${s.tip}` : s.tip}
@@ -460,12 +375,35 @@ export function ChapterManager({open, active, onPick}: {
         </div>
       ) : (
         <div className="flex items-center gap-2 border-t border-border px-3 py-2">
-          <Button data-testid="start-download" size="sm" variant="outline" disabled={busy}
+          {/* Never disabled while the queue runs. The queue is a queue: adding
+              to it is the obvious thing to do while it is working, and the old
+              button - disabled for as long as anything was in flight - made a
+              night's download feel like a mode he had to wait out. */}
+          <Button data-testid="start-download" size="sm" variant="outline"
                   onClick={() => dispatch({t: 'start', verb: 'download'})}
                   title="Pick chapters to keep on this device. The server renders whatever needs it first.">
             {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Download className="size-3.5" />}
             download…
           </Button>
+          {/* The queue, said out loud. It outlives this drawer and this app, so
+              it has to be visible somewhere that is not a row you have scrolled
+              past - and it has to be possible to change your mind. */}
+          {busy && (
+            <span data-testid="queue-count"
+                  className="min-w-0 truncate text-[11px] text-muted-foreground tabular-nums">
+              {n.queuedChapters.size} queued
+              {n.savingChapters.size > 0 && ` · ${n.savingChapters.size} saving`}
+              <button
+                data-testid="queue-cancel"
+                onClick={() => void n.unqueueDownload([...n.queuedChapters])}
+                title="Stop waiting for these. Chapters already on this device stay."
+                className="ml-1.5 underline decoration-dotted underline-offset-2
+                           transition-colors hover:text-foreground"
+              >
+                cancel
+              </button>
+            </span>
+          )}
           {err && (
             <span data-testid="chapter-error" className="ml-auto min-w-0 truncate text-[11px] text-destructive">
               {err}
@@ -486,4 +424,3 @@ function sizeOf(rows: ChapRow[], bytesPerMin?: number): string {
 }
 
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

@@ -29,14 +29,17 @@ import {
 import {loadChapterText, shardOf, type TextSources} from './lib/chaptertext';
 import {
   arbitrate, connectLive, lostSession, type HelloEvent, type LiveState, type PositionEvent,
+  type RenderEvent,
 } from './lib/live';
 import {isSane, type Manifest} from './lib/manifest';
 import {openSequence} from './lib/opening';
 import {Player, type PlayMode} from './lib/player';
 import {
   bookKey, cachedChapters, cachedShards, downloadChapter, downloadText, removeBook, removeChapter,
+  requestPersistence,
 } from './lib/offline';
-import {reconcile} from './lib/reconcile';
+import {reconcile, SWEEP_EVERY_MS, type PendingDownload} from './lib/reconcile';
+import {buildChapters, cancelChapters, renderChapters} from './lib/api';
 import {chaptersToTrim, furthestReached, KEEP_BEHIND} from './lib/autotrim';
 import {clampResume, resolveResume, type Resume} from './lib/resume';
 import * as db from './lib/db';
@@ -70,6 +73,17 @@ interface Ctx {
   message: string | null;
   conn: ConnState;
   offlineChapters: Set<number>;
+  /**
+   * The download queue as it stands on this device, for the open book: every
+   * chapter asked for and not yet stored, whoever asked and however long ago.
+   *
+   * Read straight off the durable record in IndexedDB rather than from whatever
+   * run placed it, which is the whole point - a selection confirmed last night
+   * has no run any more, and the rows still have to say it is coming.
+   */
+  queuedChapters: Set<number>;
+  /** The chapters being copied onto the device right now. */
+  savingChapters: Set<number>;
   textShards: Set<number>;
   textBusy: boolean;
   textProgress: TextProgress | null;
@@ -109,6 +123,10 @@ interface Ctx {
   nudge: (s: number) => void;
   setFontScale: (n: number) => void;
   refreshOffline: () => Promise<void>;
+  /** Put chapters in the download queue and start working on it straight away. */
+  queueDownload: (cis: number[]) => Promise<void>;
+  /** Take chapters back out of it. */
+  unqueueDownload: (cis: number[]) => Promise<void>;
   /**
    * Catch up on downloads the server finished while this device was away - see
    * lib/reconcile.ts. Runs itself on every way back into the app; exposed so a
@@ -153,6 +171,35 @@ const writeFurthest = (key: string, ci: number) => {
   try { localStorage.setItem(FURTHEST_KEY + key, String(ci)); } catch { /* private mode */ }
 };
 
+/* When this device last touched each downloaded chapter, by cache key.
+   "Touched" is read *or* stored, which is the distinction that matters: a chapter
+   downloaded ahead and not reached yet has been touched, so a jump forward and
+   back does not cost the chapters in between (lib/autotrim.ts). Pruned to what
+   is actually downloaded on every trim, so it stays the size of the wake rather
+   than the size of the book, and it lives in localStorage for the same reason
+   the anchor does - losing it costs one round of housekeeping, not a position. */
+const TOUCH_KEY = 'narrator.touched:';
+const readTouched = (key: string): Map<number, number> => {
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(TOUCH_KEY + key) ?? '{}');
+    if (!raw || typeof raw !== 'object') return new Map();
+    return new Map(Object.entries(raw as Record<string, number>)
+      .map(([ci, at]) => [Number(ci), Number(at)] as const)
+      .filter(([ci, at]) => Number.isInteger(ci) && Number.isFinite(at)));
+  } catch { return new Map(); }
+};
+const writeTouched = (key: string, m: ReadonlyMap<number, number>) => {
+  try {
+    localStorage.setItem(TOUCH_KEY + key,
+                         JSON.stringify(Object.fromEntries([...m].map(([ci, at]) => [ci, at]))));
+  } catch { /* private mode */ }
+};
+const touchChapter = (key: string, ci: number) => {
+  const m = readTouched(key);
+  m.set(ci, Date.now());
+  writeTouched(key, m);
+};
+
 /* Books whose offline text he removed on purpose. Removing it and having it
    silently come back on the next open would be the same surprise twice. */
 const OPTOUT_KEY = 'narrator.notext';
@@ -168,6 +215,17 @@ const writeOptOut = (l: string[]) => {
    a `/api/load` per flap. */
 const HEAL_MIN_MS = 10_000;
 
+/**
+ * How often the outbox is drained while the app is open, on top of every edge
+ * that already drains it.
+ *
+ * A minute rather than the queue's twenty seconds: a memo that is not going
+ * anywhere is not going anywhere faster for being asked more often, and each
+ * pass that finds a stalled memo re-uploads nothing - it asks the server whether
+ * the note was filed, which is a few hundred bytes.
+ */
+const OUTBOX_EVERY_MS = 60_000;
+
 export function NarratorProvider({children}: {children: ReactNode}) {
   const qc = useQueryClient();
   const [book, setBook] = useState<OpenBook | null>(null);
@@ -182,6 +240,8 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const [waiting, setWaiting] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [offlineChapters, setOfflineChapters] = useState<Set<number>>(new Set());
+  const [pendingDownloads, setPendingDownloads] = useState<PendingDownload[]>([]);
+  const [saving, setSaving] = useState<Set<string>>(new Set());
   const [textShards, setTextShards] = useState<Set<number>>(new Set());
   const [textBusy, setTextBusy] = useState(false);
   const [textProgress, setTextProgress] = useState<TextProgress | null>(null);
@@ -221,6 +281,23 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   indexRef.current = index;
 
   const textOptOut = !!book && optOut.includes(book.key);
+
+  /* The queue, narrowed to the book on screen. Chapters already on the device
+     are dropped here rather than in the record: the record is the *order* and it
+     is settled against Cache Storage by the sweep, so this is only ever asking
+     "what is still coming". */
+  const queuedChapters = useMemo(() => {
+    const mine = pendingDownloads.find((p) => p.key === book?.key);
+    return new Set((mine?.chapters ?? []).filter((ci) => !offlineChapters.has(ci)));
+  }, [pendingDownloads, book?.key, offlineChapters]);
+  const savingChapters = useMemo(() => {
+    const out = new Set<number>();
+    for (const k of saving) {
+      const at = k.lastIndexOf('/');
+      if (k.slice(0, at) === book?.key) out.add(Number(k.slice(at + 1)));
+    }
+    return out;
+  }, [saving, book?.key]);
 
   /* The connection indicator, derived rather than tracked - and now derived from
      the live stream first, because the stream is the honest signal: it is a
@@ -328,6 +405,16 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   useEffect(() => {
     const wake = () => void flush();
     const un = onlineManager.subscribe((online) => { if (online) wake(); });
+    /* And a floor under all of it, for the same reason the download queue has
+       one. Every other trigger here is an *edge* - the network returned, the app
+       came back, the heartbeat recovered - and a memo can outlive all of them
+       without one firing: on this box a one-minute recording is half an hour of
+       whisper, so the POST that carries it routinely dies with the screen and
+       the app is simply open, in the foreground, when the note finally lands.
+       Without a tick, the only thing that asks "did it get filed?" is the user
+       switching apps and coming back. `nextAction` still decides whether a memo
+       is uploaded again; a stalled one costs a few hundred bytes to ask about. */
+    const tick = setInterval(wake, OUTBOX_EVERY_MS);
     // Coming back to the app re-asks the server immediately rather than waiting
     // for the next tick of a poll that may have been suspended while hidden.
     const vis = () => {
@@ -338,7 +425,8 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     document.addEventListener('visibilitychange', vis);
     window.addEventListener('pagehide', wake);
     window.addEventListener('focus', vis);
-    return () => { un(); document.removeEventListener('visibilitychange', vis);
+    return () => { un(); clearInterval(tick);
+                   document.removeEventListener('visibilitychange', vis);
                    window.removeEventListener('focus', vis);
                    window.removeEventListener('pagehide', wake); };
   }, [flush, qc]);
@@ -351,50 +439,143 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   }, []);
 
   /**
-   * The foreground reconciliation sweep - lib/reconcile.ts, bound to this app.
+   * The download queue's runner - lib/reconcile.ts, bound to this app.
    *
    * A download is two halves and only one of them can happen here. The server
    * takes the order (`pack: true`) and finishes it whatever happens to this
    * device, restart included; copying the m4a into Cache Storage is the device's
    * half, and iOS suspends the device's half within seconds of the screen going
-   * off. So every way back into the app asks the one question that closes the
-   * gap: of the chapters still pending, which are packed and not here yet?
+   * off. So this asks, on every trigger there is: of the chapters still pending,
+   * which does the server still need telling about, and which are packed and not
+   * here yet?
+   *
+   * It is the *only* thing that downloads a chapter now. The drawer writes the
+   * selection to IndexedDB and calls this; everything after that - the order to
+   * the server, the wait, the copy, the retry - happens here, where it survives
+   * the drawer being closed and the app being killed.
    *
    * Guarded against overlapping runs rather than queued: two sweeps would fetch
    * the same chapters twice, and the second one's answer is the same as the
-   * first's by the time it lands.
+   * first's by the time it lands. A trigger that arrives during a run sets a
+   * flag instead, so a `packed` event landing mid-sweep is not simply dropped.
    */
   const sweeping = useRef(false);
+  const again = useRef(false);
+  /* What was last ordered per book, and when. In a ref because it is neither
+     render state nor worth persisting: the order itself is on disk at both ends,
+     and forgetting this only costs one extra POST after a reload. */
+  const orderedRef = useRef(new Map<string, {sig: string; at: number}>());
+
+  const readPending = useCallback(async () => {
+    const all = await db.allDownloads().catch(() => [] as PendingDownload[]);
+    setPendingDownloads(all);
+    return all;
+  }, []);
+
   const sweepDownloads = useCallback(async () => {
-    if (sweeping.current) return;
+    if (sweeping.current) { again.current = true; return; }
     sweeping.current = true;
     try {
-      const out = await reconcile({
-        pending: db.allDownloads,
-        rows: async (key) => (await fetchChapters(key)).chapters,
-        stored: cachedChapters,
-        fetchChapter: downloadChapter,
-        save: db.putDownload,
-        drop: db.deleteDownload,
-      });
-      if (out.some((b) => b.fetched.length)) {
-        await refreshOffline();
-        void qc.invalidateQueries({queryKey: keys.chapters});
-      }
+      do {
+        again.current = false;
+        const out = await reconcile({
+          pending: readPending,
+          rows: async (key) => (await fetchChapters(key)).chapters,
+          stored: cachedChapters,
+          fetchChapter: downloadChapter,
+          save: db.putDownload,
+          drop: db.deleteDownload,
+          order: (key, o) => Promise.all([
+            o.render.length ? renderChapters(key, o.render, true) : null,
+            o.build.length ? buildChapters(key, o.build) : null,
+          ]),
+          lastOrder: (key) => {
+            const had = orderedRef.current.get(key);
+            return {sig: had?.sig ?? null, sinceMs: had ? Date.now() - had.at : Infinity};
+          },
+          onOrdered: (key, sig) => orderedRef.current.set(key, {sig, at: Date.now()}),
+          /* Which chapters are moving right now, so the row can say "saving"
+             rather than sitting on "ready" for the two minutes a 6 MB chapter
+             takes. Keyed by book too: a sweep walks every pending book. */
+          onFetching: (key, ci, active) => setSaving((had) => {
+            const next = new Set(had);
+            if (active) next.add(`${key}/${ci}`); else next.delete(`${key}/${ci}`);
+            return next;
+          }),
+          /* Each chapter as it lands, not the whole sweep at the end. A
+             twenty-chapter order is an hour of sweeping, and a list that says
+             nothing for an hour and then everything at once is indistinguishable
+             from one that is stuck. One Cache Storage scan per chapter. */
+          onStored: (key, ci) => { touchChapter(key, ci); void refreshOffline(); },
+        });
+        await readPending();
+        if (out.some((b) => b.fetched.length)) {
+          await refreshOffline();
+          void qc.invalidateQueries({queryKey: keys.chapters});
+        }
+      } while (again.current);
     } catch {
-      // A sweep that cannot run is a sweep that runs on the next way in. There
+      // A sweep that cannot run is a sweep that runs on the next trigger. There
       // is nothing to report: the pending record is untouched.
     } finally {
       sweeping.current = false;
     }
-  }, [refreshOffline, qc]);
+  }, [refreshOffline, readPending, qc]);
 
-  /* Every way back in. `visibilitychange` and `focus` are the app being opened
-     or switched to, the online manager is the network returning, and the call
-     below is the app *starting* - a cold launch after the phone killed the tab
-     mid-download, which is the case this whole thing exists for. The other
-     trigger is `hello` off the live stream; it is in `onHello`, because a
-     reconnect is a gap whether or not the tab was ever hidden. */
+  /** Add to the queue, write it down, and start on it now. */
+  const queueDownload = useCallback(async (cis: number[]) => {
+    const b = bookRef.current;
+    if (!b || !cis.length) return;
+    const held = await cachedChapters(b.key);
+    const want = cis.filter((ci) => !held.has(ci));
+    if (!want.length) return;
+    /* Written down *before* anything is asked of the server. The queue is what
+       finishes the job; a selection confirmed as the screen locks has to be one
+       the next launch remembers. */
+    await db.addDownload({key: b.key, path: b.path, chapters: want, ts: Date.now()})
+      .catch(() => {});
+    await readPending();
+    /* A fresh selection is a changed order, so the sweep posts it on this pass
+       rather than waiting out the repeat interval. */
+    orderedRef.current.delete(b.key);
+    await sweepDownloads();
+  }, [readPending, sweepDownloads]);
+
+  /**
+   * Take chapters back out of the queue. What is already stored stays stored.
+   *
+   * Both halves, because only doing the device half would be a lie: the order is
+   * on the server too, and a box left rendering seventy chapters nobody wants is
+   * the whole night on two ARM cores. The server's refusal is not fatal - this
+   * device has stopped waiting either way, and the record here is what decides
+   * whether anything gets stored.
+   */
+  const unqueueDownload = useCallback(async (cis: number[]) => {
+    const b = bookRef.current;
+    if (!b || !cis.length) return;
+    const drop = new Set(cis);
+    const had = (await db.allDownloads().catch(() => [])).find((p) => p.key === b.key);
+    const left = (had?.chapters ?? []).filter((ci) => !drop.has(ci));
+    if (had) {
+      if (left.length) await db.putDownload({...had, chapters: left});
+      else await db.deleteDownload(b.key);
+    }
+    orderedRef.current.delete(b.key);
+    await readPending();
+    await cancelChapters(b.key, [...drop]).catch(() => {});
+    void qc.invalidateQueries({queryKey: keys.chapters});
+  }, [readPending, qc]);
+
+  /* Every way back in, and a floor under them.
+     `visibilitychange` and `focus` are the app being opened or switched to, the
+     online manager is the network returning, and the call below is the app
+     *starting* - a cold launch after the phone killed the tab mid-download,
+     which is the case this whole thing exists for. The interval is what makes
+     the queue a queue rather than a catch-up pass: chapters finish packing on
+     the server minutes apart, and the app being open is not a reason to wait for
+     the next time it is backgrounded. The other triggers are `hello` and a
+     `packed` render event off the live stream - both in the stream's handler,
+     because a reconnect is a gap whether or not the tab was ever hidden. */
   useEffect(() => {
     const go = () => {
       if (document.visibilityState === 'visible') void sweepDownloads();
@@ -402,13 +583,22 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     document.addEventListener('visibilitychange', go);
     window.addEventListener('focus', go);
     const un = onlineManager.subscribe((online) => { if (online) void sweepDownloads(); });
+    const tick = setInterval(go, SWEEP_EVERY_MS);
+    void readPending();
     void sweepDownloads();
+    /* Ask for storage that survives pressure. Never granted on iOS today and
+       never assumed - every read falls back to the network and the chapter list
+       is rebuilt from what Cache Storage still holds - but on a device that does
+       grant it, it is the difference between a night of downloads and a morning
+       of them being gone. Asked once, silently: a refusal is not news. */
+    void requestPersistence();
     return () => {
       document.removeEventListener('visibilitychange', go);
       window.removeEventListener('focus', go);
+      clearInterval(tick);
       un();
     };
-  }, [sweepDownloads]);
+  }, [sweepDownloads, readPending]);
 
   /**
    * Give back the chapters he has left behind.
@@ -423,7 +613,14 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const trimBehind = useCallback(async (key: string, ci: number) => {
     const furthest = furthestReached(readFurthest(key), ci);
     writeFurthest(key, furthest);
-    const gone = chaptersToTrim(await cachedChapters(key), furthest, KEEP_BEHIND, [ci]);
+    const held = await cachedChapters(key);
+    const touched = readTouched(key);
+    const gone = chaptersToTrim(held, furthest, KEEP_BEHIND, [ci], touched);
+    /* Prune the log to what is actually on the device, whether or not anything
+       is being given back. Otherwise it grows one entry per chapter ever read
+       and, on a 1433-chapter novel, becomes the largest thing in localStorage. */
+    for (const c of [...touched.keys()]) if (!held.has(c) || gone.includes(c)) touched.delete(c);
+    writeTouched(key, touched);
     if (!gone.length) return;
     for (const c of gone) await removeChapter(key, c);
     await refreshOffline();
@@ -492,7 +689,9 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     });
     player?.setMedia(b.title, text.title);
     // ...then the housekeeping, after it, so the two cannot race to set the same
-    // offline state with different answers.
+    // offline state with different answers. The touch goes first, or the trim
+    // that follows could give back the chapter just opened.
+    touchChapter(b.key, target);
     void refreshOffline().then(() => trimBehind(b.key, target));
     return true;
   }, [qc, player, refreshOffline, trimBehind, openSeq]);
@@ -762,13 +961,24 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     })();
   }, [qc, sweepDownloads]);
 
+  /* A chapter finished packing on the server: the one moment the queue can
+     actually act on. Without this the device only learned about it the next time
+     the app was backgrounded and re-opened, which is why a night of rendering
+     used to produce nothing on the phone until it was picked up in the morning.
+     Cheap when nothing is pending (one IndexedDB read), and the sweep coalesces
+     a burst of them into one pass. */
+  const onRender = useCallback((ev: RenderEvent) => {
+    if (ev.kind === 'packed') void sweepDownloads();
+  }, [sweepDownloads]);
+
   useEffect(() => connectLive(qc, {
     onState: setLive,
     onEvent: (ev) => {
       if (ev.name === 'position') onPosition(ev.data);
       else if (ev.name === 'hello') onHello(ev.data);
+      else if (ev.name === 'render') onRender(ev.data);
     },
-  }), [qc, onPosition, onHello]);
+  }), [qc, onPosition, onHello, onRender]);
 
   const follow = useCallback(() => {
     const to = moved;
@@ -786,19 +996,23 @@ export function NarratorProvider({children}: {children: ReactNode}) {
 
   const value = useMemo<Ctx>(() => ({
     book, chapters, index, ci, chunks, paras, chapterTitle, idx, mode, playing, waiting,
-    message, conn, offlineChapters, textShards, textBusy, textProgress, textOptOut,
+    message, conn, offlineChapters, queuedChapters, savingChapters,
+    textShards, textBusy, textProgress, textOptOut,
     textMissing, chapterLoading, bookLoading, resumedAt, queued, fontScale,
     status: status.data,
     moved, follow, dismissMoved,
     openBook, openChapter, goChapter, setIdx, toggle,
     nudge: (s: number) => player?.nudge(s),
-    setFontScale, refreshOffline, sweepDownloads, saveText, dropBook, flush, queueNote, player,
+    setFontScale, refreshOffline, queueDownload, unqueueDownload, sweepDownloads,
+    saveText, dropBook, flush, queueNote, player,
   }), [book, chapters, index, ci, chunks, paras, chapterTitle, idx, mode, playing, waiting,
-       message, conn, offlineChapters, textShards, textBusy, textProgress, textOptOut,
+       message, conn, offlineChapters, queuedChapters, savingChapters,
+       textShards, textBusy, textProgress, textOptOut,
        textMissing, chapterLoading, bookLoading, resumedAt, queued, fontScale, moved,
        follow, dismissMoved,
        status.data, openBook, openChapter, goChapter, setIdx, toggle, setFontScale,
-       refreshOffline, sweepDownloads, saveText, dropBook, flush, queueNote, player]);
+       refreshOffline, queueDownload, unqueueDownload, sweepDownloads,
+       saveText, dropBook, flush, queueNote, player]);
 
   // A handle for the dev console and for driving the reader from a headless
   // browser. Dev only: the production bundle has no such door.

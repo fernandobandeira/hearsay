@@ -219,51 +219,48 @@ export function useLoadBook() {
   });
 }
 
+/** The chapter list, fetched once rather than polled — what a download run walks. */
+export const fetchChapters = (book: string | null): Promise<ChaptersResult> =>
+  call(sdk.chaptersList({query: {book: book ?? undefined}}));
+
 /**
- * The chapter verbs, each aimed at a named book.
+ * The two chapter orders, each aimed at a named book.
  *
  * This is the request where getting the book wrong is expensive rather than
  * merely wrong: one tap can queue 74 chapters, and on the wrong novel that is
  * the render worker's afternoon. The reader has no way to close that race on its
  * own - the server can, and does, with a 409.
+ *
+ * Plain functions rather than mutation hooks, because what places them is the
+ * download queue (lib/reconcile.ts) and that is not a component: it runs on a
+ * timer, on a live event and on a cold launch, long after whatever drawer
+ * confirmed the selection has been unmounted.
+ *
+ * `pack: true` is what makes a download survive the app being closed. Without it
+ * the server renders all night and packs nothing, because packing was the
+ * client's move and iOS suspends the client seconds after the screen goes off.
+ * With it the server chains render -> pack itself and writes the order to disk,
+ * so a restart does not cancel it either. See src/wishlist.rs, and
+ * lib/reconcile.ts for the device half of the same promise.
  */
-export function useChapterActions(book: string | null) {
-  const qc = useQueryClient();
-  const bump = () => void qc.invalidateQueries({queryKey: keys.chapters});
-  const on = book ?? undefined;
-  return {
-    /**
-     * Queue renders, and - with `pack` - leave a standing order to pack each one
-     * as it completes.
-     *
-     * `pack: true` is what makes a download survive the app being closed. Without
-     * it the server renders all night and packs nothing, because packing was the
-     * client's move and iOS suspends the client seconds after the screen goes
-     * off. With it the server chains render -> pack itself and writes the order
-     * to disk, so a restart does not cancel it either. See src/wishlist.rs and
-     * lib/reconcile.ts, which is the device half of the same promise.
-     */
-    render: useMutation<RenderResult, Error, {chapters: number[]; pack?: boolean}>({
-      mutationFn: ({chapters, pack}) =>
-        call(sdk.chaptersRender({body: {chapters, pack, book: on}})),
-      onSuccess: bump,
-    }),
-    build: useMutation<BuildResult, Error, number[]>({
-      mutationFn: (chapters) =>
-        call(sdk.chaptersBuild({body: {chapters, book: on}})),
-      onSuccess: bump,
-    }),
-    cancel: useMutation<CancelResult, Error, number[] | undefined>({
-      mutationFn: (chapters) =>
-        call(sdk.chaptersCancel({body: chapters ? {chapters, book: on} : {book: on}})),
-      onSuccess: bump,
-    }),
-  };
-}
+export const renderChapters = (
+  book: string | null, chapters: number[], pack = true,
+): Promise<RenderResult> =>
+  call(sdk.chaptersRender({body: {chapters, pack, book: book ?? undefined}}));
 
-/** The chapter list, fetched once rather than polled — what a download run walks. */
-export const fetchChapters = (book: string | null): Promise<ChaptersResult> =>
-  call(sdk.chaptersList({query: {book: book ?? undefined}}));
+export const buildChapters = (book: string | null, chapters: number[]): Promise<BuildResult> =>
+  call(sdk.chaptersBuild({body: {chapters, book: book ?? undefined}}));
+
+/**
+ * Take chapters back off the server's queue.
+ *
+ * The other half of cancelling a download, and the half that costs something:
+ * dropping the order on this device stops the *storing*, but the box would
+ * happily spend the night rendering 74 chapters nobody is waiting for any more.
+ * On two ARM cores at a quarter of realtime that is the whole night.
+ */
+export const cancelChapters = (book: string | null, chapters: number[]): Promise<CancelResult> =>
+  call(sdk.chaptersCancel({body: {chapters, book: book ?? undefined}}));
 
 /** Chapter text, straight from the endpoint (the cached-shard route is in state). */
 export const fetchChapterText = (key: string | null, ci: number): Promise<ChapterText> =>

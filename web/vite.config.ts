@@ -34,6 +34,15 @@ export default defineConfig({
       },
       workbox: {
         // The shell is precached by Workbox from the build manifest.
+        //
+        // Every runtime rule below skips a request carrying `x-narrator-store`.
+        // That header marks a *deliberate* save - the download action writing an
+        // entry with `Cache.put` from the page - and a strategy that also
+        // handled it would be a second writer on one streaming body: on WebKit
+        // that surfaces either as `FetchEvent.respondWith received an error` in
+        // the page or, worse, as an entry that reads back fine all session and
+        // is gone after the next launch. The rules exist to *serve* those
+        // entries back; writing them is lib/offline.ts's job alone.
         globPatterns: ['**/*.{js,css,html,png,svg,woff2}'],
         navigateFallback: '/index.html',
         navigateFallbackDenylist: [/^\/api\//, /^\/healthz/],
@@ -42,8 +51,8 @@ export default defineConfig({
           {
             // The book's words: small, taken on first open, and the whole reason
             // the reader works with no network.
-            urlPattern: ({url}) => url.pathname === '/api/book.json'
-              || url.pathname.startsWith('/api/text/'),
+            urlPattern: ({url, request}) => request.headers.get('x-narrator-store') !== '1'
+              && (url.pathname === '/api/book.json' || url.pathname.startsWith('/api/text/')),
             handler: 'StaleWhileRevalidate',
             options: {
               cacheName: 'narrator-text',
@@ -67,7 +76,8 @@ export default defineConfig({
             // budget: on a 1433-chapter novel every chapter visited added an
             // entry until the shards - downloaded first, therefore oldest - were
             // evicted out from under the offline reader.
-            urlPattern: ({url}) => /^\/api\/chapter\/\d+$/.test(url.pathname),
+            urlPattern: ({url, request}) => request.headers.get('x-narrator-store') !== '1'
+              && /^\/api\/chapter\/\d+$/.test(url.pathname),
             handler: 'NetworkFirst',
             options: {
               cacheName: 'narrator-chapter',
@@ -82,7 +92,8 @@ export default defineConfig({
             // entries are put there deliberately by the download action; this
             // rule is what serves them back (Range included - Workbox's
             // rangeRequests plugin slices the cached body).
-            urlPattern: ({url}) => /^\/api\/chapters\/\d+\.(m4a|json)$/.test(url.pathname),
+            urlPattern: ({url, request}) => request.headers.get('x-narrator-store') !== '1'
+              && /^\/api\/chapters\/\d+\.(m4a|json)$/.test(url.pathname),
             handler: 'CacheFirst',
             options: {
               cacheName: 'narrator-audio',

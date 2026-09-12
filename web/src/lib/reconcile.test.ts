@@ -1,7 +1,7 @@
 import {describe, expect, test} from 'vitest';
 import {
-  mergePending, reconcile, remaining, toFetch,
-  type PendingDownload, type SweepDeps,
+  mergePending, orderSignature, reconcile, remaining, shouldOrder, toFetch, toOrder,
+  ORDER_EVERY_MS, type PendingDownload, type SweepDeps,
 } from './reconcile';
 import type {ChapRow} from './types';
 
@@ -89,10 +89,24 @@ function device(opts: {
   rows?: readonly ChapRow[] | null;
   stored?: Set<number>;
   fails?: ReadonlySet<number>;
+  /** collect the standing orders this device placed */
+  orders?: {key: string; render: number[]; build: number[]}[];
+  /** how long ago this device last ordered, per book */
+  since?: () => number;
+  parallel?: number;
+  /** resolve each chapter's copy by hand, to watch how many run at once */
+  gate?: (ci: number) => Promise<void>;
 }) {
   const stored = opts.stored ?? new Set<number>();
   const asked: number[] = [];
+  const sigs = new Map<string, string>();
   const deps: SweepDeps = {
+    parallel: opts.parallel,
+    ...(opts.orders ? {
+      order: async (key, o) => { opts.orders?.push({key, ...o}); },
+      lastOrder: (key) => ({sig: sigs.get(key) ?? null, sinceMs: opts.since?.() ?? 0}),
+      onOrdered: (key, sig) => sigs.set(key, sig),
+    } : {}),
     pending: async () => [...opts.store.values()],
     rows: async (key) => {
       if (!opts.rows) throw new Error(`no network (${key})`);
@@ -101,6 +115,7 @@ function device(opts: {
     stored: async () => new Set(stored),
     fetchChapter: async (_key, ci) => {
       asked.push(ci);
+      await opts.gate?.(ci);
       if (opts.fails?.has(ci)) throw new Error('the tunnel went away');
       stored.add(ci);
     },
@@ -270,5 +285,165 @@ describe('the pending record round-trips', () => {
     await reconcile(d.deps);
     expect(store.get('lom')).toEqual(
       {key: 'lom', path: '/books/lom.epub', chapters: [12, 13], ts: 2});
+  });
+});
+
+// ------------------------------------------------- the server's half of it
+
+describe('toOrder - what the server still has to be told', () => {
+  test('a chapter with no audio at all wants rendering, with a pack behind it', () => {
+    const rows = [row(1, {rendered: 0, n: 40})];
+    expect(toOrder(pending([1]), rows, new Set())).toEqual({render: [1], build: []});
+  });
+
+  test('a fully rendered chapter wants packing, and would never have been ordered', () => {
+    // This is the gap that made "download" silently do nothing for a chapter
+    // the server had already rendered: `pack: true` rides on a *render* call,
+    // and this chapter needs no render, so nothing ever asked for the pack.
+    expect(toOrder(pending([2]), [row(2, {rendered: 40, n: 40})], new Set()))
+      .toEqual({render: [], build: [2]});
+  });
+
+  test('work already under way is not re-ordered', () => {
+    const rows = [row(1, {queued: true, rendered: 0}), row(2, {pack_queued: true}),
+                  row(3, {packing: true}), packed(4)];
+    expect(toOrder(pending([1, 2, 3, 4]), rows, new Set()))
+      .toEqual({render: [], build: []});
+  });
+
+  test('a chapter the rows do not mention has never been asked for', () => {
+    expect(toOrder(pending([9]), [packed(1)], new Set())).toEqual({render: [9], build: []});
+  });
+
+  test('what is already on the device is nobody\'s order', () => {
+    expect(toOrder(pending([1, 2]), [row(1, {rendered: 0}), row(2, {rendered: 0})],
+                   new Set([1, 2]))).toEqual({render: [], build: []});
+  });
+});
+
+describe('shouldOrder - saying it again, and not more often than that', () => {
+  const sig = (o: {render: number[]; build: number[]}) => orderSignature(o);
+
+  test('a changed ask goes up immediately', () => {
+    expect(shouldOrder({want: 'r1|b', last: 'r1,2|b', sinceMs: 0})).toBe(true);
+  });
+
+  test('the same ask waits out the interval - the order is on disk at both ends', () => {
+    expect(shouldOrder({want: 'r1|b', last: 'r1|b', sinceMs: 1_000})).toBe(false);
+    expect(shouldOrder({want: 'r1|b', last: 'r1|b', sinceMs: ORDER_EVERY_MS})).toBe(true);
+  });
+
+  test('nothing to ask for is never an ask', () => {
+    expect(sig({render: [], build: []})).toBe('');
+    expect(shouldOrder({want: '', last: null, sinceMs: Infinity})).toBe(false);
+  });
+
+  test('render and pack are distinguishable, so one becoming the other re-asks', () => {
+    expect(sig({render: [1], build: []})).not.toBe(sig({render: [], build: [1]}));
+  });
+});
+
+describe('the sweep places the order as well as storing the file', () => {
+  test('a pending chapter nobody told the server about is ordered on this pass', async () => {
+    const orders: {key: string; render: number[]; build: number[]}[] = [];
+    const store = new Map([['lom', pending([1, 2])]]);
+    // 1 has no audio, 2 is rendered and waiting for a packer nobody called.
+    const d = device({store, orders, rows: [row(1, {rendered: 0}), row(2, {rendered: 40})]});
+
+    await reconcile(d.deps);
+    expect(orders).toEqual([{key: 'lom', render: [1], build: [2]}]);
+    expect(store.get('lom')?.chapters).toEqual([1, 2]);   // still pending, correctly
+  });
+
+  test('the same order is not repeated on the next pass', async () => {
+    const orders: {key: string; render: number[]; build: number[]}[] = [];
+    const store = new Map([['lom', pending([1])]]);
+    const d = device({store, orders, rows: [row(1, {rendered: 0})], since: () => 1_000});
+
+    await reconcile(d.deps);
+    await reconcile(d.deps);
+    expect(orders).toHaveLength(1);
+  });
+
+  test('an order that could not be placed is retried, and does not stop the storing', async () => {
+    const store = new Map([['lom', pending([1, 2])]]);
+    const d = device({store, rows: [row(1, {rendered: 0}), packed(2)]});
+    d.deps.order = async () => { throw new Error('409: another book'); };
+    d.deps.lastOrder = () => ({sig: null, sinceMs: 0});
+
+    const [out] = await reconcile(d.deps);
+    expect(out.ordered).toBeUndefined();     // nothing to remember: it did not land
+    expect(out.fetched).toEqual([2]);        // the packed one still came down
+  });
+
+  test('offline, no order is attempted at all', async () => {
+    const orders: {key: string; render: number[]; build: number[]}[] = [];
+    const store = new Map([['lom', pending([1])]]);
+    await reconcile(device({store, orders, rows: null}).deps);
+    expect(orders).toEqual([]);
+  });
+});
+
+// ----------------------------------------------------------- three at a time
+
+describe('chapters are copied in parallel', () => {
+  /** Let every pending microtask and timer settle, so the pool has actually run. */
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  /** Hold every copy open until `release` is called, and count the overlap. */
+  function gated() {
+    const open = new Set<number>();
+    let peak = 0;
+    const waiting: (() => void)[] = [];
+    return {
+      peak: () => peak,
+      open,
+      gate: (ci: number) => new Promise<void>((resolve) => {
+        open.add(ci);
+        peak = Math.max(peak, open.size);
+        waiting.push(() => { open.delete(ci); resolve(); });
+      }),
+      release: () => { for (const f of waiting.splice(0)) f(); },
+    };
+  }
+
+  test('three run at once, and the fourth waits for a free worker', async () => {
+    const g = gated();
+    const store = new Map([['lom', pending([1, 2, 3, 4, 5])]]);
+    const rows = [1, 2, 3, 4, 5].map(packed);
+    const d = device({store, rows, gate: g.gate, parallel: 3});
+
+    const run = reconcile(d.deps);
+    await tick();
+    expect(g.open.size).toBe(3);        // not one, and not all five
+    g.release();
+    await tick();
+    expect(g.open.size).toBe(2);        // the two that were waiting for a worker
+    g.release();
+    await run;
+
+    expect(g.peak()).toBe(3);
+    expect(d.stored).toEqual(new Set([1, 2, 3, 4, 5]));
+  });
+
+  test('the answer is still in the book\'s order, however they finished', async () => {
+    const store = new Map([['lom', pending([3, 1, 2])]]);
+    const d = device({store, rows: [packed(1), packed(2), packed(3)],
+                      fails: new Set([2]), parallel: 3});
+    const [out] = await reconcile(d.deps);
+    expect(out.fetched).toEqual([1, 3]);
+    expect(out.failed).toEqual([2]);
+  });
+
+  test('one at a time is still available, and is what a single chapter gets', async () => {
+    const g = gated();
+    const store = new Map([['lom', pending([1, 2])]]);
+    const d = device({store, rows: [packed(1), packed(2)], gate: g.gate, parallel: 1});
+    const run = reconcile(d.deps);
+    await tick();
+    expect(g.open.size).toBe(1);
+    g.release(); await tick(); g.release();
+    await run;
+    expect(g.peak()).toBe(1);
   });
 });

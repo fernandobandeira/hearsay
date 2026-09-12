@@ -5,21 +5,30 @@
  * a two-stage pipeline - synthesize every chunk, then pack the chunks into one
  * m4a - and it was on a button because the pipeline was on the screen. Nobody
  * wants a rendered chapter they cannot listen to offline: rendering without
- * downloading is a step, not a goal. So download owns the whole pipeline, and
- * this module is the ladder it climbs, per chapter:
+ * downloading is a step, not a goal. So download means the whole pipeline, and
+ * this module says where in it a chapter is:
  *
  *     queue-render -> await-render -> request-pack -> await-pack -> store
  *
- * Each rung is decided from the row the server just reported, never from a
+ * The phase is decided from the row the server just reported, never from a
  * counter this client keeps - the same disk-truth rule the server's own render
  * worker follows. That matters because every one of these waits is minutes
- * long: the drawer is polled, the app is backgrounded, the row comes back
- * further along than we left it, and a remembered step would be a lie. Ask the
- * row, act once, ask again.
+ * long: the app is backgrounded, the row comes back further along than we left
+ * it, and a remembered step would be a lie. Ask the row.
  *
- * Pure, so the ladder can be tested rather than watched.
+ * **What this module used to also be, and is not any more.** It carried the
+ * bookkeeping for a *client-driven* climb - has the ask been acknowledged, has
+ * the row stopped moving, is it time to ask again - because the drawer used to
+ * walk each chapter up the ladder itself, in component state, one at a time.
+ * That loop is gone: the durable queue in lib/reconcile.ts places a standing
+ * order the server finishes on its own and re-derives what is still owed from
+ * the rows on every pass, so there is nothing to acknowledge and no stall to
+ * detect. What survives here is the reading of a row, which the queue and the
+ * drawer both need.
+ *
+ * Pure, so it can be tested rather than watched.
  */
-import type {BuildResult, ChapRow, RenderResult} from './types';
+import type {ChapRow} from './types';
 
 export type DownloadPhase =
   /** already on this device: nothing to do */
@@ -56,6 +65,29 @@ export function phaseFor(r: ChapRow | undefined, offline: boolean): DownloadPhas
   return 'queue-render';
 }
 
+/**
+ * What this device is doing about a chapter, for the row's badge.
+ *
+ * The drawer used to answer this from a map of jobs kept in component state,
+ * written by the foreground ladder as it climbed. That map was empty after every
+ * restart, so a chapter ordered last night came back looking like a chapter
+ * nobody had asked for - and tapping it downloaded it again. It now comes from
+ * the two facts that outlive the component: the chapter is in the durable queue,
+ * and the sweep is copying it right now.
+ *
+ * `null` means the device is doing nothing about this chapter and the row should
+ * say whatever the server's row says. A queued chapter reports the *server's*
+ * stage - rendering, packing - because that is what it is genuinely waiting on;
+ * "queued" on its own is only right before the server has started.
+ */
+export function queueJob(
+  r: ChapRow | undefined, queued: boolean, saving: boolean,
+): DownloadJob | null {
+  if (saving) return 'saving';
+  if (!queued) return null;
+  return jobFor(phaseFor(r, false));
+}
+
 /** The badge for a rung, or null where the row's own state already says it. */
 export function jobFor(phase: DownloadPhase): DownloadJob | null {
   switch (phase) {
@@ -66,26 +98,6 @@ export function jobFor(phase: DownloadPhase): DownloadJob | null {
     case 'store': return 'saving';
     case 'stored': return null;
   }
-}
-
-/** True while a phase is the client's turn to act rather than to wait. */
-export function isAction(phase: DownloadPhase): boolean {
-  return phase === 'queue-render' || phase === 'request-pack' || phase === 'store';
-}
-
-/**
- * The chapters that need the server to render before anything can be packed.
- *
- * Sent in one call, up front, for the whole selection: the server works a queue
- * one chapter at a time, so telling it about all of them immediately means it
- * is never idle while this client is busy storing an earlier one.
- */
-export function needsRender(
-  rows: readonly ChapRow[], offline: ReadonlySet<number>,
-): number[] {
-  return rows
-    .filter((r) => phaseFor(r, offline.has(r.i)) === 'queue-render')
-    .map((r) => r.i);
 }
 
 /**
@@ -119,71 +131,6 @@ export function estimateBytes(
     else if (r.est_min != null) n += Math.round(r.est_min * rate);
   }
   return n;
-}
-
-// ------------------------------------------------------- reading the answers
-//
-// The server used to answer `/api/chapters/build` with three lists and no way
-// to tell "I refused this one" from "nobody mentioned it", so this client
-// ignored the response entirely and re-asked every twenty seconds until the row
-// moved. It now says what it refused and why, per chapter, which turns the
-// re-ask from a policy into an exception - see `shouldReask`.
-
-export type BuildVerdict =
-  /** The packer has it (or it was already packed). Stop asking. */
-  | {t: 'taken'}
-  /** Not rendered yet; the server queued the render instead. Stop asking. */
-  | {t: 'rendering'; rendered: number; n: number}
-  /** It can never be packed - no such chapter, or no audio in it. Give up. */
-  | {t: 'impossible'; reason: string}
-  /** The answer does not mention it at all: ask again when it makes sense. */
-  | {t: 'unknown'};
-
-export function buildVerdict(r: BuildResult | null | undefined, ci: number): BuildVerdict {
-  if (!r) return {t: 'unknown'};
-  if (r.built?.includes(ci) || r.building?.includes(ci)) return {t: 'taken'};
-  const refusal = r.refused?.find((x) => x.chapter === ci);
-  if (refusal?.reason === 'not_rendered')
-    return {t: 'rendering', rendered: refusal.rendered, n: refusal.n};
-  if (refusal) return {t: 'impossible', reason: refusal.reason};
-  if (r.rendering?.includes(ci)) return {t: 'rendering', rendered: 0, n: 0};
-  return {t: 'unknown'};
-}
-
-/** Did `/api/chapters/render` take this chapter? Its queue is the receipt. */
-export function renderAccepted(r: RenderResult | null | undefined, ci: number): boolean {
-  return !!r && (r.queue?.includes(ci) || r.packing?.includes(ci));
-}
-
-/**
- * Everything about a row that means "the server is getting somewhere". Compared
- * between polls, so a rung that has genuinely stopped moving can be told from
- * one that is simply slow - a chapter of a big novel takes minutes to render,
- * and minutes of silence are not a stall.
- */
-export function rowSignature(r: ChapRow | undefined): string {
-  if (!r) return 'none';
-  return [r.rendered, r.n, r.m4a ? 1 : 0, r.queued ? 1 : 0,
-          r.packing ? 1 : 0, r.pack_queued ? 1 : 0].join(':');
-}
-
-/** How long a row may sit perfectly still before the ask is repeated. */
-export const STALL_MS = 90_000;
-
-/**
- * Should the ask be repeated?
- *
- * Yes if it was never acknowledged - the call may have been lost, and both
- * endpoints are idempotent. Yes if it was acknowledged but nothing has changed
- * for `stallMs`, which is the case this exists for: a server restart between the
- * ask and the work, where the acknowledgement was true when it was given and is
- * not true any more. Otherwise no, and the client waits like it should.
- */
-export function shouldReask(
-  {acked, sinceChangeMs}: {acked: boolean; sinceChangeMs: number},
-  stallMs = STALL_MS,
-): boolean {
-  return !acked || sinceChangeMs >= stallMs;
 }
 
 /** Did the selection include anything the server still has to make? */

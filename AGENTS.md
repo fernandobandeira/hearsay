@@ -395,33 +395,126 @@ this box at all. The hold is bounded at `PACK_HOLD_MAX_S` (30 s): past it the
 renderer is not slow, it is wedged, and a download that waits forever on a wedged
 renderer would be a worse bug than the one being prevented.
 
-### The device's half: the foreground reconciliation sweep
+### The device's half: the download queue
 
 The one step that can only happen on the phone is copying the m4a into Cache
 Storage, and the phone is exactly what is not running. **Backgrounded work is not
 attempted** — that is the accepted platform limit, not something to fight — so
-instead every way back into the app asks one question, and
-`web/src/lib/reconcile.ts` is that question:
+what exists instead is a queue on the device, in IndexedDB (`downloads`, beside
+the outbox), driven by `web/src/lib/reconcile.ts`. Every pass asks four
+questions:
 
-> of the chapters still pending, which are packed and not here yet?
+> what was asked for · what the server still has to be told · what is packed ·
+> what is here
 
-Three terms, each from the only place that knows it: the pending selection from
-IndexedDB (`downloads`, beside the outbox, so it survives the app being killed),
-`m4a` from the server's rows, and Cache Storage — *asked*, never remembered, so a
-quota eviction reads as missing. The triggers are `visibilitychange`, `focus`,
-the network returning, a cold launch, and `hello` off the live stream, which is
-the "we were away" signal for a tab that never went hidden. One chapter that will
-not come down does not cancel the rest, and what is still wanted is recomputed
-from Cache Storage afterwards rather than from what the sweep thinks it stored.
+Each term comes from the only place that knows it: the pending selection from
+IndexedDB, the standing order re-derived from the server's rows, `m4a` from those
+same rows, and Cache Storage — *asked*, never remembered, so a quota eviction
+reads as missing. The triggers are `visibilitychange`, `focus`, the network
+returning, a cold launch, `hello` off the live stream, a `render` event with
+`kind: "packed"`, and a 20 s interval while the app is visible. Chapters are
+copied **three at a time** (`PARALLEL`); one that will not come down does not
+cancel the rest, and what is still wanted is recomputed from Cache Storage
+afterwards rather than from what the sweep thinks it stored.
 
 The selection is written down *before* the first request, or a download confirmed
 as the screen locks would be one nobody remembers. It is removed per chapter as
 each lands, and the record is deleted when the last one does.
 
-**Polling stays.** The drawer's ladder (`web/src/lib/download.ts`) is unchanged
-and still runs rung by rung while the app is open — it is the fast path and the
-fallback for a session with no live stream. The sweep is the catch-up pass, not a
-replacement for it.
+**The queue places the server's order too**, which is the half that was missing.
+`pack: true` rides on a *render* call, so two kinds of chapter fell out of it: one
+whose call was lost or never made (the app was killed between writing the
+selection down and posting it), and one that was already fully rendered and
+therefore needed no render at all — nothing ever asked the packer for it, and it
+sat there for good. `toOrder` re-derives both from the rows on every pass and
+posts `/api/chapters/render {pack:true}` and `/api/chapters/build`; the ask is
+repeated only when it changes or after `ORDER_EVERY_MS` (2 min), since the order
+is on disk at both ends.
+
+**What this replaced, and the four bugs that came out of it.** The drawer used to
+climb a per-chapter ladder in component state — queue the render, poll, ask for
+the pack, poll, store, next chapter — and every one of Fernando's reports was a
+consequence of where that loop lived:
+
+- it died with the component and with the app, so a selection had no driver after
+  a restart and the drawer showed nothing queued;
+- it was the only thing that ever asked for a pack, so a chapter the server
+  finished an hour later was never stored until the app happened to be re-opened;
+- a chapter that threw set one shared `err` string and was dropped, and the next
+  chapter's failure overwrote the message — so a failed chapter looked *skipped*;
+- it walked chapters one at a time, so a 6 MB file had the whole link to itself
+  and used a fraction of it.
+
+The ladder is gone. `web/src/lib/download.ts` is down to reading a row
+(`phaseFor`, `queueJob`, the size estimate); the drawer writes the selection and
+returns. The rows read the durable queue, which is why a chapter ordered last
+night still says "queued" on a phone that has been closed and re-opened since,
+and why it cannot be picked a second time.
+
+**Polling stays.** The drawer's two-second `/api/chapters` poll is unchanged
+while it is open — it is the fast path and the fallback for a session with no
+live stream.
+
+### The trim keeps what you touched
+
+A device that downloads ahead of itself has to give chapters back, or a
+1433-chapter novel becomes 8 GB on a phone. The rule was "keep the furthest
+chapter reached and the two behind it" — anchored to the furthest point rather
+than the current one, so re-reading a scene never widens the trim.
+
+Position alone turned out to be a bad proxy for *finished with it*. Jumping
+forward to look something up moves the anchor permanently, and coming back found
+every chapter in between deleted — chapters downloaded deliberately, minutes
+earlier, over a tunnel, from a box that renders at a quarter of realtime.
+
+So a chapter now has to be **both** well behind the anchor **and** untouched for
+`KEEP_UNTOUCHED_MS` (48 h). "Touched" is *stored* as much as read, which is the
+part that makes a forward jump survivable: a chapter downloaded ahead and not
+reached yet has been touched. The log is `narrator.touched:<key>` in
+localStorage, pruned on every trim to what is actually in Cache Storage, so it
+stays the size of the wake rather than the size of the book. A chapter with no
+entry is treated as cold — otherwise a device that predates the log could never
+give anything back.
+
+### Why a stored chapter used to stop being stored
+
+The bug underneath all of it, and the one that made the reader untrustworthy:
+chapters shown as saved at 09:03 were shown as merely packed at 09:05, across
+nothing but a restart, with nothing in the reader having deleted them (the
+auto-trim only ever touches chapters *behind* the anchor).
+
+Every URL the reader stores deliberately is also matched by a Workbox runtime
+rule — that is the point of the rules, they are what serves a cached chapter back
+to `<audio>` with Range support. But they matched the **download** too, so a
+deliberate save ran one streaming body through two consumers at once: the
+strategy putting its own copy into `narrator-audio` inside `event.waitUntil`, and
+the page putting `res.clone()` into the same entry. On WebKit that fails two
+ways, and he saw both in one sitting — `TypeError: FetchEvent.respondWith
+received an error` for the loud case, and an entry that reads back fine all
+session and is gone after the next launch for the quiet one.
+
+So: a deliberate save carries `x-narrator-store: 1`, every runtime rule in
+`web/vite.config.ts` skips a request carrying it, and exactly one writer —
+`put` in `web/src/lib/offline.ts` — writes the entry. Three further rules there
+follow from the same incident:
+
+- **the body is read to the end into a Blob before it is stored.** A
+  `res.clone()` handed to `Cache.put` is a stream the browser finishes on its own
+  time and may not finish at all. Reading first costs the chapter's size in
+  memory for a moment and buys an entry that either exists or threw.
+- **the entry is read back after the put.** `Cache.put` resolving is not the same
+  claim as "this entry exists": quota refusals surface here. Reporting success
+  for a chapter that will be missing at the next launch is the report he could
+  not trust.
+- **an entry that is present and declares itself zero bytes reads as missing.**
+  Present-and-empty is worse than absent: nothing re-fetches it and it plays
+  silence.
+
+`downloadChapter` also retries on the shared backoff curve (`lib/backoff.ts`) —
+only failures worth repeating, so a 404 is still one ask — and the reader asks
+for `navigator.storage.persist()` once at startup. Not granted on iOS today and
+never assumed; on a device that does grant it, it is the difference between a
+night of downloads and a morning of them being gone.
 
 ## The `.m4b` export
 

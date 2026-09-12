@@ -1,16 +1,14 @@
 import {describe, expect, test} from 'vitest';
 import {
-  anyEstimated, buildVerdict, estimateBytes, isAction, jobFor, needsRender, phaseFor,
-  renderAccepted, rowSignature, shouldReask, STALL_MS, type DownloadPhase,
+  anyEstimated, estimateBytes, jobFor, phaseFor, queueJob, type DownloadPhase,
 } from './download';
-import type {BuildResult, ChapRow} from './types';
+import type {ChapRow} from './types';
 
 const row = (p: Partial<ChapRow> = {}): ChapRow => ({
   i: 4, title: '5: The Sequence', n: 76, est_min: 12.2, est_bytes: 5_856_000,
   rendered: 0, m4a: false, bytes: null, duration: null,
   queued: false, packing: false, pack_queued: false, ...p,
 });
-const none = new Set<number>();
 
 describe('phaseFor - the rung a chapter is on', () => {
   test('nothing rendered: ask the server for it', () => {
@@ -73,32 +71,6 @@ describe('the badge and whose turn it is', () => {
     expect(jobFor('store')).toBe('saving');
     expect(jobFor('stored')).toBeNull();
   });
-
-  test('the client acts on three rungs and waits on the rest', () => {
-    expect(['queue-render', 'request-pack', 'store'].every((p) => isAction(p as DownloadPhase)))
-      .toBe(true);
-    expect(['await-render', 'await-pack', 'stored'].some((p) => isAction(p as DownloadPhase)))
-      .toBe(false);
-  });
-});
-
-describe('needsRender - one queue call for the whole selection', () => {
-  test('only the chapters with no audio at all', () => {
-    const rows = [
-      row({i: 0}),                                  // nothing: queue it
-      row({i: 1, queued: true}),                    // already queued
-      row({i: 2, rendered: 76}),                    // ready to pack
-      row({i: 3, m4a: true}),                       // ready to store
-      row({i: 4}),                                  // nothing: queue it
-      row({i: 5}),                                  // held on the device
-    ];
-    expect(needsRender(rows, new Set([5]))).toEqual([0, 4]);
-  });
-
-  test('nothing to do is an empty list, not a call with no chapters', () => {
-    expect(needsRender([row({m4a: true})], none)).toEqual([]);
-    expect(needsRender([], none)).toEqual([]);
-  });
 });
 
 describe('estimateBytes - what the confirm bar promises', () => {
@@ -137,65 +109,35 @@ describe('estimateBytes - what the confirm bar promises', () => {
   });
 });
 
-describe('reading what the server said it did', () => {
-  const build = (p: Partial<BuildResult> = {}): BuildResult => ({
-    ok: true, built: [], building: [], rendering: [], refused: [], ...p,
+
+// ------------------------------------------------- the badge, after a restart
+
+describe('queueJob - what this device is doing about a chapter', () => {
+  test('nothing queued is nothing to say: the row speaks for the server', () => {
+    expect(queueJob(row({rendered: 76}), false, false)).toBeNull();
+    expect(queueJob(undefined, false, false)).toBeNull();
   });
 
-  test('a chapter the packer took is taken, and is not asked about again', () => {
-    expect(buildVerdict(build({building: [4]}), 4)).toEqual({t: 'taken'});
-    expect(buildVerdict(build({built: [4]}), 4)).toEqual({t: 'taken'});
+  test('a queued chapter reports the stage the server is actually at', () => {
+    // "queued" on its own is only right before the server has started; once it
+    // is rendering, that is the honest thing for the row to say.
+    expect(queueJob(row(), true, false)).toBe('queued');
+    expect(queueJob(row({queued: true}), true, false)).toBe('rendering');
+    expect(queueJob(row({rendered: 76}), true, false)).toBe('packing');
+    expect(queueJob(row({pack_queued: true}), true, false)).toBe('packing');
   });
 
-  test('a half-rendered chapter says so, with how far it got', () => {
-    const r = build({
-      rendering: [4],
-      refused: [{chapter: 4, reason: 'not_rendered', rendered: 30, n: 76}],
-    });
-    expect(buildVerdict(r, 4)).toEqual({t: 'rendering', rendered: 30, n: 76});
+  test('a copy in flight outranks everything: it is what he is waiting on', () => {
+    expect(queueJob(row({m4a: true}), true, true)).toBe('saving');
+    // even for a chapter no longer in the queue - the sweep is mid-copy
+    expect(queueJob(row({m4a: true}), false, true)).toBe('saving');
   });
 
-  test('a chapter that can never be packed is not waited on for 45 minutes', () => {
-    const r = build({refused: [{chapter: 9, reason: 'out_of_range', rendered: 0, n: 0}]});
-    expect(buildVerdict(r, 9)).toEqual({t: 'impossible', reason: 'out_of_range'});
-    const empty = build({refused: [{chapter: 2, reason: 'no_chunks', rendered: 0, n: 0}]});
-    expect(buildVerdict(empty, 2)).toEqual({t: 'impossible', reason: 'no_chunks'});
-  });
-
-  test('an answer that does not mention the chapter is unknown, not consent', () => {
-    expect(buildVerdict(build(), 4)).toEqual({t: 'unknown'});
-    expect(buildVerdict(null, 4)).toEqual({t: 'unknown'});
-  });
-
-  test("the render queue is the render call's receipt", () => {
-    expect(renderAccepted({ok: true, queue: [1, 4], packing: []}, 4)).toBe(true);
-    // Already complete: it skipped the queue and went to the packer.
-    expect(renderAccepted({ok: true, queue: [], packing: [4]}, 4)).toBe(true);
-    expect(renderAccepted({ok: true, queue: [1], packing: []}, 4)).toBe(false);
-    expect(renderAccepted(null, 4)).toBe(false);
-  });
-});
-
-describe('shouldReask - the repeat, kept for real stalls', () => {
-  test('an ask nobody acknowledged is repeated', () => {
-    expect(shouldReask({acked: false, sinceChangeMs: 0})).toBe(true);
-  });
-
-  test('an acknowledged ask is waited on, however slow the chapter is', () => {
-    expect(shouldReask({acked: true, sinceChangeMs: 20_000})).toBe(false);
-    expect(shouldReask({acked: true, sinceChangeMs: 89_000})).toBe(false);
-  });
-
-  test('a row that has not moved at all for ninety seconds is a stall', () => {
-    expect(shouldReask({acked: true, sinceChangeMs: STALL_MS})).toBe(true);
-    expect(shouldReask({acked: true, sinceChangeMs: 5_000}, 1_000)).toBe(true);
-  });
-
-  test('the signature changes exactly when the server got somewhere', () => {
-    expect(rowSignature(row({rendered: 3}))).toBe(rowSignature(row({rendered: 3})));
-    expect(rowSignature(row({rendered: 3}))).not.toBe(rowSignature(row({rendered: 4})));
-    expect(rowSignature(row({queued: true}))).not.toBe(rowSignature(row()));
-    expect(rowSignature(row({m4a: true}))).not.toBe(rowSignature(row()));
-    expect(rowSignature(undefined)).toBe('none');
+  test('the queue is the durable half, so this survives a restart', () => {
+    // The old job map lived in component state and was empty after every
+    // launch, so a chapter ordered last night came back looking unasked-for -
+    // and tapping it downloaded it again. Both arguments here come from disk.
+    const ordered = row({queued: true});
+    expect(queueJob(ordered, true, false)).toBe('rendering');
   });
 });
