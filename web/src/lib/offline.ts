@@ -15,12 +15,50 @@
 import {chapterAudioUrl, chapterManifestUrl, chapterTextUrl, bookIndexUrl, textShardUrl} from './api';
 
 export const AUDIO_CACHE = 'narrator-audio';   // must match the Workbox rule
-export const TEXT_CACHE = 'narrator-text';
+export const TEXT_CACHE = 'narrator-text';     // book.json + the shards
+/**
+ * `/api/chapter/{ci}`, and why it is not in TEXT_CACHE.
+ *
+ * Workbox's expiration records are keyed by the cache name, so two rules sharing
+ * a name share one `maxEntries` budget. These two did: on the 1433-chapter novel
+ * each chapter read added an entry, and at 400 the oldest went - which is the
+ * shards, downloaded first, and the only reason the *unread* chapters work with
+ * no network. Two names, two budgets.
+ *
+ * Devices upgrading from that layout still have chapter entries sitting in
+ * TEXT_CACHE, so every sweep below covers both by URL rather than by cache.
+ */
+export const CHAPTER_CACHE = 'narrator-chapter';
+
+/** The two caches a chapter's words may be in - the new one, and the old layout. */
+const TEXT_CACHES = [TEXT_CACHE, CHAPTER_CACHE] as const;
+/** Every cache a book can have something in: what a whole-book sweep walks. */
+const ALL_CACHES = [AUDIO_CACHE, TEXT_CACHE, CHAPTER_CACHE] as const;
 
 const caches_ = () => (typeof caches === 'undefined' ? null : caches);
 
 async function open(name: string): Promise<Cache | null> {
   try { return (await caches_()?.open(name)) ?? null; } catch { return null; }
+}
+
+/** Ignore Vary everywhere we address an entry by URL - see the Workbox rules. */
+const MATCH: CacheQueryOptions = {ignoreVary: true};
+
+/**
+ * The name a book's files are filed under, here and on the server.
+ *
+ * The server computes it as the EPUB path's file stem truncated to 50 characters
+ * and hands it back from `/api/load`, which is fine for the book that is open -
+ * but the Books list has to name a book's *device* copy before anything has been
+ * loaded, and offline it may never be loaded at all. So the same rule is spelled
+ * out here: last path segment, minus one trailing extension, truncated to 50. A
+ * key the server has already given us always wins over the guess.
+ */
+export function bookKey(b: {path?: string; name?: string; key?: string}): string {
+  if (b.key) return b.key;
+  const base = (b.path || b.name || '').replace(/\\/g, '/').split('/').pop() ?? '';
+  // `(?!^)` keeps the stem rule's one oddity: a dotfile is all stem, no suffix.
+  return base.replace(/(?!^)\.[^.]+$/, '').slice(0, 50);
 }
 
 /** Chapter indices whose audio is held on this device, for one book. */
@@ -33,6 +71,27 @@ export async function cachedChapters(key: string | null): Promise<Set<number>> {
     if (u.searchParams.get('book') !== key) continue;
     const m = /^\/api\/chapters\/(\d+)\.m4a$/.exec(u.pathname);
     if (m) out.add(Number(m[1]));
+  }
+  return out;
+}
+
+/**
+ * Every book this device holds anything at all for, by cache key.
+ *
+ * One pass over every cache rather than a scan per book: the Books list asks this
+ * for the whole library, and it is the only thing that decides whether a book gets
+ * a remove action at all. Anything not carrying a `?book=` - the shell, the icons
+ * - belongs to no book and is not named.
+ */
+export async function heldBooks(): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const name of ALL_CACHES) {
+    const c = await open(name);
+    if (!c) continue;
+    for (const req of await c.keys()) {
+      const k = new URL(req.url).searchParams.get('book');
+      if (k) out.add(k);
+    }
   }
   return out;
 }
@@ -91,15 +150,19 @@ export async function downloadText(
  * it has to take the index with it, or the next open would look half-saved.
  */
 export async function removeText(key: string): Promise<void> {
-  const c = await open(TEXT_CACHE);
-  if (!c) return;
-  for (const req of await c.keys()) {
-    const u = new URL(req.url);
-    if (u.searchParams.get('book') !== key) continue;
-    // the index, the shards, and the single chapters read since: all of it
-    if (u.pathname === '/api/book.json'
-        || /^\/api\/text\/\d+\.json$/.test(u.pathname)
-        || /^\/api\/chapter\/\d+$/.test(u.pathname)) await c.delete(req);
+  // Both caches: chapters live in CHAPTER_CACHE now, and in TEXT_CACHE on any
+  // device that read them before the split.
+  for (const name of TEXT_CACHES) {
+    const c = await open(name);
+    if (!c) continue;
+    for (const req of await c.keys()) {
+      const u = new URL(req.url);
+      if (u.searchParams.get('book') !== key) continue;
+      // the index, the shards, and the single chapters read since: all of it
+      if (u.pathname === '/api/book.json'
+          || /^\/api\/text\/\d+\.json$/.test(u.pathname)
+          || /^\/api\/chapter\/\d+$/.test(u.pathname)) await c.delete(req);
+    }
   }
 }
 
@@ -110,7 +173,8 @@ export async function removeText(key: string): Promise<void> {
  */
 export async function downloadChapter(key: string, ci: number): Promise<number> {
   const audio = await open(AUDIO_CACHE);
-  const text = await open(TEXT_CACHE);
+  // The chapter's words go where the Workbox rule for them reads from.
+  const text = await open(CHAPTER_CACHE);
   if (!audio) throw new Error('this browser will not store offline audio');
   const size = await put(audio, chapterAudioUrl(key, ci));
   await put(audio, chapterManifestUrl(key, ci));
@@ -120,10 +184,37 @@ export async function downloadChapter(key: string, ci: number): Promise<number> 
 
 export async function removeChapter(key: string, ci: number): Promise<void> {
   const audio = await open(AUDIO_CACHE);
-  const text = await open(TEXT_CACHE);
-  await audio?.delete(chapterAudioUrl(key, ci));
-  await audio?.delete(chapterManifestUrl(key, ci));
-  await text?.delete(chapterTextUrl(key, ci));
+  await audio?.delete(chapterAudioUrl(key, ci), MATCH);
+  await audio?.delete(chapterManifestUrl(key, ci), MATCH);
+  // Both, so a copy stored under the old shared layout goes too.
+  for (const name of TEXT_CACHES) {
+    const c = await open(name);
+    await c?.delete(chapterTextUrl(key, ci), MATCH);
+  }
+}
+
+/**
+ * Give a whole book back: both tiers, in one act.
+ *
+ * Removing a book has to mean *everything this device holds for it* - the words
+ * that were taken without being asked and every chapter downloaded on purpose -
+ * or "removed" would still be sitting on a phone as a few hundred megabytes of
+ * audio. The server keeps its own files; this is a device eviction only.
+ *
+ * The sweep at the end is not redundant: quota eviction and abandoned downloads
+ * leave halves behind (a manifest whose m4a is gone, so `cachedChapters` never
+ * names that chapter), and anything still carrying this `?book=` belongs to the
+ * book being removed whatever shape it is in.
+ */
+export async function removeBook(key: string): Promise<void> {
+  await removeText(key);
+  for (const ci of await cachedChapters(key)) await removeChapter(key, ci);
+  for (const name of ALL_CACHES) {
+    const c = await open(name);
+    if (!c) continue;
+    for (const req of await c.keys())
+      if (new URL(req.url).searchParams.get('book') === key) await c.delete(req, MATCH);
+  }
 }
 
 /** Bytes of chapter audio held for one book. */
@@ -135,7 +226,7 @@ export async function audioBytes(key: string | null): Promise<number> {
     const u = new URL(req.url);
     if (u.searchParams.get('book') !== key) continue;
     if (!u.pathname.endsWith('.m4a')) continue;
-    const res = await c.match(req);
+    const res = await c.match(req, MATCH);
     const len = res?.headers.get('content-length');
     n += len ? Number(len) : (await res?.blob())?.size ?? 0;
   }
@@ -159,9 +250,34 @@ export async function requestPersistence(): Promise<boolean> {
   try { return (await navigator.storage?.persist?.()) ?? false; } catch { return false; }
 }
 
+/**
+ * Store one URL, and measure what was actually stored.
+ *
+ * The wire is not always what the browser hands back. This reader is
+ * interchangeable between the rust server and the python one, and the python one
+ * serves `/api/book.json` and `/api/text/*.json` gzipped: `fetch` decodes the
+ * body but leaves `Content-Encoding: gzip` and the *compressed* `Content-Length`
+ * on the response object. Storing that response verbatim puts a decoded body in
+ * Cache Storage under headers claiming it is gzip - which a consumer is entitled
+ * to act on - and the size accounting would report the compressed number.
+ *
+ * So when an encoding is declared, the body is buffered and re-stored with those
+ * two headers stripped, and the blob's own size is the answer. Only text takes
+ * that path: it is a few hundred kB at most, and the m4a - tens of MB, never
+ * gzipped - keeps the streaming clone and the header size rather than being read
+ * into memory just to be measured.
+ */
 async function put(c: Cache, url: string): Promise<number> {
   const res = await fetch(url, {cache: 'no-store'});
   if (!res.ok) throw new Error(`${url.split('?')[0]} → ${res.status}`);
+  if (res.headers.get('content-encoding')) {
+    const body = await res.blob();
+    const headers = new Headers(res.headers);
+    headers.delete('content-encoding');
+    headers.delete('content-length');
+    await c.put(url, new Response(body, {status: res.status, statusText: res.statusText, headers}));
+    return body.size;
+  }
   const size = Number(res.headers.get('content-length') ?? 0);
   await c.put(url, res.clone());
   return size;

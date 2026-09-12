@@ -64,6 +64,39 @@ pub fn text_dir(work: &Path, key: &str) -> PathBuf {
     work.join("text").join(key)
 }
 
+/// `foo.json` -> `foo.json.gz`. The suffix is appended, never substituted: the
+/// `.gz` is a sibling *of* the file, so a client that cannot take one can always
+/// name the plain file it decodes to.
+pub fn gz_path(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_os_string();
+    s.push(".gz");
+    PathBuf::from(s)
+}
+
+/// Write a built `.json` and its `.gz` sibling in one breath, and return the
+/// plain size.
+///
+/// Always together: a `.gz` that outlived its `.json` would serve the wrong
+/// words, which is the same failure a stale shard is. The bundle directory is
+/// wiped before a rebuild, so the pair can never be half-stale — and the plain
+/// file is written first, so the only crash window leaves a *missing* `.gz`,
+/// which the server falls back from silently.
+///
+/// `mtime = 0` keeps the output byte-deterministic. Level 9 because this is
+/// written once per load and read by every device, over a tunnel, for the life
+/// of the book.
+pub fn write_json_gz(p: &Path, data: &[u8]) -> std::io::Result<u64> {
+    use std::io::Write;
+    std::fs::write(p, data)?;
+    let mut enc = flate2::GzBuilder::new().mtime(0).write(
+        Vec::with_capacity(data.len() / 3 + 64),
+        flate2::Compression::new(9),
+    );
+    enc.write_all(data)?;
+    std::fs::write(gz_path(p), enc.finish()?)?;
+    Ok(data.len() as u64)
+}
+
 pub fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
@@ -120,8 +153,7 @@ pub fn write_bundle(
             to: sh.last().map(|c| c.i).unwrap_or(0),
             chapters: sh.clone(),
         };
-        std::fs::write(&p, serde_json::to_vec(&doc).unwrap_or_default())?;
-        total += p.metadata().map(|m| m.len()).unwrap_or(0);
+        total += write_json_gz(&p, &serde_json::to_vec(&doc).unwrap_or_default())?;
     }
 
     let index = BookIndex {
@@ -143,36 +175,68 @@ pub fn write_bundle(
             })
             .collect(),
     };
-    std::fs::write(
-        d.join("index.json"),
-        serde_json::to_vec(&index).unwrap_or_default(),
+    write_json_gz(
+        &d.join("index.json"),
+        &serde_json::to_vec(&index).unwrap_or_default(),
     )?;
     Ok(())
 }
 
-/// Read one chapter's words back out of a written bundle: `(title, paras,
-/// chunks)`, or None if that book has no bundle or no such chapter.
+/// One chapter out of a written bundle: the book's index, that chapter's index
+/// entry, and its words. None if the book has no bundle or no such chapter.
 ///
-/// This is what makes `/api/chapter/{ci}?book=` answerable without a session.
 /// Only the chapter's own shard is read, so the cost is a small index plus at
-/// most ~1.5 MB even for a 1433-chapter book.
-pub fn chapter_from_bundle(
+/// most ~1.5 MB even for a 1433-chapter book. Every reader below goes through
+/// here: the bundle is the one description of a book that does not need the
+/// session, and two of them reading it two ways is how they drift apart.
+fn bundle_chapter(
     work: &Path,
     key: &str,
     ci: usize,
-) -> Option<(String, Vec<usize>, Vec<String>)> {
+) -> Option<(BookIndex, ChapMeta, ShardChapter)> {
     if key.is_empty() {
         return None;
     }
     let d = text_dir(work, key);
     let index: BookIndex =
         serde_json::from_slice(&std::fs::read(d.join("index.json")).ok()?).ok()?;
-    let meta = index.chapters.iter().find(|c| c.i == ci)?;
+    let meta = index.chapters.iter().find(|c| c.i == ci)?.clone();
     let shard: TextShard =
         serde_json::from_slice(&std::fs::read(d.join(format!("{:03}.json", meta.shard?))).ok()?)
             .ok()?;
     let c = shard.chapters.into_iter().find(|c| c.i == ci)?;
-    Some((meta.title.clone(), c.paras, c.chunks))
+    Some((index, meta, c))
+}
+
+/// Read one chapter's words back out of a written bundle: `(title, paras,
+/// chunks)`, or None if that book has no bundle or no such chapter.
+///
+/// This is what makes `/api/chapter/{ci}?book=` answerable without a session.
+pub fn chapter_from_bundle(
+    work: &Path,
+    key: &str,
+    ci: usize,
+) -> Option<(String, Vec<usize>, Vec<String>)> {
+    let (_, meta, c) = bundle_chapter(work, key, ci)?;
+    Some((meta.title, c.paras, c.chunks))
+}
+
+/// The voice memo's view of a chapter: `(book title, file name, chapter title,
+/// chunk texts)`, the loaded book not required.
+///
+/// A memo recorded against one book can arrive after the server has swapped to
+/// another — it waited out an offline stretch in the reader's outbox — and the
+/// note's quote, frontmatter and deep link have to describe the book it was
+/// recorded against, not the one that happens to be open. The bundle is rebuilt
+/// on every load of that book, so its chunk indices are exactly the ones the
+/// memo refers to.
+pub fn note_chapter(
+    work: &Path,
+    key: &str,
+    ci: usize,
+) -> Option<(String, String, String, Vec<String>)> {
+    let (index, meta, c) = bundle_chapter(work, key, ci)?;
+    Some((index.title, index.name, meta.title, c.chunks))
 }
 
 #[cfg(test)]
@@ -248,13 +312,82 @@ mod tests {
     }
 
     #[test]
+    fn a_voice_memo_can_name_a_book_the_session_does_not_hold() {
+        // Everything the fleeting note needs — the book's own title for the
+        // frontmatter and the whisper prompt, its file name for the deep link,
+        // the chapter's title, and the words to quote — out of the bundle, with
+        // no session and no plan in memory.
+        let d = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::for_test(d.path());
+        cfg.text_shard_chapters = 2;
+        write_bundle(
+            &cfg,
+            &plan(5, 3, 20),
+            &[1.0; 5],
+            "Other Book (2019)",
+            "Other Book (2019).epub",
+            "Other Book",
+        )
+        .expect("write");
+        let (title, name, ctitle, chunks) =
+            note_chapter(&cfg.work, "Other Book (2019)", 3).expect("chapter 3");
+        assert_eq!(title, "Other Book");
+        assert_eq!(name, "Other Book (2019).epub");
+        assert_eq!(ctitle, "Section 4");
+        assert_eq!(chunks, vec!["x".repeat(20); 3]);
+        // A book with no bundle, and a chapter the book does not have: both are
+        // None, which is the 404 that keeps the recording in the outbox.
+        assert!(note_chapter(&cfg.work, "Other Book (2019)", 99).is_none());
+        assert!(note_chapter(&cfg.work, "never-loaded", 0).is_none());
+        assert!(note_chapter(&cfg.work, "", 0).is_none());
+    }
+
+    #[test]
     fn a_rebuild_removes_stale_shards() {
         let d = tempfile::tempdir().expect("tempdir");
         let mut cfg = Config::for_test(d.path());
         cfg.text_shard_chapters = 1;
         write_bundle(&cfg, &plan(4, 1, 10), &[1.0; 4], "K", "k.epub", "K").expect("write");
-        assert!(text_dir(&cfg.work, "K").join("003.json").exists());
+        let stale = text_dir(&cfg.work, "K").join("003.json");
+        assert!(stale.exists() && gz_path(&stale).exists());
         write_bundle(&cfg, &plan(2, 1, 10), &[1.0; 2], "K", "k.epub", "K").expect("write");
-        assert!(!text_dir(&cfg.work, "K").join("003.json").exists());
+        // The pair goes together: a .gz that outlived its .json would serve the
+        // wrong words, which is the same failure a stale shard is.
+        assert!(!stale.exists() && !gz_path(&stale).exists());
+    }
+
+    #[test]
+    fn every_written_file_has_a_deterministic_gz_beside_it() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::for_test(d.path());
+        cfg.text_shard_chapters = 2;
+        let p = plan(5, 6, 120);
+        write_bundle(&cfg, &p, &[1.0; 5], "K", "k.epub", "K").expect("write");
+        let dir = text_dir(&cfg.work, "K");
+        let mut seen = 0;
+        for f in ["index.json", "000.json", "001.json", "002.json"] {
+            let plain = std::fs::read(dir.join(f)).expect("plain");
+            let raw = std::fs::read(gz_path(&dir.join(f))).expect("gz");
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&raw[..]), &mut out)
+                .expect("gzip");
+            assert_eq!(out, plain, "{f}");
+            seen += 1;
+        }
+        assert_eq!(seen, 4);
+        // Written again from the same input, byte for byte: mtime=0 is what
+        // keeps a rebuild from churning the bytes a proxy may have cached.
+        let before: Vec<Vec<u8>> = ["index.json", "000.json"]
+            .iter()
+            .map(|f| std::fs::read(gz_path(&dir.join(f))).expect("gz"))
+            .collect();
+        write_bundle(&cfg, &p, &[1.0; 5], "K", "k.epub", "K").expect("rewrite");
+        for (f, was) in ["index.json", "000.json"].iter().zip(before) {
+            assert_eq!(
+                std::fs::read(gz_path(&dir.join(f))).expect("gz"),
+                was,
+                "{f}"
+            );
+        }
     }
 }

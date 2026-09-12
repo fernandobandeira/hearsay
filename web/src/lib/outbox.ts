@@ -23,21 +23,19 @@ export interface Memo {
 
 export interface OutboxCtx {
   online: boolean;
-  serverBook: string | null;   // the book the server currently holds
   manual?: boolean;            // the user asked for a retry by hand
 }
 
 /**
  * What to do with one queued memo right now.
  *
- * 'hold' is the interesting case: the server keeps one book open at a time and
- * builds the note's quote callout from *its* loaded chapter. Uploading a memo
- * recorded against another book would file a fleeting note quoting the wrong
- * passage - worse than waiting.
+ * There used to be a second 'hold': a memo recorded against a book the server
+ * had since swapped out waited, because the server built the quote callout from
+ * *its* loaded chapter. Now the memo names its book and the server quotes that
+ * book's on-disk text, so the only thing worth waiting for is the network.
  */
 export function nextAction(rec: Memo, ctx: OutboxCtx): 'send' | 'hold' | 'stalled' {
   if (!ctx.online) return 'hold';
-  if (rec.book && ctx.serverBook && rec.book !== ctx.serverBook) return 'hold';
   if (!ctx.manual && (rec.tries ?? 0) >= MAX_TRIES) return 'stalled';
   return 'send';
 }

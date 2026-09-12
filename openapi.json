@@ -1088,6 +1088,16 @@
               }
             }
           },
+          "404": {
+            "description": "`book` names a book with no text bundle here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "500": {
             "description": "transcription or the vault write failed",
             "content": {
@@ -2174,6 +2184,13 @@
           "audio": {
             "type": "string",
             "description": "base64 of the MediaRecorder blob."
+          },
+          "book": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The book the memo was recorded against, as a cache key. **Additive, and\nworth sending**: a memo can wait out an offline stretch in the reader's\noutbox and arrive after the server has loaded something else, and the\nquote callout is built from a chapter's words. Supplied and not the\nloaded book, the quote, frontmatter and deep link come from that book's\non-disk text bundle instead — no session swap, so whatever another device\nis listening to is left alone. A key with no bundle on this server is a\n**404**, never a 2xx, so the recording stays queued. Omitted, it means\n\"whatever is loaded\", exactly as before."
           },
           "chapter": {
             "type": [

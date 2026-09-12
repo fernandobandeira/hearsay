@@ -22,18 +22,25 @@ import {
 } from 'react';
 import {onlineManager, useQueryClient} from '@tanstack/react-query';
 import {
-  bookIndexUrl, chapterManifestUrl, chapterTextUrl, keys, get, loadBook, openChapter as tellOpen,
-  reportPlayhead, tellPause, tellResume, textShardUrl, useBookIndex, useStatus,
+  awaitedRetry, bookIndexUrl, chapterManifestUrl, chapterTextUrl, keys, get, loadBook,
+  openChapter as tellOpen, reportPlayhead, tellPause, tellResume, textShardUrl, useBookIndex,
+  useStatus,
 } from './lib/api';
+import {loadChapterText, shardOf, type TextSources} from './lib/chaptertext';
 import {
   arbitrate, connectLive, type LiveState, type PositionEvent,
 } from './lib/live';
 import {isSane, type Manifest} from './lib/manifest';
 import {Player, type PlayMode} from './lib/player';
-import {cachedChapters, cachedShards, downloadText, removeText} from './lib/offline';
+import {
+  bookKey, cachedChapters, cachedShards, downloadText, removeBook, removeChapter,
+} from './lib/offline';
+import {chaptersToTrim, furthestReached, KEEP_BEHIND} from './lib/autotrim';
 import {clampResume, resolveResume, type Resume} from './lib/resume';
 import * as db from './lib/db';
-import type {BookFile, BookIndex, ChapMeta, LoadResult, TextShard} from './lib/types';
+import type {
+  BookFile, BookIndex, ChapMeta, ChapterText, LoadResult, TextShard,
+} from './lib/types';
 
 export type ConnState = 'online' | 'reconnecting' | 'offline';
 
@@ -94,7 +101,8 @@ interface Ctx {
   setFontScale: (n: number) => void;
   refreshOffline: () => Promise<void>;
   saveText: () => void;
-  dropText: () => Promise<void>;
+  /** Give a whole book back: its words and every chapter downloaded for it. */
+  dropBook: (key: string) => Promise<void>;
   flush: (manual?: boolean) => Promise<void>;
   queueNote: (blob: Blob) => Promise<void>;
   player: Player | null;
@@ -115,6 +123,18 @@ const readLib = (): Record<string, LibEntry> => {
 };
 const writeLib = (l: Record<string, LibEntry>) => {
   try { localStorage.setItem(LIB_KEY, JSON.stringify(l)); } catch { /* private mode */ }
+};
+
+/* How far into each book this device has ever got, by cache key. It anchors the
+   auto-trim (lib/autotrim.ts) and nothing else, which is why it lives in
+   localStorage rather than in the position record the vault owns: losing it costs
+   one chapter's worth of housekeeping, not a reading position. */
+const FURTHEST_KEY = 'narrator.furthest:';
+const readFurthest = (key: string): number => {
+  try { return Number(localStorage.getItem(FURTHEST_KEY + key)) || 0; } catch { return 0; }
+};
+const writeFurthest = (key: string, ci: number) => {
+  try { localStorage.setItem(FURTHEST_KEY + key, String(ci)); } catch { /* private mode */ }
 };
 
 /* Books whose offline text he removed on purpose. Removing it and having it
@@ -238,10 +258,9 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const flush = useCallback(async (manual = false) => {
     const {flushOutbox, flushPositions} = await import('./lib/flush');
     await flushPositions();
-    await flushOutbox({online: onlineManager.isOnline(),
-                       serverBook: status.data?.book ?? null, manual});
+    await flushOutbox({online: onlineManager.isOnline(), manual});
     await refreshQueued();
-  }, [status.data?.book, refreshQueued]);
+  }, [refreshQueued]);
 
   const queueNote = useCallback(async (blob: Blob) => {
     const b = bookRef.current;
@@ -288,6 +307,25 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     setTextShards(await cachedShards(k));
   }, []);
 
+  /**
+   * Give back the chapters he has left behind.
+   *
+   * Reading is sequential and downloading is ahead of it, so without this the
+   * device accumulates every chapter of a 1433-chapter novel it ever played. The
+   * rule, and the reason it is safe, is in lib/autotrim.ts: the window is anchored
+   * to the furthest chapter ever reached, so going back to re-read never widens
+   * it, and the chapter in hand is never a candidate. Silent on purpose - it is
+   * housekeeping, not news - but the drawer's audio row says it happens.
+   */
+  const trimBehind = useCallback(async (key: string, ci: number) => {
+    const furthest = furthestReached(readFurthest(key), ci);
+    writeFurthest(key, furthest);
+    const gone = chaptersToTrim(await cachedChapters(key), furthest, KEEP_BEHIND, [ci]);
+    if (!gone.length) return;
+    for (const c of gone) await removeChapter(key, c);
+    await refreshOffline();
+  }, [refreshOffline]);
+
   // ---------------------------------------------------------------- opening
   /**
    * Open a chapter. `cacheOnly` is the optimistic first paint: it may use only
@@ -314,7 +352,8 @@ export function NarratorProvider({children}: {children: ReactNode}) {
        for it - is gone. `cacheOnly` still forbids the network entirely, because
        that path exists to paint from this device alone. */
     const text = await loadChapterText(
-      qc, b.key, target, indexRef.current, !opts.cacheOnly, opts.cacheOnly);
+      textSources(qc, b.key, target), target, shardOf(indexRef.current, b.key, target),
+      !opts.cacheOnly, opts.cacheOnly);
     // Another chapter (or book) was asked for while this one was in the air.
     if (bookRef.current !== b || ciRef.current !== target) return false;
     if (!text) {
@@ -347,9 +386,11 @@ export function NarratorProvider({children}: {children: ReactNode}) {
       packed: !!manifest, downloaded, startChunk: Math.min(chunk, text.chunks.length - 1),
     });
     player?.setMedia(b.title, text.title);
-    void refreshOffline();
+    // ...then the housekeeping, after it, so the two cannot race to set the same
+    // offline state with different answers.
+    void refreshOffline().then(() => trimBehind(b.key, target));
     return true;
-  }, [qc, player, refreshOffline]);
+  }, [qc, player, refreshOffline, trimBehind]);
 
   const goChapter = useCallback((d: number) => {
     const next = ciRef.current + d;
@@ -361,7 +402,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
 
   const openBook = useCallback(async (b: BookFile & {key?: string}) => {
     const lib = readLib();
-    const guessKey = b.key ?? b.name.replace(/\.epub$/i, '').slice(0, 50);
+    const guessKey = bookKey(b);
     let entry: LibEntry | undefined = lib[guessKey];
     let server: LoadResult['position'] = null;
     setBookLoading(true);
@@ -388,10 +429,13 @@ export function NarratorProvider({children}: {children: ReactNode}) {
       setChapters(entry.chapters);
       // The shard map, from Cache Storage if this device has it - scoped by
       // ?book=, like everything cacheable.
+      // Awaited, with the rest of the fast open behind it: offline this must
+      // settle on the first failure rather than pause until the network is back.
       indexRef.current = await qc.fetchQuery({
         queryKey: keys.bookIndex(known.key),
         queryFn: () => get<BookIndex>(bookIndexUrl(known.key)),
         staleTime: Infinity,
+        retry: awaitedRetry,
       }).catch(() => undefined);
       const want = resolveResume({
         queued: await queuedFor(known.name), device: readDevicePos(known.path),
@@ -488,14 +532,23 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     setOptOut(next);            // re-runs the download effect
   }, []);
 
-  const dropText = useCallback(async () => {
-    const k = bookRef.current?.key;
-    if (!k) return;
-    const next = [...new Set([...readOptOut(), k])];
+  /**
+   * Remove everything this device holds for one book - the words and every
+   * downloaded chapter - from the Books list, for any book, open or not.
+   *
+   * The opt-out goes with it. Removing a book and watching its 17 MB of text come
+   * straight back on the next open would make the act look like it did nothing,
+   * and the drawer's text row still says "not saved" and offers to save it for
+   * whoever wants it back. In-memory copies of what was just evicted go too, or
+   * Query would keep serving words this device no longer has.
+   */
+  const dropBook = useCallback(async (key: string) => {
+    const next = [...new Set([...readOptOut(), key])];
     writeOptOut(next);
     setOptOut(next);
-    await removeText(k);
-    qc.removeQueries({queryKey: ['shard', k]});
+    await removeBook(key);
+    for (const k of ['shard', 'chapter-text', 'manifest'])
+      qc.removeQueries({queryKey: [k, key]});
     await refreshOffline();
   }, [qc, refreshOffline]);
 
@@ -573,12 +626,12 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     moved, follow, dismissMoved,
     openBook, openChapter, goChapter, setIdx, toggle,
     nudge: (s: number) => player?.nudge(s),
-    setFontScale, refreshOffline, saveText, dropText, flush, queueNote, player,
+    setFontScale, refreshOffline, saveText, dropBook, flush, queueNote, player,
   }), [book, chapters, index, ci, chunks, paras, chapterTitle, idx, mode, playing, waiting,
        message, conn, offlineChapters, textShards, textBusy, textProgress, textOptOut,
        chapterLoading, bookLoading, resumedAt, queued, fontScale, moved, follow, dismissMoved,
        status.data, openBook, openChapter, goChapter, setIdx, toggle, setFontScale,
-       refreshOffline, saveText, dropText, flush, queueNote, player]);
+       refreshOffline, saveText, dropBook, flush, queueNote, player]);
 
   // A handle for the dev console and for driving the reader from a headless
   // browser. Dev only: the production bundle has no such door.
@@ -605,55 +658,33 @@ function readDevicePos(path: string): {chapter: number; chunk: number} | null {
 }
 
 /**
- * One chapter's words, by the cheapest route that can answer.
+ * The three routes of lib/chaptertext.ts, bound to this Query client.
  *
- * Order matters, and it is the fix for the blank screen: a shard already in hand
- * is free, the chapter's own endpoint is one small request, and the shard fetch -
- * up to 1.5 MB - is the offline fallback, not the front door. The 17 MB whole-book
- * bundle is never on this path at all; it downloads behind the reader.
- *
- * `cacheOnly` forbids everything the loaded-book endpoint could get wrong: it is
- * used before the server has confirmed which book it holds.
+ * Both fetches carry `awaitedRetry`, and that is the whole point of the adapter:
+ * these are awaited with a fallback behind them, so a retry that *pauses*
+ * because the browser is offline is a promise that never settles and a chapter
+ * that never paints - with its shard sitting in Cache Storage. See
+ * lib/backoff.ts. Everything else here is the default policy.
  */
-async function loadChapterText(
+function textSources(
   qc: ReturnType<typeof useQueryClient>, key: string, ci: number,
-  index: BookIndex | undefined, serverHasBook: boolean, cacheOnly = false,
-) {
-  // An index for another book maps shards to the wrong words entirely.
-  const own = index?.key === key ? index : undefined;
-  const meta = own?.chapters.find((c) => c.i === ci);
-  const shard = meta?.shard;
-  const fromShard = (s: TextShard | null | undefined) => {
-    const c = s?.chapters.find((x) => x.i === ci);
-    return c ? {title: meta?.title ?? '', chunks: c.chunks, paras: c.paras} : null;
-  };
+): TextSources {
   const oneChapter = () => qc.fetchQuery({
     queryKey: keys.chapterText(key, ci),
-    queryFn: () => get<import('./lib/types').ChapterText>(chapterTextUrl(key, ci)),
+    queryFn: () => get<ChapterText>(chapterTextUrl(key, ci)),
     staleTime: Infinity,
+    retry: awaitedRetry,
   }).catch(() => null);
-
-  if (shard != null) {
-    const held = fromShard(qc.getQueryData<TextShard>(keys.shard(key, shard)));
-    if (held) return held;
-  }
-  if (serverHasBook) {
-    const one = await oneChapter();
-    if (one) return one;
-  }
-  if (shard != null) {
-    // Offline this comes straight out of Cache Storage: local, and book-scoped.
-    const s = await qc.fetchQuery({
+  return {
+    heldShard: (shard) => qc.getQueryData<TextShard>(keys.shard(key, shard)),
+    oneChapter,
+    fetchShard: (shard) => qc.fetchQuery({
       queryKey: keys.shard(key, shard),
       queryFn: () => get<TextShard>(textShardUrl(key, shard)),
       staleTime: Infinity,
-    }).catch(() => null);
-    const c = fromShard(s);
-    if (c) return c;
-  }
-  if (cacheOnly) return null;
-  // Last resort: the endpoint, even though the server may hold another book.
-  return oneChapter();
+      retry: awaitedRetry,
+    }).catch(() => null),
+  };
 }
 
 async function loadManifest(

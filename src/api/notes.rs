@@ -5,6 +5,14 @@
 //! failure path is a 4xx or 5xx, because a memo the reader believes was filed
 //! and was not is the one loss this system cannot tolerate — the audio is in
 //! IndexedDB on a phone and nowhere else until this call succeeds.
+//!
+//! Which is why the memo names its book. Playback is one global session, and the
+//! note's quote callout is built out of a chapter's words; a memo that waited out
+//! an offline stretch and arrived after a book swap would otherwise quote the
+//! wrong passage. With `book` supplied, the words come from that book's on-disk
+//! text bundle — rebuilt on every load of it, so the chunk indices are exactly
+//! the ones the memo refers to — and a book this server has no bundle for is
+//! refused rather than filed wrong.
 
 use std::sync::Arc;
 
@@ -18,6 +26,7 @@ use serde_json::json;
 use utoipa::ToSchema;
 
 use super::{err, ApiError};
+use crate::cache;
 use crate::state::AppState;
 use crate::vault;
 
@@ -32,6 +41,17 @@ pub struct NoteBody {
     pub chapter: Option<usize>,
     #[serde(default)]
     pub chunk: Option<usize>,
+    /// The book the memo was recorded against, as a cache key. **Additive, and
+    /// worth sending**: a memo can wait out an offline stretch in the reader's
+    /// outbox and arrive after the server has loaded something else, and the
+    /// quote callout is built from a chapter's words. Supplied and not the
+    /// loaded book, the quote, frontmatter and deep link come from that book's
+    /// on-disk text bundle instead — no session swap, so whatever another device
+    /// is listening to is left alone. A key with no bundle on this server is a
+    /// **404**, never a 2xx, so the recording stays queued. Omitted, it means
+    /// "whatever is loaded", exactly as before.
+    #[serde(default)]
+    pub book: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -49,23 +69,83 @@ pub struct NoteResult {
     responses(
         (status = 200, body = NoteResult, description = "filed - the outbox may delete its copy"),
         (status = 400, body = ApiError, description = "no book, no audio, or nothing heard"),
+        (status = 404, body = ApiError, description = "`book` names a book with no text bundle here"),
         (status = 500, body = ApiError, description = "transcription or the vault write failed"),
     )
 )]
 pub async fn note(State(st): State<Arc<AppState>>, Json(body): Json<NoteBody>) -> Response {
-    let (plan, title, bookpath, ci, i) = {
+    let (plan, session_title, bookpath, loaded_key, ci, i) = {
         let s = st.session();
         (
             s.plan.clone(),
             s.title.clone().unwrap_or_default(),
             s.book.clone().unwrap_or_default(),
+            s.key(),
             body.chapter.unwrap_or(s.chapter),
             body.chunk.unwrap_or(s.playhead),
         )
     };
-    if plan.is_empty() {
+    // Which book's words the note quotes, decided before anything is written:
+    // the named one out of its bundle, or the session's own plan.
+    let asked = body
+        .book
+        .as_deref()
+        .map(cache::safe_key)
+        .unwrap_or_default();
+    let named = !asked.is_empty() && Some(&asked) != loaded_key.as_ref();
+    let (title, name, ctitle, ctx, n) = if named {
+        let got = tokio::task::spawn_blocking({
+            let work = st.cfg.work.clone();
+            let key = asked.clone();
+            move || crate::text::note_chapter(&work, &key, ci)
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some((title, name, ctitle, texts)) = got else {
+            // A 404 rather than a note quoting the wrong passage: the reader's
+            // outbox keeps the recording and asks again later.
+            return err(
+                StatusCode::NOT_FOUND,
+                format!("no text for book '{asked}' on this server"),
+            );
+        };
+        // The bundle has no `silent` flags — a beat is stored as the text it
+        // was made from — so a blank chunk is what stands in for one here.
+        let ctx = texts
+            .iter()
+            .skip(i.saturating_sub(1))
+            .take(if i == 0 { 2 } else { 3 })
+            .filter(|t| !t.trim().is_empty())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let n = texts.len();
+        (title, name, ctitle, ctx, n)
+    } else if !plan.is_empty() {
+        let ch = plan.get(ci);
+        let chunks = ch.map(|c| c.chunks.as_slice()).unwrap_or(&[]);
+        let ctitle = ch
+            .map(|c| c.display_title())
+            .unwrap_or_else(|| format!("Section {}", ci + 1));
+        // The surrounding words, so a later pass over the vault knows what the
+        // thought was reacting to.
+        let ctx = chunks
+            .iter()
+            .skip(i.saturating_sub(1))
+            .take(if i == 0 { 2 } else { 3 })
+            .filter(|c| !c.silent)
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let name = std::path::Path::new(&bookpath)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        (session_title, name, ctitle, ctx, chunks.len())
+    } else {
         return err(StatusCode::BAD_REQUEST, "no book loaded");
-    }
+    };
     let Ok(audio) = base64::engine::general_purpose::STANDARD.decode(&body.audio) else {
         return err(StatusCode::BAD_REQUEST, "no audio");
     };
@@ -94,22 +174,6 @@ pub async fn note(State(st): State<Arc<AppState>>, Json(body): Json<NoteBody>) -
             format!("could not save audio: {e}"),
         );
     }
-
-    let ch = plan.get(ci);
-    let chunks = ch.map(|c| c.chunks.as_slice()).unwrap_or(&[]);
-    let ctitle = ch
-        .map(|c| c.display_title())
-        .unwrap_or_else(|| format!("Section {}", ci + 1));
-    // The surrounding words, so a later pass over the vault knows what the
-    // thought was reacting to.
-    let ctx = chunks
-        .iter()
-        .skip(i.saturating_sub(1))
-        .take(if i == 0 { 2 } else { 3 })
-        .filter(|c| !c.silent)
-        .map(|c| c.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
 
     let prompt = [
         st.cfg.whisper_prompt.as_str(),
@@ -148,18 +212,16 @@ pub async fn note(State(st): State<Arc<AppState>>, Json(body): Json<NoteBody>) -
         );
     }
 
-    let book_file = std::path::Path::new(&bookpath)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
     let md = vault::note_markdown(&vault::NoteInput {
         stamp,
         book_title: &title,
-        book_file: &book_file,
+        // The named book's own file name, so the deep link reopens the reader on
+        // the passage the memo was recorded at rather than on whatever is loaded.
+        book_file: &name,
         chapter_title: &ctitle,
         chapter: ci,
         chunk: i,
-        chunks_total: chunks.len(),
+        chunks_total: n,
         context: &ctx,
         language: &t.language,
         audio_name: &apath
@@ -185,7 +247,7 @@ pub async fn note(State(st): State<Arc<AppState>>, Json(body): Json<NoteBody>) -
     // its delivery contract; the event is for the *other* devices.
     st.bus.emit(
         "note",
-        json!({"file": fname, "book": book_file, "chapter": ci,
+        json!({"file": fname, "book": name, "chapter": ci,
                "chunk": i, "language": t.language}),
     );
     Json(NoteResult {

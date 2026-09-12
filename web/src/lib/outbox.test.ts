@@ -7,24 +7,21 @@ const memo = (o: Partial<Memo> = {}): Memo => ({
 });
 
 describe('when a memo is sent', () => {
-  test('when the server is reachable and holding its book', () => {
-    expect(nextAction(memo(), {online: true, serverBook: 'A Book.epub'})).toBe('send');
-    expect(nextAction(memo({book: null}), {online: true, serverBook: 'Other.epub'})).toBe('send');
+  test('whenever the server is reachable - it names its own book', () => {
+    // The memo carries the book it was recorded against, and the server quotes
+    // that book's on-disk text, so a swapped-out session is no reason to wait.
+    expect(nextAction(memo(), {online: true})).toBe('send');
+    expect(nextAction(memo({book: null}), {online: true})).toBe('send');
   });
 
   test('offline it waits - it is never dropped', () => {
-    expect(nextAction(memo(), {online: false, serverBook: 'A Book.epub'})).toBe('hold');
-  });
-
-  test('it waits for its own book rather than quoting the wrong one', () => {
-    // The server builds the note's quote callout from the chapter *it* has open.
-    expect(nextAction(memo(), {online: true, serverBook: 'Different.epub'})).toBe('hold');
+    expect(nextAction(memo(), {online: false})).toBe('hold');
   });
 
   test('after enough failures it stalls, and a manual retry un-stalls it', () => {
     const tired = memo({tries: MAX_TRIES});
-    expect(nextAction(tired, {online: true, serverBook: 'A Book.epub'})).toBe('stalled');
-    expect(nextAction(tired, {online: true, serverBook: 'A Book.epub', manual: true})).toBe('send');
+    expect(nextAction(tired, {online: true})).toBe('stalled');
+    expect(nextAction(tired, {online: true, manual: true})).toBe('send');
   });
 });
 

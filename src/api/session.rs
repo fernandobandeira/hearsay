@@ -201,8 +201,13 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
     // words. A reused plan is by definition the same words, so the bundle is
     // only written when it is missing — which is also how a load recovers from
     // a half-written one.
+    //
+    // A bundle written before the files were pre-gzipped has no `.gz` beside
+    // it, and a reused plan would never give it one; the words have not moved,
+    // so rewriting the bundle is both harmless and the cheapest way to earn the
+    // compressed copy every device then reads for the life of the book.
     let bundle = crate::text::text_dir(&st.cfg.work, &key).join("index.json");
-    if !reused || !bundle.exists() {
+    if !reused || !bundle.exists() || !crate::text::gz_path(&bundle).exists() {
         if let Err(e) = crate::text::write_bundle(&st.cfg, &plan, &est, &key, &name, &title) {
             tracing::warn!("could not write text bundle: {e}");
         }

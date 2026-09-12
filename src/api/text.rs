@@ -6,10 +6,10 @@
 use std::sync::Arc;
 
 use axum::extract::{Path as AxPath, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
 
-use super::{err, json_file, ApiError};
+use super::{err, gz_json_file, ApiError};
 use crate::cache;
 use crate::state::AppState;
 use crate::text::text_dir;
@@ -32,9 +32,21 @@ fn key_for(st: &AppState, q: &BookQuery) -> String {
     params(BookQuery),
     responses((status = 200, body = crate::text::BookIndex), (status = 404, body = ApiError))
 )]
-pub async fn book_index(State(st): State<Arc<AppState>>, Query(q): Query<BookQuery>) -> Response {
+pub async fn book_index(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
+    Query(q): Query<BookQuery>,
+) -> Response {
     let p = text_dir(&st.cfg.work, &key_for(&st, &q)).join("index.json");
-    json_file(&p, "public, max-age=3600", "not loaded yet").await
+    gz_json_file(
+        &p,
+        &headers,
+        method == Method::HEAD,
+        "public, max-age=3600",
+        "not loaded yet",
+    )
+    .await
 }
 
 /// One shard: a run of whole chapters, ~1.5 MB at most. Cache every shard and
@@ -47,6 +59,8 @@ pub async fn book_index(State(st): State<Arc<AppState>>, Query(q): Query<BookQue
 )]
 pub async fn book_text(
     State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
     AxPath(name): AxPath<String>,
     Query(q): Query<BookQuery>,
 ) -> Response {
@@ -57,5 +71,12 @@ pub async fn book_text(
         return err(StatusCode::NOT_FOUND, "no such shard");
     };
     let p = text_dir(&st.cfg.work, &key_for(&st, &q)).join(format!("{s:03}.json"));
-    json_file(&p, "public, max-age=3600", "no such shard").await
+    gz_json_file(
+        &p,
+        &headers,
+        method == Method::HEAD,
+        "public, max-age=3600",
+        "no such shard",
+    )
+    .await
 }

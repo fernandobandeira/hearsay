@@ -45,17 +45,33 @@ export default defineConfig({
             urlPattern: ({url}) => url.pathname === '/api/book.json'
               || url.pathname.startsWith('/api/text/'),
             handler: 'StaleWhileRevalidate',
-            options: {cacheName: 'narrator-text', expiration: {maxEntries: 400}},
+            options: {
+              cacheName: 'narrator-text',
+              // The reader is interchangeable between this server and the python
+              // one, and that one serves the text bundle gzipped - so a stored
+              // shard carries `Vary: Accept-Encoding`. A Vary-respecting match
+              // can then miss it entirely, which offline means a book that is on
+              // the device and will not open. Same reason as the audio rule.
+              matchOptions: {ignoreVary: true},
+              expiration: {maxEntries: 400},
+            },
           },
           {
             // One chapter's words. This is what first paint waits on - never the
             // 17 MB bundle - so it needs an answer with no network too: the copy
             // the last visit left behind, while the network is asked for a fresh
             // one. Keyed by ?book=, so it can never answer for another book.
+            //
+            // Its own cache, not the text one. Workbox's expiration records are
+            // keyed by cache *name*, so sharing one meant sharing one 400-entry
+            // budget: on a 1433-chapter novel every chapter visited added an
+            // entry until the shards - downloaded first, therefore oldest - were
+            // evicted out from under the offline reader.
             urlPattern: ({url}) => /^\/api\/chapter\/\d+$/.test(url.pathname),
             handler: 'NetworkFirst',
             options: {
-              cacheName: 'narrator-text',
+              cacheName: 'narrator-chapter',
+              matchOptions: {ignoreVary: true},
               networkTimeoutSeconds: 6,
               expiration: {maxEntries: 400},
               cacheableResponse: {statuses: [200]},

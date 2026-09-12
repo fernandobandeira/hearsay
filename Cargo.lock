@@ -1176,6 +1176,7 @@ dependencies = [
  "bytes",
  "chrono",
  "epub",
+ "flate2",
  "futures-core",
  "futures-util",
  "hound",

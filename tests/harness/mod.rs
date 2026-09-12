@@ -115,6 +115,25 @@ impl Harness {
         self.send(req).await
     }
 
+    /// The whole response, headers included — what a test that is about
+    /// content negotiation rather than JSON shape needs.
+    pub async fn raw(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> axum::http::Response<Body> {
+        let mut req = Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        self.app
+            .clone()
+            .oneshot(req.body(Body::empty()).expect("request"))
+            .await
+            .expect("the router never fails")
+    }
+
     pub async fn get_json(&self, path: &str) -> (StatusCode, Value) {
         let (code, body) = self.get(path).await;
         (code, parse(&body))

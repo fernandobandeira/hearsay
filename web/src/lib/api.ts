@@ -28,9 +28,11 @@
  *   too, so a builder URL and an SDK URL for the same resource are byte for byte
  *   the same request.
  */
-import {QueryClient, useQuery, useMutation, useQueryClient} from '@tanstack/react-query';
+import {
+  QueryClient, onlineManager, useQuery, useMutation, useQueryClient,
+} from '@tanstack/react-query';
 import * as sdk from '@/client';
-import {delayFor, isRetryable} from './backoff';
+import {delayFor, isRetryable, retryQuery, retryWhileOnline} from './backoff';
 import type {
   BookIndex, BuildResult, CancelResult, ChaptersResult, ChapterText, LoadResult,
   RenderResult, TextShard,
@@ -103,14 +105,26 @@ export const queryClient = new QueryClient({
       networkMode: 'offlineFirst',
       refetchOnReconnect: true,
       refetchOnWindowFocus: true,
-      retry: (count, error) =>
-        count < 5 && isRetryable(error instanceof ApiError ? error.status : 0),
+      retry: retryQuery,
       retryDelay: (attempt) => delayFor(attempt),
       staleTime: 5_000,
     },
     mutations: {networkMode: 'offlineFirst', retry: 1},
   },
 });
+
+/**
+ * The retry policy for an **awaited** `fetchQuery` that has a fallback behind it.
+ *
+ * `offlineFirst` + the default policy means a retry is *paused* rather than run
+ * while the browser says it is offline, and a paused query's promise never
+ * settles. A hook can afford that - it keeps showing what it has and resumes on
+ * reconnect. A `await qc.fetchQuery(...).catch(() => null)` cannot: the catch
+ * never runs, so the cached copy sitting one line further down is never reached.
+ * See lib/backoff.ts. Hook queries keep the default; this is for the chain in
+ * lib/chaptertext.ts and the book index behind it.
+ */
+export const awaitedRetry = retryWhileOnline(() => onlineManager.isOnline());
 
 export const keys = {
   books: ['books'] as const,

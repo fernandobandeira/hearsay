@@ -239,6 +239,17 @@ async fn the_status_codes_the_clients_branch_on() {
             .await
             .0,
     );
+    // A memo naming a book this server has no text for: refused, so the
+    // reader's outbox keeps the recording instead of deleting it on a 2xx.
+    expect(
+        "POST /api/note (unknown book)",
+        h.post_json(
+            "/api/note",
+            json!({"audio": SOME_AUDIO, "book": "A Book Never Loaded Here"}),
+        )
+        .await
+        .0,
+    );
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
@@ -322,4 +333,375 @@ async fn the_openapi_document_covers_the_urls_the_reader_builds() {
         assert!(ops.get(method).is_some(), "{p} has no {method}");
     }
     assert_eq!(paths.len(), 25, "the contract is 25 paths");
+}
+
+// ------------------------------------------------------- pre-gzipped book text
+// Content negotiation only: the decoded body is byte-identical to the plain
+// file, so the frozen contract above is untouched. The assertions are on the
+// response headers and on the bytes on disk, never on a decoded body alone — a
+// client that decompresses transparently would make that pass vacuously.
+
+/// Every built text file of the loaded book, as (url, path) pairs.
+async fn text_files(h: &Harness) -> Vec<(String, std::path::PathBuf)> {
+    let (code, index) = h.get_json("/api/book.json").await;
+    assert_eq!(code, StatusCode::OK, "{index}");
+    let key = index["key"].as_str().unwrap_or_default().to_string();
+    let d = narrator::text::text_dir(&h.work(), &key);
+    let mut out = vec![("/api/book.json".to_string(), d.join("index.json"))];
+    for s in 0..index["shards"].as_u64().unwrap_or(0) {
+        out.push((
+            format!("/api/text/{s}.json"),
+            d.join(format!("{s:03}.json")),
+        ));
+    }
+    out
+}
+
+fn gunzip(b: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(b)
+        .read_to_end(&mut out)
+        .expect("a .gz that is really gzip");
+    out
+}
+
+fn header(res: &axum::http::Response<axum::body::Body>, name: &str) -> Option<String> {
+    res.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+async fn body_of(res: axum::http::Response<axum::body::Body>) -> Vec<u8> {
+    axum::body::to_bytes(res.into_body(), 64 * 1024 * 1024)
+        .await
+        .expect("body")
+        .to_vec()
+}
+
+#[tokio::test]
+async fn every_text_file_is_gzipped_beside_itself() {
+    // The .gz is written in the same breath as the .json — one can never be
+    // staler than the other — and it really is that file, byte for byte. One
+    // chapter per shard, so every shard the writer can emit is covered, not
+    // just the single one the fixture fits in.
+    let h = Harness::with(|c| c.text_shard_chapters = 1).await;
+    h.load().await;
+    let files = text_files(&h).await;
+    assert!(files.len() > 2, "index plus several shards, got {files:?}");
+    for (_, p) in files {
+        let gz = narrator::text::gz_path(&p);
+        let raw = std::fs::read(&gz).unwrap_or_else(|e| panic!("{}: {e}", gz.display()));
+        assert!(!raw.is_empty(), "{} is empty", gz.display());
+        assert_eq!(gunzip(&raw), std::fs::read(&p).expect("plain"));
+    }
+}
+
+#[tokio::test]
+async fn gzip_is_served_when_it_is_accepted() {
+    let h = Harness::new().await;
+    h.load().await;
+    for (url, p) in text_files(&h).await {
+        let res = h.raw("GET", &url, &[("accept-encoding", "gzip")]).await;
+        assert_eq!(res.status(), StatusCode::OK, "{url}");
+        assert_eq!(
+            header(&res, "content-encoding").as_deref(),
+            Some("gzip"),
+            "{url}"
+        );
+        assert_eq!(
+            header(&res, "vary").as_deref(),
+            Some("Accept-Encoding"),
+            "{url}"
+        );
+        assert_eq!(
+            header(&res, "cache-control").as_deref(),
+            Some("public, max-age=3600"),
+            "{url}"
+        );
+        assert_eq!(
+            header(&res, "content-type").as_deref(),
+            Some("application/json"),
+            "{url}"
+        );
+        let plain = std::fs::read(&p).expect("plain");
+        let len: usize = header(&res, "content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let body = body_of(res).await;
+        // The wire really was smaller than the file it carried, and it decodes
+        // to exactly that file.
+        assert_eq!(len, body.len(), "{url}");
+        assert!(
+            len < plain.len(),
+            "{url}: {len} is not smaller than {}",
+            plain.len()
+        );
+        assert_eq!(gunzip(&body), plain, "{url}");
+    }
+}
+
+#[tokio::test]
+async fn identity_is_served_when_gzip_is_not_accepted() {
+    let h = Harness::new().await;
+    h.load().await;
+    for (url, p) in text_files(&h).await {
+        let res = h.raw("GET", &url, &[("accept-encoding", "identity")]).await;
+        assert_eq!(res.status(), StatusCode::OK, "{url}");
+        assert_eq!(header(&res, "content-encoding"), None, "{url}");
+        assert_eq!(
+            header(&res, "vary").as_deref(),
+            Some("Accept-Encoding"),
+            "{url}"
+        );
+        let plain = std::fs::read(&p).expect("plain");
+        assert_eq!(
+            header(&res, "content-length").as_deref(),
+            Some(plain.len().to_string().as_str()),
+            "{url}"
+        );
+        assert_eq!(body_of(res).await, plain, "{url}");
+    }
+}
+
+#[tokio::test]
+async fn accept_encoding_is_parsed_tolerantly() {
+    let h = Harness::new().await;
+    h.load().await;
+    for (hdr, want) in [
+        ("gzip", true),
+        ("gzip;q=0.5", true),
+        ("br, gzip", true),
+        ("*", true),
+        ("GZIP", true),
+        ("gzip, deflate, br", true),
+        ("gzip;q=nonsense", true), // a q we cannot read is not a refusal
+        ("gzip;q=0", false),
+        ("identity", false),
+        ("", false),
+        ("br", false),
+        ("*;q=0", false),
+        ("gzip;q=0, *", false), // an explicit refusal beats the wildcard
+    ] {
+        let res = h
+            .raw("GET", "/api/book.json", &[("accept-encoding", hdr)])
+            .await;
+        assert_eq!(res.status(), StatusCode::OK, "{hdr:?}");
+        assert_eq!(
+            header(&res, "content-encoding").as_deref() == Some("gzip"),
+            want,
+            "accept-encoding: {hdr:?}"
+        );
+    }
+    // No Accept-Encoding at all is the identity case too.
+    let res = h.raw("GET", "/api/book.json", &[]).await;
+    assert_eq!(header(&res, "content-encoding"), None);
+}
+
+#[tokio::test]
+async fn head_answers_the_same_headers_with_no_body() {
+    let h = Harness::new().await;
+    h.load().await;
+    for (url, p) in text_files(&h).await {
+        let plain = std::fs::read(&p).expect("plain");
+        for (hdr, gz) in [("gzip", true), ("identity", false)] {
+            let res = h.raw("HEAD", &url, &[("accept-encoding", hdr)]).await;
+            assert_eq!(res.status(), StatusCode::OK, "{url}");
+            assert_eq!(
+                header(&res, "content-encoding").is_some(),
+                gz,
+                "{url} {hdr}"
+            );
+            assert_eq!(header(&res, "vary").as_deref(), Some("Accept-Encoding"));
+            assert_eq!(
+                header(&res, "content-type").as_deref(),
+                Some("application/json")
+            );
+            let len: usize = header(&res, "content-length")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            assert_eq!(len < plain.len(), gz, "{url} {hdr}: content-length {len}");
+            assert!(
+                body_of(res).await.is_empty(),
+                "{url} {hdr}: HEAD has no body"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn text_without_a_gz_still_serves() {
+    // Text built by an older server has no .gz; that is a fallback, not a 500.
+    let h = Harness::new().await;
+    h.load().await;
+    let (_, p) = text_files(&h).await.remove(0);
+    std::fs::remove_file(narrator::text::gz_path(&p)).expect("remove the .gz");
+    let res = h
+        .raw("GET", "/api/book.json", &[("accept-encoding", "gzip")])
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(header(&res, "content-encoding"), None);
+    assert_eq!(header(&res, "vary").as_deref(), Some("Accept-Encoding"));
+    assert_eq!(body_of(res).await, std::fs::read(&p).expect("plain"));
+}
+
+#[tokio::test]
+async fn a_missing_text_file_is_still_a_404_with_an_error_body() {
+    let h = Harness::new().await;
+    h.load().await;
+    for url in ["/api/text/99.json", "/api/book.json?book=nobody"] {
+        let res = h.raw("GET", url, &[("accept-encoding", "gzip")]).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{url}");
+        assert_eq!(header(&res, "content-encoding"), None, "{url}");
+        let body: Value = serde_json::from_slice(&body_of(res).await).expect("error body");
+        assert!(body.get("error").is_some(), "{url}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_bundle_without_a_gz_is_rebuilt_on_the_next_load() {
+    // The upgrade path: text written before this feature existed has no .gz,
+    // and a reused plan would otherwise never give it one.
+    let h = Harness::new().await;
+    h.load().await;
+    let files = text_files(&h).await;
+    for (_, p) in &files {
+        std::fs::remove_file(narrator::text::gz_path(p)).expect("remove the .gz");
+    }
+    h.load().await; // the plan is reused; the bundle is not
+    for (url, p) in files {
+        assert!(
+            narrator::text::gz_path(&p).exists(),
+            "{url}: the .gz came back"
+        );
+        let res = h.raw("GET", &url, &[("accept-encoding", "gzip")]).await;
+        assert_eq!(
+            header(&res, "content-encoding").as_deref(),
+            Some("gzip"),
+            "{url}"
+        );
+    }
+}
+
+// --------------------------------------------------- a memo names its book
+
+/// A text bundle for a book this server never loaded — the shape `/api/load`
+/// leaves behind, written by hand so the test does not need a second epub.
+fn seed_bundle(h: &Harness, key: &str, name: &str, title: &str, chunks: &[&str]) {
+    let d = h.work().join("text").join(key);
+    std::fs::create_dir_all(&d).expect("bundle dir");
+    std::fs::write(
+        d.join("index.json"),
+        json!({
+            "key": key, "name": name, "title": title, "total_min": 1.0,
+            "shards": 1, "text_bytes": 1,
+            "chapters": [{"i": 0, "title": "Opening", "n": chunks.len(), "est_min": 1.0, "shard": 0}],
+        })
+        .to_string(),
+    )
+    .expect("index.json");
+    std::fs::write(
+        d.join("000.json"),
+        json!({
+            "shard": 0, "from": 0, "to": 0,
+            "chapters": [{"i": 0, "paras": vec![0usize; chunks.len()], "chunks": chunks}],
+        })
+        .to_string(),
+    )
+    .expect("shard");
+}
+
+/// Base64 of something that is not audio (`not really a webm`): enough to get
+/// past the decode, which is as far as a suite with no whisper model can go.
+const SOME_AUDIO: &str = "bm90IHJlYWxseSBhIHdlYm0=";
+
+#[tokio::test]
+async fn a_memo_naming_a_book_with_no_bundle_here_is_a_404_not_a_note() {
+    // The delivery contract: anything but a 2xx leaves the recording in the
+    // reader's outbox. Filing it against the loaded book would quote the wrong
+    // passage and the phone would then delete the only copy.
+    let h = Harness::new().await;
+    h.load().await;
+    for body in [
+        json!({"audio": SOME_AUDIO, "book": "A Book Never Loaded Here"}),
+        // A bundle that exists, at a chapter it does not have.
+        json!({"audio": SOME_AUDIO, "book": "Other Book (2019)", "chapter": 9}),
+    ] {
+        let named = body["book"].as_str().unwrap_or_default().to_string();
+        seed_bundle(
+            &h,
+            "Other Book (2019)",
+            "Other Book (2019).epub",
+            "Other Book",
+            &["one.", "two."],
+        );
+        let (code, got) = h.post_json("/api/note", body).await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{named}: {got}");
+        assert!(
+            got["error"].as_str().unwrap_or_default().contains(&named),
+            "the refusal names the book it could not answer for: {got}"
+        );
+        assert_eq!(got.as_object().map(|o| o.len()), Some(1), "{got}");
+    }
+}
+
+#[tokio::test]
+async fn a_memo_naming_another_book_is_answered_from_that_books_bundle() {
+    let h = Harness::new().await;
+    let loaded = h.load().await;
+    seed_bundle(
+        &h,
+        "Other Book (2019)",
+        "Other Book (2019).epub",
+        "Other Book",
+        &["one.", "two.", "three."],
+    );
+    let (code, body) = h
+        .post_json(
+            "/api/note",
+            json!({"audio": SOME_AUDIO, "mime": "audio/webm",
+                   "chapter": 0, "chunk": 1, "book": "Other Book (2019)"}),
+        )
+        .await;
+    // The bundle answered — this is neither the 404 of a book with no text nor
+    // the 400 of a body that never got that far. What stops it here is whisper,
+    // which has no model in this suite; the words it would have quoted are
+    // asserted at the bundle reader in `src/text.rs`.
+    assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("transcription"),
+        "{body}"
+    );
+    // The raw memo is on disk before anything can fail, and it never was the
+    // session's business: the loaded book is untouched.
+    let kept = std::fs::read_dir(h.work().join("notes-audio"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(kept, 1, "the recording landed before transcription");
+    let (_, status) = h.get_json("/api/status").await;
+    assert_eq!(status["key"], loaded["key"], "no session swap: {status}");
+}
+
+#[tokio::test]
+async fn naming_the_loaded_book_is_the_same_as_naming_nothing() {
+    let h = Harness::new().await;
+    let key = h.load().await["key"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    for (name, payload) in [
+        ("nothing heard", json!({"audio": SOME_AUDIO, "chunk": 1})),
+        ("a body with no audio", json!({"audio": "!!!not base64!!!"})),
+    ] {
+        let (plain, a) = h.post_json("/api/note", payload.clone()).await;
+        let mut named = payload;
+        named["book"] = json!(key);
+        let (with_book, b) = h.post_json("/api/note", named).await;
+        assert_eq!(plain, with_book, "{name}: {a} vs {b}");
+        assert_eq!(a, b, "{name}");
+    }
 }

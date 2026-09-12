@@ -12,16 +12,23 @@
  * that has been opened once has its table of contents in localStorage and its
  * words in Cache Storage - which is the whole point of taking them. So the list
  * falls back to what this device already knows rather than showing an error.
+ *
+ * It is also where a book is given back. Removing it belongs to the book, not to
+ * the chapter level: the words and every downloaded chapter go together, in one
+ * act, for any book in the list - including one that is not open, which the
+ * chapter level could never reach. It is a phone-sized destructive button with
+ * nothing behind it to undo with, so it asks once: the first tap arms it, the
+ * second does it.
  */
-import {useEffect, useState} from 'react';
-import {ChevronLeft, ChevronRight} from 'lucide-react';
+import {useCallback, useEffect, useState} from 'react';
+import {ChevronLeft, ChevronRight, Trash2} from 'lucide-react';
 import {Sheet, SheetContent, SheetHeader, SheetTitle} from '@/components/ui/sheet';
 import {ScrollArea} from '@/components/ui/scroll-area';
 import {Separator} from '@/components/ui/separator';
 import {Skeleton} from '@/components/ui/skeleton';
 import {Spinner} from '@/components/ui/spinner';
 import {useBooks} from '@/lib/api';
-import {storageEstimate} from '@/lib/offline';
+import {bookKey, heldBooks, storageEstimate} from '@/lib/offline';
 import {bytes as fmtBytes} from '@/lib/format';
 import {initialView, type DrawerView} from '@/lib/drawernav';
 import {cn} from '@/lib/utils';
@@ -44,8 +51,37 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
   const books = useBooks();
   const [opening, setOpening] = useState<string | null>(null);
   const [view, setView] = useState<DrawerView>(() => initialView(false));
+  const [held, setHeld] = useState<Set<string>>(new Set());
+  const [armed, setArmed] = useState<string | null>(null);
+  const [dropping, setDropping] = useState<string | null>(null);
   const list: BookFile[] = books.data?.length ? books.data : knownBooks();
   const loadingList = books.isPending && !list.length;
+
+  /* Which books have anything on this device. Always asked, never remembered -
+     a quota eviction (or the auto-trim) has to show up as a book with nothing
+     left to remove. The open book's own offline state changing is the other
+     reason to re-ask. */
+  const look = useCallback(async () => { setHeld(await heldBooks()); }, []);
+  useEffect(() => {
+    if (!open) { setArmed(null); return; }
+    void look();
+  }, [open, look, n.offlineChapters, n.textShards]);
+
+  /* An armed remove disarms itself - on a timer, and on any trip away from the
+     list. A red "remove?" left sitting under a thumb is the one way this could
+     delete a 400 MB download nobody asked it to. */
+  useEffect(() => {
+    if (!armed) return;
+    const t = setTimeout(() => setArmed(null), 5_000);
+    return () => clearTimeout(t);
+  }, [armed]);
+  useEffect(() => { if (view !== 'books') setArmed(null); }, [view]);
+
+  const drop = async (key: string) => {
+    setArmed(null);
+    setDropping(key);
+    try { await n.dropBook(key); } finally { setDropping(null); void look(); }
+  };
 
   /* Which view is decided on each open, not remembered from the last one: the
      answer depends on whether a book is open *now*. Deliberately keyed on `open`
@@ -117,31 +153,79 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
                   {books.isError ? 'cannot reach the server, and nothing is saved here' : 'no epubs found'}
                 </div>
               )}
-              {list.map((b) => (
-                <button
-                  key={b.path}
-                  data-testid="book"
-                  data-key={b.key}
-                  onClick={() => {
-                    setOpening(b.path);
-                    // Push first: the chapters view is where the book is opening,
-                    // and it has its own skeleton to show while it does.
-                    setView('chapters');
-                    void n.openBook(b).finally(() => setOpening(null));
-                  }}
-                  className={cn(
-                    'flex w-full items-baseline gap-2 px-4 py-2 text-left text-[13px] font-light',
-                    'text-muted-foreground transition-colors hover:bg-white/5 hover:text-foreground',
-                    b.path === n.book?.path &&
-                      'bg-white/[0.06] text-foreground shadow-[inset_2px_0_0_var(--color-ring)]',
-                  )}
-                >
-                  <span className="min-w-0 flex-1 truncate">{b.name.replace(/\.epub$/i, '')}</span>
-                  {opening === b.path
-                    ? <Spinner className="size-3 shrink-0 self-center text-muted-foreground" />
-                    : b.mb ? <span className="shrink-0 text-[10px] text-muted-foreground">{b.mb}MB</span> : null}
-                </button>
-              ))}
+              {list.map((b) => {
+                /* The library's rows come from the server without a cache key,
+                   so the device copy is named by the same rule the server files
+                   it under - which is what lets a book that has never been
+                   opened here still be recognised, and removed. */
+                const key = bookKey(b);
+                const title = b.name.replace(/\.epub$/i, '');
+                const here = b.path === n.book?.path;
+                return (
+                  <div
+                    key={b.path}
+                    data-testid="book-row"
+                    data-key={key}
+                    className={cn(
+                      'flex items-center transition-colors hover:bg-white/5',
+                      here && 'bg-white/[0.06] shadow-[inset_2px_0_0_var(--color-ring)]',
+                    )}
+                  >
+                    <button
+                      data-testid="book"
+                      data-key={key}
+                      onClick={() => {
+                        setArmed(null);
+                        setOpening(b.path);
+                        // Push first: the chapters view is where the book is
+                        // opening, and it has its own skeleton for the wait.
+                        setView('chapters');
+                        void n.openBook(b).finally(() => setOpening(null));
+                      }}
+                      className={cn(
+                        'flex min-w-0 flex-1 items-baseline gap-2 py-2 pl-4 pr-2 text-left text-[13px]',
+                        'font-light text-muted-foreground transition-colors hover:text-foreground',
+                        here && 'text-foreground',
+                      )}
+                    >
+                      <span className="min-w-0 flex-1 truncate">{title}</span>
+                      {opening === b.path
+                        ? <Spinner className="size-3 shrink-0 self-center text-muted-foreground" />
+                        : b.mb ? <span className="shrink-0 text-[10px] text-muted-foreground">{b.mb}MB</span> : null}
+                    </button>
+
+                    {/* Only for a book this device actually holds something for,
+                        and only ever this device's copy: the server keeps its
+                        files, so everything removed here is one download away. */}
+                    {held.has(key) && (dropping === key ? (
+                      <Spinner data-testid="book-dropping"
+                               className="mr-3.5 size-3 shrink-0 text-muted-foreground" />
+                    ) : armed === key ? (
+                      <button
+                        data-testid="book-remove-confirm"
+                        aria-label={`Confirm removing this device's copy of ${title}`}
+                        onClick={() => void drop(key)}
+                        title={`Remove this device's copy of ${title} — the words and every downloaded chapter. The server keeps its files.`}
+                        className="mr-1.5 h-9 shrink-0 rounded-md px-2.5 text-[11px] text-destructive
+                                   transition-colors hover:bg-destructive/10"
+                      >
+                        remove?
+                      </button>
+                    ) : (
+                      <button
+                        data-testid="book-remove"
+                        aria-label={`Remove this device's copy of ${title} — the words and every downloaded chapter. The server keeps its files.`}
+                        onClick={() => setArmed(key)}
+                        title="Remove this device's copy — the words and every downloaded chapter. The server keeps its files."
+                        className="mr-1.5 flex size-9 shrink-0 items-center justify-center rounded-md
+                                   text-muted-foreground/60 transition-colors hover:text-destructive"
+                      >
+                        <Trash2 className="size-3.5" />
+                      </button>
+                    ))}
+                  </div>
+                );
+              })}
             </ScrollArea>
           </div>
 

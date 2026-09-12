@@ -7,6 +7,7 @@
  * timeout, a proxy's own 200 - leaves it exactly where it was.
  */
 import * as db from './db';
+import {bookKey} from './offline';
 import {afterFailure, classify, nextAction, type OutboxCtx} from './outbox';
 import type {NoteResult} from './types';
 
@@ -28,6 +29,10 @@ export async function flushOutbox(ctx: OutboxCtx): Promise<void> {
         body: JSON.stringify({
           audio: await toBase64(memo.blob), mime: memo.mime,
           chapter: memo.chapter, chunk: memo.chunk,
+          // The memo stores the book's file name; the server files by cache key.
+          // Naming it lets the note quote the right book's text even when the
+          // server has since loaded another one.
+          ...(memo.book ? {book: bookKey({name: memo.book})} : {}),
         }),
       });
       status = res.status;

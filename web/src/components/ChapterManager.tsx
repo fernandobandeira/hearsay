@@ -7,8 +7,10 @@
  * **The two tiers are one line.** They used to be two bordered cards with a
  * label, a sentence and a badge each - 133 px of a 852 px screen, restating per
  * book what every chapter row already says per chapter. They are now one line
- * of small print: what the text copy costs, its remove/save affordance, and how
- * many chapters are on the device. The caption explaining the verbs, the
+ * of small print: what the text copy costs, its save affordance, and how many
+ * chapters are on the device. (Giving a copy *back* is the Books list's job now:
+ * it takes the words and every downloaded chapter in one act, for any book this
+ * device holds, open or not.) The caption explaining the verbs, the
  * "server has 2.5h of 331.3h rendered" line and the text-size row all went with
  * them; text size lives in the top bar's `T` now, and the pipeline figures live
  * in the diagnostics corner at the bottom of the Books level.
@@ -35,6 +37,7 @@ import {ScrollArea} from '@/components/ui/scroll-area';
 import {Skeleton} from '@/components/ui/skeleton';
 import {useQueryClient} from '@tanstack/react-query';
 import {fetchChapters, keys, useChapterActions, useChapters} from '@/lib/api';
+import {KEEP_BEHIND} from '@/lib/autotrim';
 import {chapterState, type ChapterStateKey, type Job} from '@/lib/chapterstate';
 import {
   anyEstimated, buildVerdict, estimateBytes, isAction, jobFor, needsRender, phaseFor,
@@ -319,19 +322,17 @@ export function ChapterManager({open, active, onPick}: {
                 ? `text ${n.index?.text_bytes ? fmtBytes(n.index.text_bytes) : 'saved'}`
                 : shards ? `text ${n.textShards.size}/${shards}` : 'text not saved'}
         </span>
-        {textDone && !n.textOptOut ? (
-          <button data-testid="text-remove" onClick={() => void n.dropText()}
-                  title="Delete the book's words from this device. The reader then needs the server for every chapter."
-                  className="shrink-0 rounded p-1 text-muted-foreground/70 transition-colors hover:text-destructive">
-            <Trash2 className="size-3" />
-          </button>
-        ) : (n.textOptOut || (!textDone && !n.textBusy)) ? (
+        {/* Only the opt-in half lives here now. Giving the words back belongs to
+            the book rather than to this drawer - on the Books list it can take
+            the downloaded chapters with it in one act, and it can reach a book
+            that is not open, which this level never could. */}
+        {(n.textOptOut || (!textDone && !n.textBusy)) && (
           <button data-testid="text-save" onClick={() => n.saveText()}
                   title="Keep the whole book's words on this device"
                   className="shrink-0 rounded p-1 text-muted-foreground/70 transition-colors hover:text-foreground">
             <HardDriveDownload className="size-3" />
           </button>
-        ) : null}
+        )}
         <span data-testid="audio-state"
               className="ml-auto flex shrink-0 items-center gap-1 tabular-nums">
           <FileAudio className="size-3" />
@@ -339,6 +340,15 @@ export function ChapterManager({open, active, onPick}: {
           {offlineBytes > 0 && ` · ${fmtBytes(offlineBytes)}`}
         </span>
       </div>
+      {/* Said once, quietly, and only where it is true: downloaded chapters
+          vanish from this list on their own, and a reader who has not been told
+          that reads it as a bug. */}
+      {n.offlineChapters.size > 0 && (
+        <div data-testid="audio-autotrim"
+             className="px-4 pb-1.5 text-right text-[10px] leading-relaxed text-muted-foreground/70">
+          chapters more than {KEEP_BEHIND} behind you are removed automatically
+        </div>
+      )}
       {n.textBusy && (
         <Progress data-testid="text-progress" className="mx-4 mb-1.5 h-px bg-white/[0.06]"
                   value={n.textProgress

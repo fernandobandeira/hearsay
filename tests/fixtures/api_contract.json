@@ -203,6 +203,7 @@
     "GET /api/text/99.json": 404,
     "GET /api/hls/x/0/evil.sh": 404,
     "POST /api/position (no book)": 400,
-    "POST /api/note (no audio)": 400
+    "POST /api/note (no audio)": 400,
+    "POST /api/note (unknown book)": 404
   }
 }

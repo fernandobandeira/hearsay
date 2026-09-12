@@ -263,6 +263,18 @@ export type NoteBody = {
      */
     audio: string;
     /**
+     * The book the memo was recorded against, as a cache key. **Additive, and
+     * worth sending**: a memo can wait out an offline stretch in the reader's
+     * outbox and arrive after the server has loaded something else, and the
+     * quote callout is built from a chapter's words. Supplied and not the
+     * loaded book, the quote, frontmatter and deep link come from that book's
+     * on-disk text bundle instead — no session swap, so whatever another device
+     * is listening to is left alone. A key with no bundle on this server is a
+     * **404**, never a 2xx, so the recording stays queued. Omitted, it means
+     * "whatever is loaded", exactly as before.
+     */
+    book?: string | null;
+    /**
      * Where the memo was recorded. Defaults to the session's own position.
      */
     chapter?: number | null;
@@ -959,6 +971,10 @@ export type NoteErrors = {
      * no book, no audio, or nothing heard
      */
     400: ApiError;
+    /**
+     * `book` names a book with no text bundle here
+     */
+    404: ApiError;
     /**
      * transcription or the vault write failed
      */

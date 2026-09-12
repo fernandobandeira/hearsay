@@ -175,6 +175,84 @@ pub async fn ranged(
 
 use tokio::io::AsyncReadExt;
 
+// ------------------------------------------------------- pre-gzipped serving
+// The text bundle is written with a `.gz` beside every `.json`, so the only
+// thing left at request time is content negotiation. Hand-rolled and narrow on
+// purpose: a compression *layer* would either re-compress ~17 MB of shards on
+// every request or would have to be kept away from the audio endpoints by hand,
+// and those serve byte ranges (a range of a compressed body is not a range of
+// the file iOS asked for).
+
+/// Tolerant `Accept-Encoding` parse: gzip (or `*`) offered and not refused with
+/// `q=0`. A malformed q-value is taken as 1.0 rather than as a refusal — the
+/// cost of being wrong is a few hundred kB, not a broken reader.
+pub fn accepts_gzip(headers: &HeaderMap) -> bool {
+    let raw = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut gzip = None;
+    let mut star = None;
+    for part in raw.split(',') {
+        let (name, params) = match part.split_once(';') {
+            Some((n, p)) => (n.trim(), p.trim()),
+            None => (part.trim(), ""),
+        };
+        let q = params
+            .strip_prefix("q=")
+            .map_or(1.0, |v| v.parse::<f64>().unwrap_or(1.0));
+        match name {
+            "gzip" => gzip = Some(q),
+            "*" => star = Some(q),
+            _ => {}
+        }
+    }
+    gzip.or(star).unwrap_or(0.0) > 0.0
+}
+
+/// Serve a built text file, pre-gzipped when the client takes it.
+///
+/// Pure content negotiation: the decoded body is byte-identical either way, so
+/// the frozen API shape is untouched. A missing `.gz` (a bundle built by an
+/// older server) falls back to the plain file rather than failing.
+pub async fn gz_json_file(
+    path: &std::path::Path,
+    headers: &HeaderMap,
+    is_head: bool,
+    cache: &str,
+    missing: &str,
+) -> Response {
+    // The plain file is what decides 404: a `.gz` can only ever stand in for one.
+    if tokio::fs::metadata(path).await.is_err() {
+        return err(StatusCode::NOT_FOUND, missing);
+    }
+    let gz = crate::text::gz_path(path);
+    let gzipped = accepts_gzip(headers) && tokio::fs::metadata(&gz).await.is_ok();
+    let Ok(body) = tokio::fs::read(if gzipped { &gz } else { path }).await else {
+        return err(StatusCode::NOT_FOUND, missing);
+    };
+    let mut r = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, cache)
+        // Sent either way: a cache that saw one form must not serve it to a
+        // client that asked for the other.
+        .header(header::VARY, "Accept-Encoding")
+        .header(header::CONTENT_LENGTH, body.len().to_string());
+    if gzipped {
+        r = r.header(header::CONTENT_ENCODING, "gzip");
+    }
+    // HEAD answers with the same headers and no body, so a client can size a
+    // download without taking it.
+    r.body(if is_head {
+        Body::empty()
+    } else {
+        Body::from(body)
+    })
+    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 /// Serve a small file whole, with a cache header.
 pub async fn json_file(path: &std::path::Path, cache: &str, missing: &str) -> Response {
     match tokio::fs::read(path).await {

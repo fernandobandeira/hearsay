@@ -38,3 +38,52 @@ export function isRetryable(status: number): boolean {
   if (status === 408 || status === 429) return true;
   return status >= 500;
 }
+
+/** How many times a request is worth repeating before it is simply broken. */
+export const MAX_RETRIES = 5;
+
+/**
+ * The status of a failure, whatever threw it.
+ *
+ * Duck-typed on purpose: `ApiError` lives in api.ts, api.ts imports this module,
+ * and reading `.status` off an unknown keeps this file at the bottom of the
+ * import graph instead of in a cycle with the thing it is a policy for.
+ * Anything with no status is a transport failure, which is status 0.
+ */
+export function statusOf(error: unknown): number {
+  const s = (error as {status?: unknown} | null | undefined)?.status;
+  return typeof s === 'number' ? s : 0;
+}
+
+/** The default policy: the curve above, five times, for failures worth repeating. */
+export function retryQuery(count: number, error: unknown): boolean {
+  return count < MAX_RETRIES && isRetryable(statusOf(error));
+}
+
+/**
+ * The same policy, except that being offline ends it immediately.
+ *
+ * This exists for one shape of call: an **awaited** `fetchQuery` that has a
+ * fallback behind it. Every query here is `networkMode: 'offlineFirst'`, because
+ * the service worker answers plenty of requests with no network - but when a
+ * request genuinely fails and a retry is scheduled, TanStack Query *pauses* the
+ * retry until the browser is online again rather than rejecting. For a hook that
+ * is right: the screen keeps its last data and the query resumes on reconnect.
+ * For an awaited call it is fatal - the promise never settles, so the
+ * `.catch(() => null)` that was supposed to move on to the cached copy never
+ * runs, and the reader shows a loading skeleton for as long as the plane is in
+ * the air. That was the bug: in airplane mode only the chapter that was already
+ * open would display, with every shard of the book sitting in Cache Storage.
+ *
+ * Offline, the first failure settles and the caller falls through to the cache.
+ * Online, this is the default policy exactly - same curve, same five attempts.
+ *
+ * One case is deliberately left alone: query-core's `canContinue()` gates on the
+ * focus manager as well, so a document that is hidden pauses in the same way
+ * even with a network. That one is not this bug and the trade is different - a
+ * backgrounded tab giving up after a single attempt on a slow connection is
+ * worse than one that waits to be looked at again.
+ */
+export function retryWhileOnline(isOnline: () => boolean) {
+  return (count: number, error: unknown): boolean => isOnline() && retryQuery(count, error);
+}
