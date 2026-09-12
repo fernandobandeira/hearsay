@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -182,6 +182,12 @@ pub struct AppState {
     pub render_started: AtomicBool,
     pub build_started: AtomicBool,
 
+    /// Every attempt to put a chunk on disk, successful or not — a cache hit is
+    /// not one. It is not in the API and nothing reads it at runtime; it exists
+    /// so that "the worker is retrying a chunk it can never render" is a number
+    /// rather than a guess, and it is what the backoff test asserts against.
+    pub render_attempts: AtomicU64,
+
     /// When a chunk last landed on disk — `/healthz` turns a renderer that has
     /// silently wedged into a 503 a systemd timer can act on.
     pub progress_at: Mutex<Instant>,
@@ -212,6 +218,7 @@ impl AppState {
             pos_written: Mutex::new(None),
             render_started: AtomicBool::new(false),
             build_started: AtomicBool::new(false),
+            render_attempts: AtomicU64::new(0),
             progress_at: Mutex::new(Instant::now()),
             started_at: Instant::now(),
             chstat: Mutex::new(None),

@@ -152,6 +152,69 @@ async fn a_forward_jump_does_not_strand_the_chunk_under_the_playhead() {
     until("the jumped-to chunk", 20.0, || p.exists()).await;
 }
 
+/// The other half of rule 1: it has no exit.
+///
+/// A chunk under the playhead that will not render is re-attempted every time
+/// round the worker loop, and before the backoff that was a full-speed retry —
+/// an espeak spawn and a warn line per iteration for as long as the reader sits
+/// there. The invariant still has to hold (the chunk is never abandoned), so
+/// what is asserted here is both halves: it is still retried, and it is not
+/// retried thousands of times.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_chunk_that_will_not_render_backs_off_instead_of_spinning() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::Ordering;
+
+    let ro = |p: &Path, yes: bool| {
+        std::fs::set_permissions(
+            p,
+            std::fs::Permissions::from_mode(if yes { 0o555 } else { 0o755 }),
+        )
+    };
+
+    let h = Harness::new().await;
+    h.load().await;
+    let key = key_of(&h);
+    // Every write into chapter 0 fails: the directory is there and is not
+    // writable, which is what a read-only mount or a full disk looks like from
+    // inside `render_one`.
+    let dir = cache::chapter_dir(&h.work(), &key, 0);
+    std::fs::create_dir_all(&dir).expect("dir");
+    ro(&dir, true).expect("chmod");
+    // root ignores the mode, and then there is nothing to test.
+    let probe = dir.join(".probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        let _ = ro(&dir, false);
+        eprintln!("skipping: the directory is writable anyway (root?)");
+        return;
+    }
+
+    h.post_json("/api/open", json!({"chapter": 0, "chunk": 0}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let tries = h.state.render_attempts.load(Ordering::Relaxed);
+    ro(&dir, false).expect("restore");
+
+    assert!(
+        tries >= 2,
+        "the failing chunk must still be retried: {tries}"
+    );
+    assert!(
+        tries <= 12,
+        "a failing chunk must not spin the worker: {tries} attempts in 2.5 s"
+    );
+    // And it heals the moment the cause does: the next tick renders.
+    let p = cache::chunk_path(&h.work(), &key, 0, 0);
+    until(
+        "the chunk once the directory is writable again",
+        20.0,
+        || p.exists(),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn gc_evicts_by_age_but_never_the_chapter_being_read() {
     let h = Harness::with(|c| {

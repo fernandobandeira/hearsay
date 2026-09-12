@@ -88,6 +88,36 @@ async fn the_stream_opens_with_a_comment_a_retry_and_a_hello() {
     assert!(hello.contains("\"heartbeat_s\""), "{hello}");
 }
 
+/// `hello` is the reader's only way to tell a reconnect from a restart.
+///
+/// The event fires on every connect, so it is the first thing a reader hears
+/// after a deploy — and the book it names is the answer to "does this server
+/// still know what I am reading?". A restored session names the book; one that
+/// could not be restored names `null`, and the reader loads it back itself
+/// (`web/src/lib/live.ts`).
+#[tokio::test]
+async fn hello_names_the_book_a_reconnecting_reader_can_check() {
+    let mut h = Harness::new().await;
+    // Before anything is loaded, and after a restart that restored nothing, it
+    // is null — which is the signal.
+    let mut s = open_stream(&h).await;
+    let text = s.read_for(300, Some("event: hello")).await;
+    assert!(text.contains("\"book\":null"), "{text}");
+    assert!(text.contains("\"key\":null"), "{text}");
+
+    h.load().await;
+    let mut s = open_stream(&h).await;
+    let text = s.read_for(300, Some("event: hello")).await;
+    assert!(text.contains("\"key\":\"Fixture (2026)\""), "{text}");
+
+    // And across a restart the reader gets the same answer, because the session
+    // came back with the process.
+    h.restart().await;
+    let mut s = open_stream(&h).await;
+    let text = s.read_for(300, Some("event: hello")).await;
+    assert!(text.contains("\"key\":\"Fixture (2026)\""), "{text}");
+}
+
 #[tokio::test]
 async fn a_position_write_reaches_the_other_devices() {
     let h = Harness::new().await;

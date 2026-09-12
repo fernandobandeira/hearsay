@@ -60,12 +60,10 @@ async fn main() -> anyhow::Result<()> {
     let port = cfg.port;
     let state = AppState::new(cfg);
 
-    // The prerender target belongs on disk: it is one number the user chose, and
-    // a redeploy used to silently drop a 13-chapter buffer back to the default.
-    if let Some(h) = api::session::load_prerender(&state) {
-        state.session().prerender_hours = Some(h);
-        tracing::info!("prerender target restored: {h} h");
-    }
+    // Whatever the last process knew and wrote down: the prerender target and
+    // the book it was on. A restart is a deploy, and a deploy must not leave a
+    // reader mid-chapter talking to a server with no session.
+    narrator::boot(&state);
     // Load the engine off the request path so the first chunk is not also the
     // first 325 MB read. A failure here is a warning, not an exit.
     {

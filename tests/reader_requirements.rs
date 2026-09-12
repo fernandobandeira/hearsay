@@ -406,3 +406,119 @@ async fn build_reports_what_it_refused_and_why() {
     assert_eq!(far["reason"], json!("out_of_range"));
     assert!(n < 9999);
 }
+
+// -------------------------------------------------------- 10. and a restart
+
+/// 10. A restart must not leave the reader talking to a server with no session.
+///
+/// Not on the original list, because it was not understood until it happened:
+/// Fernando's reader stalled mid-chapter around a deploy and healed itself some
+/// time later. Playback is one global in-memory session, and a container restart
+/// empties it. A reader that is *already* mid-chapter never calls `/api/load` —
+/// that is what picking a book does — so nothing refilled it, and in the meantime
+/// `/api/chunk` 404ed (it is session-scoped), `/api/open`, `/api/playhead` and
+/// `/api/chapters?book=` all answered 409, and the renderer had no plan to work
+/// from. Every ingredient of the heal was already on disk; the only thing missing
+/// was the name of the book, which is now `work/session.json`.
+#[tokio::test]
+async fn the_server_comes_back_on_the_book_it_was_reading() {
+    let mut h = Harness::new().await;
+    let load = h.load().await;
+    let key = load["key"].as_str().unwrap_or("").to_string();
+    let n = h.state.session().plan[1].chunks.len();
+    assert!(n >= 3);
+
+    h.post_json("/api/open", json!({"chapter": 1, "chunk": 2}))
+        .await;
+    let rendered = narrator::cache::chunk_path(&h.work(), &key, 1, 2);
+    until("the opened chunk", 20.0, || rendered.exists()).await;
+
+    // The redeploy.
+    h.restart().await;
+
+    // The session is back, at the position the vault holds.
+    let (code, st) = h.get_json("/api/status").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(st["key"], json!(key), "{st}");
+    assert_eq!(st["book"], json!("Fixture (2026).epub"), "{st}");
+    assert_eq!(st["chapter"], json!(1), "{st}");
+    assert_eq!(st["playhead"], json!(2), "{st}");
+    assert!(st["chapters"].as_u64().unwrap_or(0) > 1, "the plan: {st}");
+
+    // The audio the reader was in the middle of is servable again. Before this,
+    // the key was "x" and every chunk in the book was a 404.
+    let (code, body) = h.get("/api/chunk/1/00002.wav").await;
+    assert_eq!(code, StatusCode::OK, "{}", body.len());
+
+    // And the endpoints that name the book stop refusing.
+    let (code, _) = h
+        .post_json("/api/playhead", json!({"chunk": 3, "book": key}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "a playhead report must not 409");
+    // A playhead report is the only signal a mid-chapter reader gives a restarted
+    // process, so it is what has to start the worker.
+    assert!(narrator::render::render_alive(&h.state));
+    let (code, _) = h
+        .post_json("/api/open", json!({"chapter": 1, "chunk": 3, "book": key}))
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    let enc: String =
+        percent_encoding::utf8_percent_encode(&key, percent_encoding::NON_ALPHANUMERIC).to_string();
+    let (code, _) = h.get(&format!("/api/chapters?book={enc}")).await;
+    assert_eq!(code, StatusCode::OK);
+
+    // The chunk the reader is waiting on renders, with nobody having loaded
+    // anything.
+    let p = narrator::cache::chunk_path(&h.work(), &key, 1, 3);
+    until("the chunk after the restart", 20.0, || p.exists()).await;
+}
+
+/// ... and it restores only what is still true. A book that has changed on disk
+/// since it was loaded is a `/api/load`'s business, not a restart's: re-chunking
+/// it here would silently move every stored position in it.
+#[tokio::test]
+async fn a_book_that_changed_is_not_restored() {
+    let mut h = Harness::new().await;
+    h.load().await;
+    let epub = std::path::PathBuf::from(h.book_path());
+    let mut bytes = std::fs::read(&epub).expect("read");
+    bytes.extend_from_slice(b"and then some");
+    std::fs::write(&epub, &bytes).expect("grow");
+
+    h.restart().await;
+    let (_, st) = h.get_json("/api/status").await;
+    assert_eq!(st["key"], json!(null), "{st}");
+    assert_eq!(st["book"], json!(null), "{st}");
+    // Which is the old behaviour, and the reader's own heal covers it: it sees a
+    // `hello` naming no book and loads one.
+    let (code, _) = h
+        .post_json(
+            "/api/open",
+            json!({"chapter": 0, "chunk": 0, "book": "Fixture (2026)"}),
+        )
+        .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+}
+
+/// A fresh work directory has nothing to restore and must not care.
+#[tokio::test]
+async fn a_first_boot_restores_nothing() {
+    let mut h = Harness::new().await;
+    h.restart().await;
+    let (code, st) = h.get_json("/api/status").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(st["book"], json!(null), "{st}");
+    assert_eq!(st["status"], json!("idle"), "{st}");
+}
+
+/// Wait for a predicate, or fail.
+async fn until(what: &str, timeout_s: f64, mut f: impl FnMut() -> bool) {
+    let t0 = Instant::now();
+    while t0.elapsed().as_secs_f64() < timeout_s {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {what}");
+}

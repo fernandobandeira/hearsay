@@ -55,6 +55,24 @@ impl Harness {
         }
     }
 
+    /// Throw this process away and start another one over the same work
+    /// directory, book library and vault — which is what a redeploy is.
+    ///
+    /// Goes through `narrator::boot`, the same startup sequence `main` runs, so
+    /// what a test sees after a restart is what the box sees.
+    pub async fn restart(&mut self) {
+        let st = self.state.clone();
+        st.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        st.run.set();
+        st.build_ev.set();
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let state = AppState::new(st.cfg.clone());
+        narrator::boot(&state);
+        let (app, _) = narrator::api::router(state.clone());
+        self.app = app;
+        self.state = state;
+    }
+
     pub fn root(&self) -> &Path {
         self.dir.path()
     }

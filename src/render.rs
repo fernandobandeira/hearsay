@@ -24,6 +24,17 @@
 //!    is genuinely absent, and renders that.
 //! 3. `/api/open` sets the playhead, so rule 1 guarantees the opened chunk
 //!    renders — whatever the cache looks like.
+//!
+//! ## ... and what it cost
+//!
+//! Rule 1 has no exit: a chunk under the playhead that is missing is rendered,
+//! every time round the loop, for as long as the playhead sits on it. That is
+//! exactly right while the render can succeed and exactly wrong when it cannot —
+//! an espeak-ng that will not answer, a work directory gone read-only, a model
+//! that failed to load — because then it is a full-speed retry loop: a subprocess
+//! spawn and a `warn!` line per iteration, burning a core for nothing and burying
+//! the log. [`Backoff`] bounds it without weakening the invariant: the chunk is
+//! still retried, and still first, just not faster than a doubling interval.
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -84,6 +95,67 @@ fn render_event(st: &AppState, kind: &str, ci: usize, idx: usize, total: usize, 
     );
 }
 
+/// How long the worker waits after a run of failed renders.
+///
+/// Consecutive failures only — any success puts it straight back to zero, so a
+/// single unlucky chunk in a healthy book costs a quarter of a second and
+/// nothing else. It is deliberately *not* per-chunk: a render that fails is
+/// almost always a systemic problem (the engine did not load, the disk is full,
+/// espeak-ng is wedged), and in that state every chunk fails, so counting
+/// per-chunk would just ping-pong between two hot targets. The cap is generous
+/// because the thing being avoided is a spin, not a delay: when the cause clears,
+/// the next tick renders and the counter resets.
+const BACKOFF_BASE: Duration = Duration::from_millis(250);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// The longest single sleep, so `stop` is still noticed promptly at shutdown.
+const BACKOFF_SLICE: Duration = Duration::from_millis(400);
+
+#[derive(Default)]
+struct Backoff {
+    fails: u32,
+    until: Option<Instant>,
+}
+
+impl Backoff {
+    /// May the worker try to render right now?
+    fn ready(&self) -> bool {
+        match self.until {
+            None => true,
+            Some(t) => Instant::now() >= t,
+        }
+    }
+
+    /// How long is left, in a slice short enough to stay responsive to `stop`.
+    fn nap(&self) -> Duration {
+        match self.until {
+            None => Duration::ZERO,
+            Some(t) => t
+                .saturating_duration_since(Instant::now())
+                .min(BACKOFF_SLICE),
+        }
+    }
+
+    fn record(&mut self, ok: bool) {
+        if ok {
+            self.fails = 0;
+            self.until = None;
+            return;
+        }
+        self.fails = self.fails.saturating_add(1);
+        let d = BACKOFF_BASE
+            .saturating_mul(1u32 << (self.fails - 1).min(16))
+            .min(BACKOFF_MAX);
+        self.until = Instant::now().checked_add(d);
+        if self.fails == 1 || self.fails.is_power_of_two() {
+            tracing::warn!(
+                "{} render(s) failed in a row; retrying in {:.1}s",
+                self.fails,
+                d.as_secs_f64()
+            );
+        }
+    }
+}
+
 /// Render chunk `i` of chapter `ci` to disk, unless it is already there.
 ///
 /// Never propagates a failure upward: a chunk that will not synthesize is logged
@@ -97,6 +169,7 @@ fn render_one(st: &AppState, key: &str, ci: usize, i: usize, chunks: &[Chunk]) -
     let Some(chunk) = chunks.get(i) else {
         return false;
     };
+    st.render_attempts.fetch_add(1, Ordering::Relaxed);
     let t0 = Instant::now();
     let wav = if chunk.silent {
         // Nothing to pronounce — render the beat, do not ask the model to invent
@@ -262,6 +335,7 @@ fn worker(st: Arc<AppState>) {
     st.engine.load();
     st.session().model_ready = st.engine.ready();
     let mut pre = 0usize;
+    let mut bo = Backoff::default();
     while !st.stop.load(Ordering::SeqCst) {
         if !st.run.wait(Duration::from_millis(500)) {
             continue;
@@ -278,6 +352,13 @@ fn worker(st: Arc<AppState>) {
             std::thread::sleep(Duration::from_millis(300));
             continue;
         };
+        // Renders have been failing: wait before trying again. Nothing is
+        // skipped and nothing is given up on — the loop comes straight back
+        // round to rule 1 — it just does not do it thousands of times a second.
+        if !bo.ready() {
+            std::thread::sleep(bo.nap());
+            continue;
+        }
         let chunks: &[Chunk] = plan.get(ci).map(|c| c.chunks.as_slice()).unwrap_or(&[]);
         let n = chunks.len();
 
@@ -285,7 +366,7 @@ fn worker(st: Arc<AppState>) {
         //    is missing the reader is stalled on it right now.
         if ph < n && !exists(&st, &key, ci, ph) {
             st.session().status = "rendering".into();
-            render_one(&st, &key, ci, ph, chunks);
+            bo.record(render_one(&st, &key, ci, ph, chunks));
             render_event(&st, "progress", ci, ph + 1, n, "rendering");
             continue;
         }
@@ -300,7 +381,7 @@ fn worker(st: Arc<AppState>) {
                 s.status = "rendering".into();
                 s.prerender = None;
             }
-            render_one(&st, &key, ci, i, chunks);
+            bo.record(render_one(&st, &key, ci, i, chunks));
             let next = {
                 let mut s = st.session();
                 // Only advance if nothing moved the hint while we were rendering:
@@ -335,13 +416,13 @@ fn worker(st: Arc<AppState>) {
                 s.prerender = Some(cj);
             }
             let qn = plan.get(cj).map(|c| c.chunks.len()).unwrap_or(0);
-            render_one(
+            bo.record(render_one(
                 &st,
                 &key,
                 cj,
                 j,
                 plan.get(cj).map(|c| c.chunks.as_slice()).unwrap_or(&[]),
-            );
+            ));
             render_event(&st, "progress", cj, j + 1, qn, "queued");
             pre += 1;
             if pre % 25 == 0 {
@@ -383,13 +464,13 @@ fn worker(st: Arc<AppState>) {
                     s.prerender = Some(cj);
                 }
                 let an = plan.get(cj).map(|c| c.chunks.len()).unwrap_or(0);
-                render_one(
+                bo.record(render_one(
                     &st,
                     &key,
                     cj,
                     j,
                     plan.get(cj).map(|c| c.chunks.as_slice()).unwrap_or(&[]),
-                );
+                ));
                 render_event(&st, "progress", cj, j + 1, an, "prerendering");
                 pre += 1;
                 if pre % 25 == 0 {

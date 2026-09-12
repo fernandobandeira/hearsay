@@ -213,6 +213,10 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
         }
     }
 
+    // Which book this process is on is worth one small file: it is what lets the
+    // next process come back on it. See `restore_session`.
+    save_session(&st, &body.path, max_chars);
+
     let position = st
         .positions()
         .get(&name)
@@ -408,6 +412,16 @@ pub async fn playhead(State(st): State<Arc<AppState>>, Json(body): Json<Playhead
         if body.chunk > s.render_idx {
             s.render_idx = body.chunk;
         }
+    }
+    // A playhead report is a reader that is listening right now. Normally
+    // `/api/open` has already started the worker; after a restart it has not —
+    // the reader was *already* mid-chapter and has no reason to open anything —
+    // so this is the only signal the worker gets. Gated on the thread never
+    // having started in this process, so an explicit `/api/renderer {"on":
+    // false}` is not quietly undone by the next chunk advance.
+    if !render::render_alive(&st) {
+        st.run.set();
+        render::ensure_render_thread(&st);
     }
     save_position(&st, false);
     ok().into_response()
@@ -676,6 +690,123 @@ pub async fn prerender(
         chapters_ahead: span,
     })
     .into_response()
+}
+
+// ------------------------------------------------------- surviving a restart
+
+/// Which book the process was on, so the next one can pick it up.
+///
+/// **The deploy bug, 2026-09-11.** Playback is one global session held in
+/// memory, and a container restart empties it: `book` is `None` until some
+/// client calls `/api/load` again. Nothing the reader does mid-chapter is that
+/// call — it loads a book when you *pick* one — so a restart under a listening
+/// reader left the server in a state where
+///
+/// * `/api/chunk/{ci}/{i}.wav` is session-scoped and 404s ("not ready"),
+/// * `/api/open` and `/api/playhead` carrying `?book=` answer **409**,
+/// * `/api/chapters?book=` answers 409 and the drawer shows an empty book,
+/// * and the render worker has no plan, so nothing is being rendered for the
+///   reader that is sitting there waiting on exactly one chunk.
+///
+/// The reader's own half of the heal is in `web/src/lib/live.ts`, but the server
+/// should not need rescuing in the first place: everything it needs is already
+/// on disk. The plan is in `plan.json` with its `parse.json` stamp beside it,
+/// the position is in the vault; the only thing that was missing was the name of
+/// the book, which is this file. Restoring costs one plan read — 0.36 s on the
+/// 1433-chapter book, the same read `/api/load` does — and no parse.
+///
+/// It is deliberately *only* a restore of what was already true. It does not
+/// start the renderer: a process that comes up rendering a book nobody is
+/// reading is a worse failure than the one being fixed.
+#[derive(Debug, Serialize, Deserialize)]
+struct LastBook {
+    book: String,
+    #[serde(default)]
+    max_chars: Option<usize>,
+}
+
+pub fn session_file(st: &AppState) -> std::path::PathBuf {
+    st.cfg.work.join("session.json")
+}
+
+fn save_session(st: &AppState, book: &str, max_chars: usize) {
+    let v = LastBook {
+        book: book.to_string(),
+        max_chars: Some(max_chars),
+    };
+    if let Err(e) = std::fs::write(
+        session_file(st),
+        serde_json::to_vec(&v).unwrap_or_else(|_| b"{}".to_vec()),
+    ) {
+        // Losing this costs a restart its memory, nothing else.
+        tracing::warn!("could not record the loaded book: {e}");
+    }
+}
+
+/// Put the last-loaded book back in the session. Called once at startup.
+///
+/// Returns the key it restored, or None — a missing file, a book that has been
+/// deleted or edited since, a plan that is not there any more. Every one of
+/// those simply means "start empty", exactly as before; none is an error.
+pub fn restore_session(st: &Arc<AppState>) -> Option<String> {
+    let last: LastBook = serde_json::from_slice(&std::fs::read(session_file(st)).ok()?).ok()?;
+    let path = Path::new(&last.book);
+    let max_chars = last.max_chars.unwrap_or(crate::book::DEFAULT_MAX_CHARS);
+    let key = cache::book_key(&last.book);
+    // Only ever from the parse cache: re-parsing here would put a 12-second
+    // EPUB parse in front of the port opening, and a plan whose stamp no longer
+    // matches is a book that changed — which is a `/api/load`'s business, not a
+    // restart's.
+    let want = plancache::stamp(path, max_chars)?;
+    let plan = plancache::load(&st.cfg.work, &key, &want)?;
+
+    let est: Vec<f64> = plan
+        .iter()
+        .map(|c| {
+            est_chapter_s(
+                &c.chunks,
+                st.cfg.chapter_gap_s,
+                st.cfg.chapter_para_gap_s,
+                st.cfg.silence_s,
+            )
+        })
+        .collect();
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // Where the reader was is the vault's answer, not a second copy of it here.
+    let pos = st
+        .positions()
+        .get(&name)
+        .cloned()
+        .and_then(|v| serde_json::from_value::<vault::Position>(v).ok());
+    let ci = pos
+        .as_ref()
+        .map(|p| p.chapter.max(0) as usize)
+        .filter(|c| *c < plan.len())
+        .unwrap_or(0);
+    let n = plan.get(ci).map(|c| c.chunks.len()).unwrap_or(0);
+    let chunk = pos
+        .as_ref()
+        .map(|p| p.chunk.max(0) as usize)
+        .filter(|i| *i < n)
+        .unwrap_or(0);
+
+    let mut s = st.session();
+    s.book = Some(last.book.clone());
+    s.title = Some(
+        path.file_stem()
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    );
+    s.plan = plan;
+    s.est_s = est;
+    s.chapter = ci;
+    s.playhead = chunk;
+    s.render_idx = chunk;
+    s.status = "idle".into();
+    Some(key)
 }
 
 pub fn prerender_file(st: &AppState) -> std::path::PathBuf {
