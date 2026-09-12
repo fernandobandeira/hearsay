@@ -28,6 +28,7 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `src/state.rs` | One global session, exactly like Python's process-wide `S`. |
 | `src/api/` | Every endpoint, with typed request/response structs that **generate** the OpenAPI document. |
 | `src/watch.rs` | The library watcher (`notify`), which turns "the vault's git sync pulled an epub onto the server" into a `books` event. |
+| `src/wishlist.rs` | The chapters someone asked for, kept across restarts: `work/audio/<key>/queue.json`, intent only. See [downloading a chapter](#downloading-a-chapter-end-to-end). |
 | `tests/` | Five parity suites, the reader-requirement suite, and a harness that runs a whole server in a temp dir. |
 | `scripts/golden/` | Generates the Python golden fixtures (uv + ebooklib + bs4) the parity tests assert against. |
 | `scripts/gen-client.sh` | OpenAPI → the reader's typed TS client (`web/src/client/`), and the `--check` gate CI runs. |
@@ -331,6 +332,97 @@ The heartbeat query (`/api/status`) survives at a fifth of its old rate — 5 s
 instead of 1 s — as the fallback for a browser with no live stream and the source
 of the few numbers no event carries.
 
+## Downloading a chapter, end to end
+
+A download is two stages — render every chunk, then pack the chunks into one
+m4a — and three parties: the server's render worker, the server's packer, and
+the device that has to end up holding the file. The design rule for the whole
+pipeline is that **no stage may depend on the app still being open**, because on
+the A1 a 74-chapter download is an overnight job and iOS suspends a PWA within
+seconds of the screen going off.
+
+### The order: `pack: true`, and `work/audio/<key>/queue.json`
+
+`POST /api/chapters/render {"chapters": [...], "pack": true}` is the whole
+request. Additive in both halves — a client that sends neither the flag nor
+`book` gets the python behaviour — and it means two things:
+
+- the chapters go in the render queue, as before;
+- each is marked `build_want`, so the worker hands it to the packer the moment
+  its last chunk lands (`next_queued` in `src/render.rs`). **Nothing else has to
+  be called.** The reader used to send one `/api/chapters/build` per chapter when
+  it saw the row reach "fully rendered", which is why closing the app used to
+  leave a night of rendered chapters and not one file.
+
+`/api/chapters/build` takes the same flag's meaning implicitly: a chapter it has
+to render first is queued with `pack: true`.
+
+The order survives the process in `src/wishlist.rs` — one `queue.json` per book,
+beside its `plan.json`, written `.part` → fsync → rename → fsync-dir on every
+mutation, resumed by `narrator::boot` after the session restore and re-adopted by
+`/api/load`. **Intent only, never progress**: which chapters, in what order, and
+whether each wants packing. Completion stays disk truth, so a chapter finished
+while the process was down simply leaves the queue the first time the worker
+looks at it. A chapter picked back up by five restarts with no chunk landing is
+*parked* — kept, logged, reported as `ChapterRow.parked`, retried by asking
+again. The details, including why the file is per-book, are in that module's doc.
+
+**What is deliberately not persisted: `autopack`'s own speculative orders.** The
+packer also packs the chapter being read and the one after it, from the worker's
+idle branches — organic listening rather than anything anybody asked for. Those
+are re-derived from the current chapter on every boot and are *not* written to
+the wishlist. Only a user-requested download is durable, which is the whole
+distinction: an order somebody placed outlives the process, a guess about what
+might be useful next does not.
+
+### The CPU policy: pack when the renderer is ahead or idle
+
+Two ARM cores, Kokoro at a quarter of realtime, and now packs that arrive with no
+client watching — a resumed wishlist can fill the pack queue seconds after boot.
+So the packer has a second hold-back below [the STT gate](#the-stt-priority-gate),
+with the same shape and the same reason one rank down:
+
+- the renderer sets `render_stalled` when it takes **rule 1** — the chunk under
+  the playhead is missing, so somebody is waiting on that exact chunk *now* — and
+  clears it on any other branch;
+- the packer holds a **new** encode back while that flag is set. One already
+  running is left to finish, for the same reason a memo does not kill it: an
+  encode abandoned mid-chapter costs the box everything it has spent.
+
+Only rule 1 counts as "behind". The lookahead is 80 chunks and also reports
+`status: "rendering"`, and a packer that waited for *that* would never run on
+this box at all. The hold is bounded at `PACK_HOLD_MAX_S` (30 s): past it the
+renderer is not slow, it is wedged, and a download that waits forever on a wedged
+renderer would be a worse bug than the one being prevented.
+
+### The device's half: the foreground reconciliation sweep
+
+The one step that can only happen on the phone is copying the m4a into Cache
+Storage, and the phone is exactly what is not running. **Backgrounded work is not
+attempted** — that is the accepted platform limit, not something to fight — so
+instead every way back into the app asks one question, and
+`web/src/lib/reconcile.ts` is that question:
+
+> of the chapters still pending, which are packed and not here yet?
+
+Three terms, each from the only place that knows it: the pending selection from
+IndexedDB (`downloads`, beside the outbox, so it survives the app being killed),
+`m4a` from the server's rows, and Cache Storage — *asked*, never remembered, so a
+quota eviction reads as missing. The triggers are `visibilitychange`, `focus`,
+the network returning, a cold launch, and `hello` off the live stream, which is
+the "we were away" signal for a tab that never went hidden. One chapter that will
+not come down does not cancel the rest, and what is still wanted is recomputed
+from Cache Storage afterwards rather than from what the sweep thinks it stored.
+
+The selection is written down *before* the first request, or a download confirmed
+as the screen locks would be one nobody remembers. It is removed per chapter as
+each lands, and the record is deleted when the last one does.
+
+**Polling stays.** The drawer's ladder (`web/src/lib/download.ts`) is unchanged
+and still runs rung by rung while the app is open — it is the fast path and the
+fallback for a session with no live stream. The sweep is the catch-up pass, not a
+replacement for it.
+
 ## The `.m4b` export
 
 `narrator export --book <file.epub> [--partial]` packs the rendered chunks in the
@@ -565,7 +657,7 @@ transcription rather than one of them being Kokoro's.
 
 Every name the Python `AGENTS.md` documents, with the same default: `NARRATOR_PORT` (7870), `NARRATOR_VAULT`, `NARRATOR_WORK`, `NARRATOR_BOOKS`, `NARRATOR_WEB`, `BOOKS_SUBDIR`, `POSITIONS_SUBDIR` (`02 - Studies`), `NOTES_SUBDIR` (`05 - Fleeting`), `KOKORO_VOICE` (`af_heart`), `KOKORO_SPEED`, `KOKORO_GAIN` (1.0), `LOOKAHEAD` (80), `PRERENDER_CHAPTERS` (2), `PREFETCH_WHILE_PAUSED`, `MAX_AUDIO_GB` (5), `MAX_CHAPTER_GB` (20), `SILENCE_S` (0.5), `WHISPER_MODEL`, `WHISPER_PROMPT`, `WHISPER_THREADS` (every core), `CHAPTER_BITRATE` (`64k`), `CHAPTER_GAP_S` (0.30), `CHAPTER_PARA_GAP_S` (0.60), `HLS_SEGMENT_S` (6), `TEXT_SHARD_BYTES`, `TEXT_SHARD_CHAPTERS`, `HEALTH_STALL_S` (300), `AUTOPACK`, `AUTOPACK_EVERY_S`, `NARRATOR_WATCH_BOOKS`, `NARRATOR_FAKE_TTS`, `SSE_HEARTBEAT_S`, `SSE_QUEUE`, `SSE_RENDER_MIN_S`, `SSE_RETRY_MS`.
 
-New here, because the weights are not downloaded by a Python package on first use: `NARRATOR_MODELS` (`/models`), `KOKORO_MODEL`, `KOKORO_VOICES`, `WHISPER_VAD_MODEL`, `ESPEAK_BIN`, `ESPEAK_VOICE`, `ESPEAK_TIMEOUT` (15 s, seconds, after which the subprocess is killed). `HF_HOME` and `KOKORO_REPO` are gone — nothing here talks to Hugging Face at runtime.
+New here, because the weights are not downloaded by a Python package on first use: `NARRATOR_MODELS` (`/models`), `KOKORO_MODEL`, `KOKORO_VOICES`, `WHISPER_VAD_MODEL`, `ESPEAK_BIN`, `ESPEAK_VOICE`, `ESPEAK_TIMEOUT` (15 s, seconds, after which the subprocess is killed), `QUEUE_RESUME_DELAY_S` (10 s, how long after startup a wishlist left by the last process may start rendering — the note queue's own startup sweep may be claiming one of the box's two cores). `HF_HOME` and `KOKORO_REPO` are gone — nothing here talks to Hugging Face at runtime.
 
 A value that will not parse logs a warning and falls back. A typo in an env var is not a reason to refuse to start a reader.
 
