@@ -39,6 +39,11 @@ jobs:
       # `npm exec` ignores --prefix for the working directory; the package's own
       # script does not, and it is the same `tsc -b --force`.
       - run: npm --prefix web run typecheck
+      # The other half of the contract gate (release.yml has the one that needs
+      # cargo): regenerate the client from the *committed* openapi.json and fail
+      # if it differs. A hand-edited generated client is the one way the reader's
+      # types can drift from the server without anything noticing.
+      - run: ./scripts/gen-client.sh --from-spec --check
       - run: npm --prefix web run build
 
   build:

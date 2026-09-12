@@ -1,42 +1,65 @@
 #!/usr/bin/env bash
 #
-# Regenerate the typed TypeScript client from the Rust server's own OpenAPI
-# document, then check it against the contract the React reader already uses.
+# Regenerate the reader's API client from the Rust server's own OpenAPI document.
 #
-#   openapi.json  the checked-in contract. `narrator --openapi` prints it; the
-#                 binary needs no work dir and no running server.
-#   client/       the generated fetch client: types + one function per operation.
-#   client/DRIFT.md  what the reader would have to change to adopt it.
+#   openapi.json        the checked-in contract. `narrator --openapi` prints it;
+#                       the binary needs no work dir and no running server.
+#   web/src/client/     the generated fetch client: types + one function per
+#                       operation. It lives inside the reader because the reader
+#                       is what imports it — and because the reader's image is
+#                       built from `web/` alone.
 #
-# Nothing outside this repo is written. ~/git/narrator is read for its
-# hand-written types and never touched.
+# Both are committed, and `--check` is the gate that keeps them honest: it
+# regenerates and fails if the result differs from what is in git. A response
+# shape changed in Rust and not carried through here is then a red build rather
+# than a reader that compiles and misreads a field.
 #
-# Usage: scripts/gen-client.sh
+# Usage:
+#   scripts/gen-client.sh                 build the server, dump the spec, generate
+#   scripts/gen-client.sh --from-spec     skip cargo; generate from the committed spec
+#   scripts/gen-client.sh --check         ... and fail if anything differs from git
+#   NARRATOR_BIN=path scripts/gen-client.sh   use an existing binary (a debug one
+#                                             prints the same document)
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 REPO="$PWD"
-BIN="$REPO/target/release/narrator"
+BIN="${NARRATOR_BIN:-$REPO/target/release/narrator}"
 SPEC="$REPO/openapi.json"
-OUT="$REPO/client"
+OUT="$REPO/web/src/client"
+
+FROM_SPEC=0
+CHECK=0
+for a in "$@"; do
+  case "$a" in
+    --from-spec) FROM_SPEC=1 ;;
+    --check)     CHECK=1 ;;
+    *) echo "unknown argument: $a" >&2; exit 2 ;;
+  esac
+done
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 step() { printf '\n\033[1m==>\033[0m %s\n' "$*"; }
 
 # ---------------------------------------------------------------------------
-step "Server binary"
-# Building unconditionally costs a couple of minutes on a cold target dir and
-# seconds on a warm one, but a stale binary means a stale contract — which is
-# the one failure this script exists to prevent. cargo decides if there is work.
-# ---------------------------------------------------------------------------
-cargo build --release --bin narrator
-[[ -x "$BIN" ]] || { echo "no binary at $BIN after build" >&2; exit 1; }
+if [[ $FROM_SPEC -eq 1 ]]; then
+  step "OpenAPI document (using the committed openapi.json)"
+  [[ -f "$SPEC" ]] || { echo "no $SPEC" >&2; exit 1; }
+else
+  step "Server binary"
+  # A stale binary means a stale contract, which is the one failure this script
+  # exists to prevent. cargo decides whether there is any work to do.
+  if [[ -n "${NARRATOR_BIN:-}" ]]; then
+    echo "  using $BIN"
+  else
+    cargo build --release --bin narrator
+  fi
+  [[ -x "$BIN" ]] || { echo "no binary at $BIN" >&2; exit 1; }
 
-# ---------------------------------------------------------------------------
-step "OpenAPI document"
-# ---------------------------------------------------------------------------
-"$BIN" --openapi > "$SPEC.tmp"
-mv -f "$SPEC.tmp" "$SPEC"
+  step "OpenAPI document"
+  "$BIN" --openapi > "$SPEC.tmp"
+  mv -f "$SPEC.tmp" "$SPEC"
+fi
 
 read -r SPEC_PATHS SPEC_OPS SPEC_SCHEMAS <<<"$(node -e '
   const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
@@ -67,37 +90,27 @@ TYPES=$(grep -c '^export type ' "$OUT/types.gen.ts" || true)
 SDK_OPS=$(grep -c '^export const ' "$OUT/sdk.gen.ts" || true)
 
 echo
-echo "  ${FILES} TypeScript files under client/"
-echo "  ${TYPES} exported types (client/types.gen.ts)"
-echo "  ${SDK_OPS} exported operations (client/sdk.gen.ts)"
-echo "  fetch runtime vendored into client/client/ and client/core/ — no npm dependency at integration time"
+echo "  ${FILES} TypeScript files under web/src/client/"
+echo "  ${TYPES} exported types (types.gen.ts)"
+echo "  ${SDK_OPS} exported operations (sdk.gen.ts)"
+echo "  fetch runtime vendored in — no npm dependency at integration time"
 
 # ---------------------------------------------------------------------------
-step "Drift check against the reader's hand-written contract"
-# ---------------------------------------------------------------------------
-set +e
-node "$REPO/scripts/drift-check.mjs"
-DRIFT_STATUS=$?
-set -e
-
-echo
-if [[ $DRIFT_STATUS -eq 0 ]]; then
-  bold "OK — the generated client is a drop-in for the reader's current calls."
-  echo "Any 'additive' or 'missing-optional' lines above are safe by construction:"
-  echo "extra fields the reader ignores, or optional fields it already guards."
-else
-  bold "FAILED — the drift check found MISMATCHES."
+if [[ $CHECK -eq 1 ]]; then
+  step "Drift gate"
+  # The generated client is the reader's only description of the API, so the
+  # question is not "is it compatible" any more — it is "is what is committed
+  # what this server actually generates". Anything else is a lie the compiler
+  # cannot see.
+  if git diff --quiet -- "$SPEC" "$OUT"; then
+    bold "OK — openapi.json and web/src/client match the server."
+    exit 0
+  fi
+  git --no-pager diff --stat -- "$SPEC" "$OUT"
   echo
-  echo "A MISMATCH means a value from the generated client is not assignable to the"
-  echo "type the reader declares: a required field is gone, a type changed, a required"
-  echo "field became optional, or nullability moved. Those break the port."
-  echo
-  echo "Not counted as mismatches, and never a reason for this to fail:"
-  echo "  additive        — fields only the generated type has; the reader ignores them"
-  echo "  missing-optional — an optional hand-written field the server no longer sends"
-  echo "  now-always-sent  — a field the reader treated as optional that is now guaranteed"
-  echo
-  echo "Full report: client/DRIFT.md"
+  bold "FAILED — the committed contract is not what this server generates."
+  echo "Run ./narrator client and commit the result in the same change."
+  exit 1
 fi
 
-exit $DRIFT_STATUS
+bold "OK — regenerated. Commit openapi.json and web/src/client together."

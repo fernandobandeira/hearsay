@@ -3,10 +3,9 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Pinned toolchain for generating the typed TS client from openapi.json and for the drift check against narrator/web's hand-written types.",
+  "description": "Pinned toolchain for generating the reader's typed TS client from openapi.json.",
   "scripts": {
-    "generate": "openapi-ts",
-    "drift": "node ../drift-check.mjs"
+    "generate": "openapi-ts"
   },
   "devDependencies": {
     "@hey-api/openapi-ts": "0.99.0",

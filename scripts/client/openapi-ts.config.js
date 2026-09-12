@@ -2,13 +2,14 @@
  * Codegen config for the typed narrator client.
  *
  * Input is the checked-in contract (`openapi.json`, dumped by
- * `narrator --openapi`); output is `client/`, a fetch-based SDK plus the
- * schema types. Paths are relative to this file (scripts/client/).
+ * `narrator --openapi`); output is the reader's own `web/src/client/` — a
+ * fetch-based SDK plus the schema types, committed, and the only description of
+ * this API the reader has. Paths are relative to this file (scripts/client/).
  */
 export default {
   input: '../../openapi.json',
   output: {
-    path: '../../client',
+    path: '../../web/src/client',
     postProcess: [],
   },
   plugins: [

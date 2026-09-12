@@ -23,14 +23,16 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `src/text.rs` | The two-tier offline text bundle: `index.json` + byte-budgeted shards. |
 | `src/vault.rs` | `.narrator-positions.json`, `Reading Log.md`, fleeting notes — all byte-identical to the Python output. |
 | `src/render.rs` | The render worker and the packer, one OS thread each. |
+| `src/export.rs` | `narrator export`: the streaming cache packed into one `.m4b`, chapter marks and cover art included. A port of `app/export.py`. |
 | `src/events.rs`, `src/api/stream.rs` | The SSE bus and `/api/events`. |
 | `src/state.rs` | One global session, exactly like Python's process-wide `S`. |
 | `src/api/` | Every endpoint, with typed request/response structs that **generate** the OpenAPI document. |
 | `src/watch.rs` | The library watcher (`notify`), which turns "the vault's git sync pulled an epub onto the server" into a `books` event. |
 | `tests/` | Five parity suites, the reader-requirement suite, and a harness that runs a whole server in a temp dir. |
 | `scripts/golden/` | Generates the Python golden fixtures (uv + ebooklib + bs4) the parity tests assert against. |
-| `scripts/gen-client.sh`, `scripts/drift-check.mjs` | OpenAPI → typed TS client, and the drift gate against the reader's hand-written types. |
+| `scripts/gen-client.sh` | OpenAPI → the reader's typed TS client (`web/src/client/`), and the `--check` gate CI runs. |
 | `listen-test/` | GATE 0: the ONNX engine rendered against the PyTorch render Fernando accepted. |
+| `web/src/client/` | **Generated**, committed, and the reader's only description of the API. Never hand-edited; see [the gate](#openapi-is-the-contract). |
 | `web/` | **The reader itself** — the Vite/React/Tailwind PWA, source and all. It moved in from the python repo; the build is no longer vendored (`web/.gitignore` ignores `dist/`), because two images are built from this tree now. See [the two images](#two-images-server-and-reader). `web/placeholder/` is the fallback page when there is no build at all. |
 | `deploy/` | systemd templates for the Oracle A1 — **applied by hand, never by a playbook**, like the python repo's. |
 
@@ -41,9 +43,10 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 ./narrator web           # npm ci && npm run build in web/ (dev serves web/dist)
 ./narrator dev           # cargo run, serving ./web and ./work
 ./narrator build && ./narrator up     # docker, port 7870 on localhost only
-./narrator test          # the whole suite: 86 tests, no model, no network
+./narrator test          # the whole suite: 112 tests, no model, no network
 ./narrator lint          # rustfmt --check + clippy -D warnings
-./narrator client        # regenerate the TS client and run the drift check
+./narrator client        # regenerate openapi.json + web/src/client
+./narrator export --book books/Title.epub [--partial]   # the cache → a .m4b
 ./narrator listen-test   # re-render the GATE 0 passage and report RTF
 ```
 
@@ -81,7 +84,9 @@ somewhere else, and it only ever reads (the epub is copied out before parsing).
 
 ### Cache layout
 
-`work/audio/<stem[:50]>/chNNN/IIIII.wav`, 24 kHz mono s16le; `plan.json` beside the chapter directories; `chapters/<key>/chNNN.{m4a,json}`; `hls/<key>/chNNN/`; `text/<key>/{index,NNN}.json`. **A Rust deploy adopts the existing cache in place** — a test seeds a Python-shaped cache and asserts nothing is re-rendered.
+`work/audio/<stem[:50]>/chNNN/IIIII.wav`, 24 kHz mono s16le; `plan.json` beside the chapter directories; `chapters/<key>/chNNN.{m4a,json}`; `hls/<key>/chNNN/`; `text/<key>/{index,NNN}.json`, each with a `.json.gz` beside it. **A Rust deploy adopts the existing cache in place** — a test seeds a Python-shaped cache and asserts nothing is re-rendered.
+
+**The text bundle is pre-gzipped at build time**, exactly as the python reference does it: `write_json_gz` writes the `.json` and its `.gz` sibling in one call (level 9, `mtime=0`, so a rebuild from the same words produces the same bytes), and `/api/book.json` and `/api/text/{s}.json` serve the `.gz` with `Content-Encoding: gzip` when the request's `Accept-Encoding` takes it, `Vary: Accept-Encoding` either way. The decoded body is byte-identical to the plain file — content negotiation only, the frozen contract is untouched. JSON this repetitive compresses to ~33 %: *Lord of Mysteries* goes 17.7 MB → 5.8 MB over the wire, once per device rather than once per request. A missing `.gz` (a bundle written before this existed) falls back silently to the plain file, and the next `/api/load` rewrites the bundle to earn one even when the plan itself is reused. The negotiation is hand-rolled rather than a `tower-http` compression layer for two reasons: a layer would re-compress those megabytes on every request instead of serving the file that is already on disk, and it must never touch the audio endpoints, which serve byte ranges — a range of a compressed body is not the range iOS asked for.
 
 `gc_audio` trims to 90 % of `MAX_AUDIO_GB`, oldest first, and never touches the current chapter, its prerender span, or any chapter the manager is rendering, flagged for packing, queued to pack, or packing right now — chunk wavs are the *input* to a pack, and evicting them leaves a chapter permanently one hole short of packable.
 
@@ -111,11 +116,12 @@ Every path, method, field name, type and nullability of the Python contract, ass
 
 ## What this server does that the Python one does not
 
-`web/RUST-NOTES.md` is a list of requirements the reader wrote against the Python server, each with the client-side mitigation
-standing in for it meanwhile. All six are implemented here, all six are
-**additive** — a client that sends none of the new parameters gets exactly the
-Python behaviour, which is what keeps the Obsidian plugin working untouched —
-and each has a test in `tests/reader_requirements.rs`.
+The reader kept a list of nine requirements written against the Python server,
+each with the client-side mitigation standing in for it meanwhile. All nine are
+implemented here, all nine are **additive** — a client that sends none of the new
+parameters gets exactly the Python behaviour, which is what keeps the Obsidian
+plugin working untouched — and each has a test in `tests/reader_requirements.rs`.
+The list is gone; this is what it said, and what answered it.
 
 1. **`/api/load` does not re-parse an unchanged book.** Measured at 12.4 s per
    call on the 1433-chapter *Lord of Mysteries*, and the reading position comes
@@ -145,6 +151,29 @@ and each has a test in `tests/reader_requirements.rs`.
    quietly opens at chapter one.
 6. **`/api/chapters` takes `?from=&to=`.** Inclusive, clamped, with `total`
    alongside so a windowed response still says how big the book is.
+7. **Every chapter endpoint takes the book.** `?book=` on `/api/chapters`, a
+   `"book"` field on `/api/chapters/{render,build,cancel}`, and the same **409**
+   on a mismatch as `/api/open`. This is the endpoint where the race is
+   expensive rather than merely wrong: one tap can queue 74 chapters, and if the
+   server swapped books between the reader's poll and the reader's tap — the
+   watcher picked up an epub, the plugin opened something, a second device
+   loaded another book — those renders occupy the worker for hours on the wrong
+   novel. The reader had no mitigation that closed it; this does.
+8. **The packed bitrate is reported.** `/api/status` carries `bitrate` (`"64k"`)
+   and `bitrate_bytes_per_min` (480000), and every `/api/chapters` row carries
+   `est_bytes` — the server doing the arithmetic with the constants it actually
+   has. The reader used to hard-code the 64 kbit/s default, so changing
+   `CHAPTER_BITRATE` on the box made every size in the UI wrong by that ratio,
+   silently.
+9. **`/api/chapters/build` says what it refused, and why.** A fourth list,
+   `refused`, with one entry per chapter the packer did not take:
+   `not_rendered` (carrying `rendered`/`n`, and the chapter is queued to render
+   instead), `no_chunks`, `out_of_range`. Before, a refused chapter appeared in
+   none of `built`/`building`/`rendering` and was indistinguishable from one
+   nobody asked about, so the reader ignored the response entirely and re-asked
+   every twenty seconds. It now reads the answer and keeps the repeat for a row
+   that has not moved in ninety seconds, which is what a lost call actually
+   looks like.
 
 ## OpenAPI is the contract
 
@@ -152,14 +181,137 @@ Handlers carry `#[utoipa::path]` and every request/response is a typed struct, s
 
 ```bash
 ./target/release/narrator --openapi > openapi.json   # no server, no work dir
-./scripts/gen-client.sh                              # spec → client/ → drift check
+./scripts/gen-client.sh                              # spec → web/src/client
+./scripts/gen-client.sh --check                      # ... and fail on any difference
 ```
 
-`scripts/gen-client.sh` runs `@hey-api/openapi-ts` (pinned in `scripts/client/package.json`) into `client/`, then `scripts/drift-check.mjs` compares the generated types field by field against the reader's own `web/src/lib/types.ts` using the TypeScript compiler's own assignability. It exits non-zero on a **MISMATCH** — something that would break the reader — and merely reports additive fields.
+**The reader is on that client.** `web/src/lib/api.ts` calls the generated
+functions and `web/src/lib/types.ts` is a handful of aliases over the generated
+types (`ChapRow` = `ChapterRow`, `SavedPosition` = `StampedPosition`), so there is
+no longer a hand-written description of this API anywhere in the tree: a field
+that moves in Rust is a TypeScript error in the same change. What stayed
+hand-written in the reader is policy no generator knows — the offline-first
+retry rules, and the URL builders for `<audio src>`, HLS and Cache Storage keys,
+which are strings rather than calls (the generated client encodes query values
+with `encodeURIComponent` too, so a builder URL and an SDK URL for the same
+resource are byte for byte the same request).
 
-That check earned its keep on its first run: 29 mismatches, all real. utoipa renders `Option<T>` as both nullable *and* absent from `required`, while serde without `skip_serializing_if` always sends the key — so the spec was lying about eleven `Status` fields. Fixed with `#[schema(required = true)]` and `value_type` overrides on the fields the server genuinely always sends. **The rule: if serde will always serialize it, say so in the schema.** Current state: 0 mismatches, 0 missing endpoints, 3 additive fields.
+That leaves one thing worth checking, and CI checks it: **is what is committed
+what this server generates?** `--check` regenerates and diffs against git.
+`release.yml` runs it with the debug binary (a spec change in Rust that was not
+carried through is a red build); `web.yml` runs `--from-spec --check`, which
+regenerates the client from the committed spec and catches a hand-edited
+generated file on a push that never touches Rust.
+
+The old field-by-field drift check — which compared the generated types against
+the reader's hand-written ones through the TypeScript compiler — is gone with the
+hand-written types it compared against. It earned its keep first: 29 mismatches
+on its first run, all real. utoipa renders `Option<T>` as both nullable *and*
+absent from `required`, while serde without `skip_serializing_if` always sends
+the key — so the spec was lying about eleven `Status` fields. Fixed with
+`#[schema(required = true)]` and `value_type` overrides on the fields the server
+genuinely always sends. **That rule stands: if serde will always serialize it,
+say so in the schema** — the reader's types are generated from those annotations
+now, so getting one wrong is no longer a report, it is a bug in the reader.
 
 Five paths carry a file extension after their parameter (`/api/chunk/{ci}/{i}.wav` and friends). matchit matches whole segments only, so those are routed by hand against `{file}` and split their own suffix; the *document* still carries the real contract URL, because that is what the client is generated from.
+
+## Live updates: `/api/events`
+
+One long-lived `text/event-stream` per client, fed by a tokio broadcast channel
+(`src/events.rs`) and served by `src/api/stream.rs`. It is how anything learns that anything
+changed — the heartbeat poll dropped to a fifth of its rate behind it, and the
+chapter drawer's two-second poll survives only as a backstop while it is open —
+and the design rule is one sentence:
+**an event is not state.** Every event means "this changed, go and look", which
+is what makes a dropped one — a phone the server lagged, a reconnect — a
+non-event rather than a lost update. Nothing is replayed, and `Last-Event-ID` is
+accepted and ignored on purpose.
+
+| event | when | payload |
+|---|---|---|
+| `hello` | on connect, and on every reconnect | `{heartbeat_s, book, key, chapter}` |
+| `position` | every time a position is *written* (so at the 15 s throttle, and forced on open/pause) | the vault record plus `book` and `source`: `session` for the loaded book's playhead, `api` for a named `/api/position` write |
+| `render` | the worker moved | `{kind, key, chapter, render_idx, playhead, n, status}`; `kind` is `progress` (throttled to `SSE_RENDER_MIN_S`, default 1/s), `complete`, `chapter`, or `packed` (which also carries `ok` and an `error`) |
+| `books` | an epub appeared in or left either book root, debounced 500 ms | `{changed: [names], count}` |
+| `note` | a voice memo was transcribed and filed | `{file, book, chapter, chunk, language}` |
+
+Plus what is not an event: `: narrator live` on open, `retry: <SSE_RETRY_MS>`,
+`: ping` every `SSE_HEARTBEAT_S`, and `: lagged N` for a subscriber that stopped
+reading. Those comments are the point of the heartbeat — bytes on the wire prove
+a tunnel that is still there, which `navigator.onLine` does not.
+
+**A slow client never backpressures the renderer.** `broadcast::Sender::send`
+does not block and does not fail on a full queue; a receiver that falls behind
+gets `Lagged(n)`, is told so as a comment, and carries on with what is left.
+`SSE_QUEUE` (64) is the depth. Tested both ways in `tests/parity_events.rs`: at
+the bus (twenty events into a four-deep queue, emit never fails, the reader sees
+one lag and then the last four) and over the wire (a stream nobody is polling
+gets `: lagged`, and still delivers the next event).
+
+The `books` event is why `src/watch.rs` exists: both book roots are watched
+(`./books` and the vault's `03 - Resources/Books`), so an epub the vault's git
+sync pulls onto the server appears in the library with nothing to call and no git
+coupling. A root that does not exist is skipped rather than fatal.
+
+### The reader's half
+
+`web/src/lib/live.ts` is the client: a typed `EventSource` wrapper that validates
+each payload (this is the one part of the API that is *not* generated — its body
+is a stream, so there is nothing for openapi-ts to type) and turns each event into
+a TanStack Query invalidation. `hello` refetches everything, because a reconnect
+by definition missed whatever happened while it was down. Reconnection is the
+browser's own: `EventSource` retries on the server's `retry:` interval, and the
+connection indicator in the top bar is fed from the stream's state rather than
+from a failing poll.
+
+`position` is the one event that is not a refetch, because the reading position
+is not a query — it is the page in front of someone. The arbitration
+(`arbitrate`, unit-tested in `live.test.ts`):
+
+- another book, or within two chunks of where this device already is (its own
+  echo, a chunk or two stale by the time it arrives) → **ignore**
+- somewhere else, and nothing is playing here → **follow**: this is the
+  phone-down, laptop-up case, and it is the whole feature
+- somewhere else, and this device *is* playing → **offer**: a quiet line above
+  the player bar ("moved on another device · <chapter>", follow / dismiss).
+  Jumping the page mid-sentence because a phone in another room saved a position
+  would be the worst thing this feature could do.
+
+The heartbeat query (`/api/status`) survives at a fifth of its old rate — 5 s
+instead of 1 s — as the fallback for a browser with no live stream and the source
+of the few numbers no event carries.
+
+## The `.m4b` export
+
+`narrator export --book <file.epub> [--partial]` packs the rendered chunks in the
+work directory into one AAC `.m4b` under `work/export/<Title>.m4b`: chapter marks
+from the *real* wav durations (so a seek in a player lands where the chapter
+does), the EPUB's title, author and cover art embedded, the same inter-chunk
+(0.30 s) and paragraph (0.60 s) gaps the chapter packer uses, and 1 s between
+chapters.
+
+It is a **CLI path, not a server one**, exactly as `app/export.py` was: a
+minutes-long ffmpeg run producing a file for a different device entirely (Apple
+Books, a car), with nobody waiting on a response, and it has to work against a
+work directory whose server is not running. What it needs is what the server
+already leaves behind — `plan.json`, read raw rather than through the parse cache,
+because an export of audio on disk has no business refusing to run because the
+epub's mtime moved.
+
+On the box, where the cache actually is, it runs inside the container the server
+is already using:
+
+```bash
+docker exec narrator-rs narrator export --book "/vault/03 - Resources/Books/…/Title (2016).epub" --partial
+# → /work/export/Title.m4b, i.e. /home/ubuntu/narrator/work/export/ on the host
+```
+
+A chapter with one missing chunk is not packable: the gap would swallow the hole
+and every chapter mark after it would be wrong. So it is left out and named, and
+without `--partial` the whole run refuses rather than quietly shipping a book
+with holes. `--dir`, `--out`, `--bitrate`, `--title`, `--author` and the three
+gap widths are the python script's flags, spelled the same way.
 
 ## Engine notes
 
@@ -167,11 +319,46 @@ Five paths carry a file extension after their parameter (`/api/chunk/{ci}/{i}.wa
 
 **espeak-ng is a subprocess, not a library.** libespeak-ng keeps process-global state, is not thread-safe, and a wedge or a segfault inside it would take the server with it. A fork costs a few milliseconds against a chunk that takes a second or two to synthesize, and it can be killed on a timeout. It also deletes the Python image's entire `espeakng_loader` symlink surgery: the apt binary and its data are simply what `espeak-ng` on PATH resolves to and can never be a mismatched pair.
 
-**G2P is the fallback half of misaki, not all of it.** Kokoro's real front end looks English words up in a lexicon first and only falls back to espeak-ng; this implements the fallback for every word, with misaki's `EspeakFallback.E2M` mapping table verbatim. Measured cost on the GATE 0 passage: 269.25 s against the PyTorch render's 271.57 s (0.9 %), with per-chunk boundaries lining up. Adding the lexicon would close the rest; it is a lookup table plus POS tagging, and it is the obvious next improvement if any word sounds wrong.
+**G2P is the fallback half of misaki, not all of it.** Kokoro's real front end looks English words up in a lexicon first and only falls back to espeak-ng; this implements the fallback for every word, with misaki's `EspeakFallback.E2M` mapping table verbatim. Measured cost on the GATE 0 passage: 269.25 s against the PyTorch render's 271.57 s (0.9 %), with per-chunk boundaries lining up.
 
-**Known delta, needs Fernando's ear:** the ONNX render is uniformly ~1.4× louder (≈ +3 dB) than `work/kokoro-test/kokoro_af_heart.wav` — same timing, same prosody, a flat gain. One sample of 6.5 million clipped. If that reference was written with headroom applied, nothing is wrong; if not, expose a gain.
+**The lexicon half: what a port would take, and why it has not been done.** It is
+not a lookup table. misaki's `en.G2P` is a ~1200-line front end around two gold
+lexicons (`us_gold.json` + `us_silver.json`, ~4 MB of JSON) plus:
+a spaCy `en_core_web_sm` POS tag per token — a 12 MB statistical model, and the
+only reason `read`, `lead`, `live`, `bow`, `close`, `record` come out right;
+`num2words` for every number, ordinal, year, currency and decimal; a stress
+system that re-marks a word by its part of speech and its position in the
+sentence; and a stack of special cases (contractions, possessive `'s`, currency
+symbols, `Mr`/`Mrs`, acronyms, hyphenation). The lexicon lookup alone, without
+the tagger, would be worse than the fallback — it would give `read` one
+pronunciation and be confidently wrong half the time, where espeak-ng at least
+guesses from context. So a faithful port is a POS tagger in Rust or an ONNX
+export of one, plus number expansion, plus the stress rules: days of work, a
+~16 MB asset addition to the image, and a new class of divergence from the
+Python render to test against. **Not attempted**, deliberately. The measured
+difference today is 0.9 % of duration with boundaries lining up, and no word has
+actually been reported as wrong. If one ever is, the cheap fix is a small
+override table (a JSON map of word → phonemes consulted before espeak-ng),
+which is an afternoon and carries none of the above.
 
-**Whisper.** `large-v3-turbo-q5_0` ggml, CPU, serialized behind one mutex like the Python's lock. Language auto-detect, `WHISPER_PROMPT` + book title + chapter title as the initial prompt, silero VAD when `models/whisper/ggml-silero-v5.1.2.bin` is present. `WHISPER_MODEL` takes either a bare name (resolved to `<models>/whisper/ggml-<name>.bin`) or a path.
+**`KOKORO_GAIN`, and the delta it exists for.** The ONNX render is uniformly
+~1.4× louder (≈ +3 dB) than `work/kokoro-test/kokoro_af_heart.wav` — same timing,
+same prosody, a flat gain; one sample of 6.5 million clipped. Whether that is
+wrong is Fernando's ear to decide, so what exists is the knob rather than a
+decision: `KOKORO_GAIN` (default **1.0**, the identity — it changes not one byte
+of a rendered chunk) multiplies every synthesized chunk post-synthesis, with a
+soft knee at 0.95 so it cannot clip. Everything below the knee is a plain
+multiply; above it, the remaining headroom is a `tanh`, which is smooth,
+monotonic and can never leave ±1.0. Multiplying a waveform that already touches
+±1.0 and then clamping is how a flat gain becomes audible distortion on exactly
+the loudest words, which is the failure this avoids. `KOKORO_GAIN=0.71` would
+undo the measured delta.
+
+**It is not set on the box.** The verdict has not been given, and a gain applied
+to chunks already rendered at another gain would make a book that changes
+loudness at the frontier.
+
+**Whisper.** `large-v3-turbo-q5_0` ggml, CPU, serialized behind one mutex like the Python's lock. Language auto-detect, `WHISPER_PROMPT` + book title + chapter title as the initial prompt, silero VAD when `models/whisper/ggml-silero-v5.1.2.bin` is present. `WHISPER_MODEL` takes either a bare name (resolved to `<models>/whisper/ggml-<name>.bin`) or a path. `WHISPER_THREADS` sets the thread count; it defaults to every core, which is what it was before it was configurable — see [the measurement](#whisper-on-the-a1).
 
 ## Performance
 
@@ -210,7 +397,7 @@ model load) before trusting the voice-memo path to feel responsive.
 
 ## Config surface
 
-Every name the Python `AGENTS.md` documents, with the same default: `NARRATOR_PORT` (7870), `NARRATOR_VAULT`, `NARRATOR_WORK`, `NARRATOR_BOOKS`, `NARRATOR_WEB`, `BOOKS_SUBDIR`, `POSITIONS_SUBDIR` (`02 - Studies`), `NOTES_SUBDIR` (`05 - Fleeting`), `KOKORO_VOICE` (`af_heart`), `KOKORO_SPEED`, `LOOKAHEAD` (80), `PRERENDER_CHAPTERS` (2), `PREFETCH_WHILE_PAUSED`, `MAX_AUDIO_GB` (5), `MAX_CHAPTER_GB` (20), `SILENCE_S` (0.5), `WHISPER_MODEL`, `WHISPER_PROMPT`, `CHAPTER_BITRATE` (`64k`), `CHAPTER_GAP_S` (0.30), `CHAPTER_PARA_GAP_S` (0.60), `HLS_SEGMENT_S` (6), `TEXT_SHARD_BYTES`, `TEXT_SHARD_CHAPTERS`, `HEALTH_STALL_S` (300), `AUTOPACK`, `AUTOPACK_EVERY_S`, `NARRATOR_WATCH_BOOKS`, `NARRATOR_FAKE_TTS`, `SSE_HEARTBEAT_S`, `SSE_QUEUE`, `SSE_RENDER_MIN_S`, `SSE_RETRY_MS`.
+Every name the Python `AGENTS.md` documents, with the same default: `NARRATOR_PORT` (7870), `NARRATOR_VAULT`, `NARRATOR_WORK`, `NARRATOR_BOOKS`, `NARRATOR_WEB`, `BOOKS_SUBDIR`, `POSITIONS_SUBDIR` (`02 - Studies`), `NOTES_SUBDIR` (`05 - Fleeting`), `KOKORO_VOICE` (`af_heart`), `KOKORO_SPEED`, `KOKORO_GAIN` (1.0), `LOOKAHEAD` (80), `PRERENDER_CHAPTERS` (2), `PREFETCH_WHILE_PAUSED`, `MAX_AUDIO_GB` (5), `MAX_CHAPTER_GB` (20), `SILENCE_S` (0.5), `WHISPER_MODEL`, `WHISPER_PROMPT`, `WHISPER_THREADS` (every core), `CHAPTER_BITRATE` (`64k`), `CHAPTER_GAP_S` (0.30), `CHAPTER_PARA_GAP_S` (0.60), `HLS_SEGMENT_S` (6), `TEXT_SHARD_BYTES`, `TEXT_SHARD_CHAPTERS`, `HEALTH_STALL_S` (300), `AUTOPACK`, `AUTOPACK_EVERY_S`, `NARRATOR_WATCH_BOOKS`, `NARRATOR_FAKE_TTS`, `SSE_HEARTBEAT_S`, `SSE_QUEUE`, `SSE_RENDER_MIN_S`, `SSE_RETRY_MS`.
 
 New here, because the weights are not downloaded by a Python package on first use: `NARRATOR_MODELS` (`/models`), `KOKORO_MODEL`, `KOKORO_VOICES`, `WHISPER_VAD_MODEL`, `ESPEAK_BIN`, `ESPEAK_VOICE`. `HF_HOME` and `KOKORO_REPO` are gone — nothing here talks to Hugging Face at runtime.
 
@@ -330,20 +517,34 @@ sudo cp hearsay-web-update.service hearsay-web-update.timer /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now hearsay-web-update.timer
 ```
 
-## What is still missing before this can replace production
+## What has and has not been proven
 
-1. **arm64.** The image has never been built for aarch64: this box has no qemu binfmt registered and no cross toolchain. The two risky dependencies both look fine on paper — `ort` ships a prebuilt ONNX Runtime 1.22.0 for `aarch64-unknown-linux-gnu` (confirmed fetchable), and whisper.cpp's primary target *is* ARM — but "looks fine" is not a build. Do it on the Oracle A1, or `docker run --privileged tonistiigi/binfmt --install arm64` here first.
-2. **The reader on the generated client.** The app lives in `web/` now, but it still calls the server through its hand-written `api.ts`. The generated client is ready and drift-clean; porting it is mechanical except for three things the drift report names: `ChapRow` → `ChapterRow`, the SDK's `{data, error, response}` envelope replacing the reader's `get()`/`post()` helpers, and the binary endpoints (`.m4a`, `.m3u8`) which must stay plain URL builders because they feed `<audio src>` and Cache Storage.
-3. **A real-book soak.** The longest run so far is a few minutes. *Lord of Mysteries* is 1433 chapters; the things that only show up there are memory growth across thousands of ONNX sessions, the `/api/chapters` scan under a full cache, and gc churn at the 5 GB cap.
-4. **The listening verdict.** GATE 0 is rendered and waiting; nothing should deploy until Fernando has compared the two wavs, and the loudness delta above is decided one way or the other.
-5. **`.m4b` export.** `app/export.py` has no port yet. It is a CLI path, not a server one, and the Python script runs on the host with nothing but python3 and ffmpeg — so it still works against this server's cache unchanged.
+This server *is* production: the box runs the published arm64 image, the reader
+runs against it, and the cache and the vault it adopted are the same ones the
+python server left. What that sentence does not cover:
+
+- **The listening verdict is Fernando's and has not been given.** GATE 0 is
+  rendered and waiting (`./narrator listen-test`), and the ≈ +3 dB delta above is
+  still undecided — which is why `KOKORO_GAIN` exists and is **not** set on the
+  box. Setting it mid-book would make a novel that changes loudness at the render
+  frontier, so it wants a decision and a re-render, not a quiet flip.
+- **No long soak.** The longest continuous render observed is minutes, not days.
+  What only shows up over a real book: memory growth across thousands of ONNX
+  sessions (it settled flat at ~1.24 GB over five minutes here, which is the
+  arena reaching its working set rather than a leak, but five minutes is five
+  minutes), gc churn at the `MAX_AUDIO_GB` cap, and the `/api/chapters` scan
+  under a *full* 1433-chapter cache rather than a mostly-empty one.
+- **The A1's synthesis RTF is unmeasured.** Every Kokoro number below is x86.
+  The one that decides whether the box can keep ahead of a listener is the A1's,
+  and taking it means rendering a real chapter there.
 
 ## Rules
 
 - **Never edit `~/git/narrator`.** It is the reference and it is someone else's working tree — including its `web/`, which is now a historical copy of this repo's reader. The reader is edited **here**.
+- **`web/src/client/` is generated.** Never hand-edit a `.gen.ts`; change the Rust and regenerate.
 - **This repo is public.** Anything committed is on the internet: no tailnet addresses, no hostnames, no tokens, no vault contents. The reader talks to the API by relative path and has nothing to leak; keep it that way.
 - **Never touch production.** The VPS is deployed by hand.
 - No `unwrap()` or `expect()` outside tests and the startup path. Errors are typed (`thiserror`), the edges use `anyhow`, and every failure path logs and degrades.
 - `cargo fmt` and `cargo clippy --all-targets -- -D warnings` are clean, and stay clean.
-- A change to any response shape means regenerating the client and re-running the drift check in the same commit.
+- A change to any response shape means regenerating in the same commit: `./narrator client`, then commit `openapi.json` and `web/src/client/` with the Rust change. CI fails otherwise, and the reader's types come from those files.
 - If the chunker's output changes, that is a **migration**, not an edit — it invalidates every cache and every stored position. Say so out loud before doing it.

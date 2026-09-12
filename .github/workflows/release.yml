@@ -49,6 +49,14 @@ jobs:
       # `npm exec` ignores --prefix for the working directory; the package's own
       # script does not, and it is the same `tsc -b --force`.
       - run: npm --prefix web run typecheck
+      # The contract gate. openapi.json and web/src/client are *generated* - from
+      # the handlers, through utoipa, through openapi-ts - and the reader has no
+      # other description of this API. So a response shape that changed in Rust
+      # without being carried through here is a red build rather than a reader
+      # that compiles and quietly misreads a field. The debug binary prints the
+      # same document as the release one, and cargo test above already built it.
+      - run: cargo build --bin narrator
+      - run: NARRATOR_BIN="$PWD/target/debug/narrator" ./scripts/gen-client.sh --check
 
   build:
     # A failing test must block the publish - the image only builds on green.
