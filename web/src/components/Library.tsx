@@ -288,6 +288,12 @@ function Diagnostics() {
     lines.push('the server is not answering');
   }
   if (store) lines.push(`this device ${fmtBytes(store.usage)}${store.quota ? ` of ${fmtBytes(store.quota)}` : ''}`);
+  /* What the page actually got of the screen, and what it is spending on the
+     insets. One line, because on an installed iOS app the two numbers can
+     differ - a viewport shorter than the screen is the whole vocabulary for
+     "the app does not reach the bottom", and it is otherwise invisible from
+     here. */
+  lines.push(viewportLine());
   return (
     <div data-testid="diag" className="px-3 py-1.5">
       <button
@@ -306,4 +312,27 @@ function Diagnostics() {
       )}
     </div>
   );
+}
+
+/**
+ * "viewport 430x869 of 430x932 · insets 59/34"
+ *
+ * The insets are measured off a throwaway element rather than read from
+ * `--sat`/`--sab`: an unregistered custom property computes to the *text*
+ * `env(safe-area-inset-top, 0px)`, so asking the root for it gives a string and
+ * not a number. Spending it as padding is what resolves it.
+ */
+function viewportLine(): string {
+  const probe = document.createElement('div');
+  probe.style.cssText = 'position:absolute;visibility:hidden;top:0;left:0;'
+    + 'padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)';
+  document.body.appendChild(probe);
+  const cs = getComputedStyle(probe);
+  const top = Math.round(parseFloat(cs.paddingTop) || 0);
+  const bottom = Math.round(parseFloat(cs.paddingBottom) || 0);
+  probe.remove();
+  const {innerWidth: w, innerHeight: h, screen} = window;
+  return `viewport ${Math.round(w)}x${Math.round(h)}`
+    + ` of ${Math.round(screen.width)}x${Math.round(screen.height)}`
+    + ` · insets ${top}/${bottom}`;
 }

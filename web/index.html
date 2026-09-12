@@ -11,7 +11,21 @@
      no network at all. -->
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<!-- `black`, not `black-translucent`, and the bottom of the screen is why.
+     With black-translucent an installed iOS app is laid out from the top of the
+     screen but handed a viewport one status bar *shorter* than the screen, so
+     the page ends ~59pt above the bottom edge and everything fixed to that edge
+     - the player bar, the drawer, the overlay - stops there, with the strip
+     below painted by the system in the background colour. `black` lets iOS
+     inset the web view itself: it starts under the status bar and reaches the
+     true bottom. The status bar strip is then the system's to paint, which on a
+     #0a0a0a app is the same colour it was.
+
+     viewport-fit=cover stays: in this mode the insets read 0 and every
+     `max(0.5rem, var(--sab))` floor in index.css simply stands on the rem.
+     NOTE: iOS caches this at *install* time - an icon already on the home
+     screen has to be removed and re-added before the change is visible. -->
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="apple-mobile-web-app-title" content="HearSay">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="icon" href="/icon-192.png" type="image/png">
