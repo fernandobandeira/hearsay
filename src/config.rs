@@ -67,6 +67,10 @@ pub struct Config {
     /// to every core, which is what it was before this was configurable, and is
     /// measured to be the right answer on the 2-core box (see AGENTS.md).
     pub whisper_threads: usize,
+    /// `NARRATOR_FAKE_STT` — the memo's own bytes stand in for a transcript, so
+    /// the note path can be tested end to end without a 574 MB ggml model. The
+    /// counterpart to `fake_tts`, and like it, off everywhere but a test.
+    pub fake_stt: bool,
 
     pub chapter_bitrate: String,
     pub chapter_gap_s: f64,
@@ -160,6 +164,7 @@ impl Config {
                     .unwrap_or(4),
             )
             .max(1),
+            fake_stt: flag("NARRATOR_FAKE_STT", false),
             models,
 
             chapter_bitrate: env("CHAPTER_BITRATE").unwrap_or_else(|| "64k".into()),

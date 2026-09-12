@@ -336,12 +336,36 @@ fn worker(st: Arc<AppState>) {
     st.session().model_ready = st.engine.ready();
     let mut pre = 0usize;
     let mut bo = Backoff::default();
+    let mut parked: Option<Instant> = None;
     while !st.stop.load(Ordering::SeqCst) {
         if !st.run.wait(Duration::from_millis(500)) {
             continue;
         }
         if st.stop.load(Ordering::SeqCst) {
             break;
+        }
+        // Whisper outranks this. A voice memo exists only in the phone that
+        // recorded it until `/api/note` answers, and on the two-core A1 a memo
+        // sharing the box with Kokoro took seven minutes instead of one. So the
+        // worker stands down for the duration — a bounded wait on the gate's
+        // condvar, so it starts again the instant the last transcription ends —
+        // and this is **not** a render failure, so the backoff is untouched.
+        //
+        // Said out loud both ways: a renderer that has quietly stopped is
+        // exactly the shape of the bug this round is about, and "it is parked
+        // for a memo" is only reassuring if it is written down somewhere.
+        if !st.whisper.gate().wait_clear(Duration::from_millis(250)) {
+            if parked.is_none() {
+                parked = Some(Instant::now());
+                tracing::info!("renderer parked: a voice memo is being transcribed");
+            }
+            continue;
+        }
+        if let Some(t) = parked.take() {
+            tracing::info!(
+                "renderer resumed after {:.1}s parked for transcription",
+                t.elapsed().as_secs_f64()
+            );
         }
 
         let (ci, hint, ph, plan, key) = {
@@ -485,8 +509,32 @@ fn worker(st: Arc<AppState>) {
 // ----------------------------------------------------------------- the packer
 
 fn builder(st: Arc<AppState>) {
+    let mut parked: Option<Instant> = None;
     while !st.stop.load(Ordering::SeqCst) {
         st.build_ev.wait(Duration::from_secs(1));
+        // The same rule as the renderer, for the same reason: an ffmpeg encode
+        // of a long chapter is the other thing on this box that will hold a core
+        // for a minute, and a memo waiting on it is a memo that exists nowhere
+        // but a phone.
+        //
+        // Only a *new* pack is held back. One already running is left to finish:
+        // killing an encode mid-chapter throws away every second it has spent
+        // and the chapter has to be packed again from nothing, which costs the
+        // box more than the transcription gains — and the packer is one chapter
+        // at a time, so the wait is bounded by one encode either way.
+        if !st.whisper.gate().wait_clear(Duration::from_millis(250)) {
+            if parked.is_none() {
+                parked = Some(Instant::now());
+                tracing::info!("packer parked: a voice memo is being transcribed");
+            }
+            continue;
+        }
+        if let Some(t) = parked.take() {
+            tracing::info!(
+                "packer resumed after {:.1}s parked for transcription",
+                t.elapsed().as_secs_f64()
+            );
+        }
         let Some((ci, plan, key, title)) = ({
             let mut s = st.session();
             match s.pack_queue.first().copied() {

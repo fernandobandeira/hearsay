@@ -491,3 +491,99 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
             .find(|p| p.is_file())
     })
 }
+
+// ------------------------------------------------------ the STT priority gate
+
+/// Whisper outranks the renderer, and the renderer has to actually stand down.
+///
+/// The A1 is two cores. With chapters queued, a ~45 s memo took over seven
+/// minutes to come back because Kokoro and whisper were taking turns on the same
+/// two cores — and a memo is the one artifact here that exists in exactly one
+/// place (IndexedDB on a phone) until `/api/note` answers. A rendered chunk can
+/// always be made again.
+#[tokio::test]
+async fn a_transcription_parks_the_renderer_until_it_is_done() {
+    let h = Harness::new().await;
+    h.load().await;
+    let key = key_of(&h);
+    let p = cache::chunk_path(&h.work(), &key, 0, 0);
+
+    // What `Whisper::transcribe` holds for the length of a memo.
+    let busy = h.state.whisper.gate().enter();
+    h.post_json("/api/open", json!({"chapter": 0, "chunk": 0}))
+        .await;
+    // Long enough that the fake engine would have rendered the whole chapter.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(
+        !p.exists(),
+        "the renderer must not take a core while a memo is being transcribed"
+    );
+
+    drop(busy);
+    until("the renderer to resume", 20.0, || p.exists()).await;
+}
+
+/// And the packer: a new ffmpeg encode does not start while a memo is in flight.
+/// One already running is left to finish on purpose — killing an encode
+/// mid-chapter throws away everything it has done.
+#[tokio::test]
+async fn a_transcription_holds_back_a_new_pack() {
+    let h = Harness::new().await;
+    h.load().await;
+    let key = key_of(&h);
+    let n = h.state.session().plan[0].chunks.len();
+    for i in 0..n {
+        cache::write_wav(&cache::chunk_path(&h.work(), &key, 0, i), &[0.0f32; 24_000])
+            .expect("seed");
+    }
+
+    let busy = h.state.whisper.gate().enter();
+    let (code, body) = h
+        .post_json("/api/chapters/build", json!({"chapters": [0]}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(
+        h.state.session().building,
+        None,
+        "no encode may start while a memo is being transcribed"
+    );
+    // The request was accepted and is still waiting, not dropped.
+    assert!(h.state.session().pack_queue.contains(&0));
+
+    drop(busy);
+    if which("ffmpeg").is_none() {
+        eprintln!("skipping the second half: no ffmpeg");
+        return;
+    }
+    let (m4a, _) = narrator::chapters::chapter_files(&h.work(), &key, 0);
+    until("the pack once the memo is filed", 30.0, || m4a.exists()).await;
+}
+
+/// The guard belongs to the blocking work, not to the request future.
+///
+/// `/api/note` transcribes inside `spawn_blocking`. A phone that locks mid-memo,
+/// an iOS PWA going to the background, a tunnel blip: axum drops the request
+/// future and the `.await` is cancelled, but the blocking job runs on. If the
+/// gate were held by the future, that cancellation would leak it and park the
+/// renderer for the life of the process — a far worse failure than the one the
+/// gate exists to fix. It is held by the closure, so it goes when the work does.
+#[tokio::test]
+async fn a_cancelled_request_cannot_leak_the_gate() {
+    let h = Harness::new().await;
+    let st = h.state.clone();
+    let job = tokio::task::spawn_blocking(move || {
+        let _busy = st.whisper.gate().enter();
+        std::thread::sleep(Duration::from_millis(200));
+    });
+    until("the gate to be claimed", 5.0, || {
+        h.state.whisper.gate().held()
+    })
+    .await;
+    // The client went away: the future is dropped, the blocking job is not.
+    drop(job);
+    until("the gate to clear on its own", 10.0, || {
+        !h.state.whisper.gate().held()
+    })
+    .await;
+}

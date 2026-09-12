@@ -95,8 +95,16 @@ pub async fn healthz(State(st): State<Arc<AppState>>) -> Response {
     }
     // "rendering" that has not produced a chunk in minutes is a wedge, not work:
     // a single chunk is a second or two even on the slowest box.
+    //
+    // Unless a voice memo is being transcribed, in which case the renderer is
+    // parked on purpose and *should* not be producing chunks. Whisper runs at
+    // 30–50× realtime on the A1, so a one-minute memo is half an hour of not
+    // rendering — comfortably past `HEALTH_STALL_S`, and the watchdog restarting
+    // the container over it would kill the transcription every time it was
+    // retried. A stall that is explained is not a stall.
     if matches!(status.as_str(), "rendering" | "prerendering" | "queued")
         && since > st.cfg.health_stall_s
+        && !st.whisper.gate().held()
     {
         problems.push(format!(
             "no chunk finished in {}s while status={status}",

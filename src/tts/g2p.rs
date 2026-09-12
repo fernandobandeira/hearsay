@@ -65,12 +65,23 @@ pub struct Phonemizer {
     timeout: Duration,
 }
 
+/// How long espeak-ng gets before it is killed. Generous on purpose: a short
+/// phrase is milliseconds even on the A1, so anything near this is a wedge
+/// rather than a slow box, and the cost of being wrong in this direction is a
+/// chunk that renders late instead of one that never renders at all.
+const DEFAULT_TIMEOUT_S: f64 = 15.0;
+
 impl Default for Phonemizer {
     fn default() -> Self {
+        let secs = std::env::var("ESPEAK_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|s| *s > 0.0)
+            .unwrap_or(DEFAULT_TIMEOUT_S);
         Self {
             binary: std::env::var("ESPEAK_BIN").unwrap_or_else(|_| "espeak-ng".into()),
             voice: std::env::var("ESPEAK_VOICE").unwrap_or_else(|_| "en-us".into()),
-            timeout: Duration::from_secs(15),
+            timeout: Duration::from_secs_f64(secs),
         }
     }
 }

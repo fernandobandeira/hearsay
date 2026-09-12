@@ -43,7 +43,7 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 ./narrator web           # npm ci && npm run build in web/ (dev serves web/dist)
 ./narrator dev           # cargo run, serving ./web and ./work
 ./narrator build && ./narrator up     # docker, port 7870 on localhost only
-./narrator test          # the whole suite: 112 tests, no model, no network
+./narrator test          # the whole suite: 139 tests, no model, no network
 ./narrator lint          # rustfmt --check + clippy -D warnings
 ./narrator client        # regenerate openapi.json + web/src/client
 ./narrator export --book books/Title.epub [--partial]   # the cache → a .m4b
@@ -107,6 +107,55 @@ Here `render_idx` is a **hint** and the filesystem is the truth:
 3. `/api/open` sets the playhead, so rule 1 guarantees the opened chunk renders, whatever the cache looks like.
 
 Tested three ways: a cache with holes opened at a missing chunk, a hole punched *behind* a completed frontier, and a forward jump past the frontier.
+
+**And the other half of rule 1, which is that it has no exit.** "Render the chunk
+under the playhead, always" is exactly right while the render can succeed and
+exactly wrong when it cannot — a wedged espeak-ng, a work directory gone
+read-only, a model that never loaded — because then it is a full-speed retry
+loop: a subprocess spawn and a `warn!` line per iteration, a core burnt for
+nothing and the log buried. Measured at **3611 attempts in 2.5 s** with the
+backoff disabled. So a run of *consecutive* failed renders now pauses the worker,
+250 ms doubling to a 30 s cap, and any success puts it straight back to zero. The
+invariant is untouched: the chunk is still retried, still first, just not
+thousands of times a second. It is deliberately not per-chunk — a render that
+fails is almost always systemic, so in that state every chunk fails and a
+per-chunk counter would only ping-pong between two hot targets.
+
+The worker also parks entirely while a voice memo is being transcribed — see
+[the STT priority gate](#the-stt-priority-gate). That is not a failure and does
+not touch the backoff.
+
+### Surviving a restart
+
+The other half of the same incident. Playback is one global in-memory session, so
+a container restart emptied it: `book` was `None` until something called
+`/api/load`, and a reader that was already mid-chapter never does — loading is
+what *picking* a book does. In that state `/api/chunk/{ci}/{i}.wav` (which is
+session-scoped) 404s, `/api/open`, `/api/playhead` and `/api/chapters?book=`
+answer 409, and the worker has no plan to render from. The reader sat on a 404
+that would never become a 200, silently, showing a healthy connection.
+
+Everything needed was already on disk — the plan in `plan.json` with its
+`parse.json` stamp, the position in the vault. The only missing thing was the
+name of the book, which is now `work/session.json`, written by `/api/load` and
+read back by `narrator::boot` at startup. Restoring costs one plan read (0.30 s
+on the 1433-chapter book) and **never a parse**: a stamp that no longer matches
+means the book changed, and re-chunking it here would move every stored position
+in it. It also does not start the renderer — a process that comes up rendering a
+book nobody is reading is a worse failure than the one being fixed. What starts
+it is the reader's next `/api/playhead`, which now wakes the worker if nothing
+has started it in this process (gated so an explicit `/api/renderer {"on":
+false}` is not undone by a chunk advance).
+
+The reader has a backstop for the cases the server cannot restore: `hello` fires
+on every reconnect and names the book, so a `hello` naming *no* book while this
+device has one open is an unambiguous "the session is gone", and the reader
+re-issues `/api/load` and tells it where it is (`lostSession` in
+`web/src/lib/live.ts`, rate-limited to once per ten seconds so a flapping tunnel
+is not a load per flap). Deliberately narrow: a `hello` naming a *different* book
+is another device having loaded one, which is the existing one-session-at-a-time
+behaviour and not this reader's to undo — two readers healing a mismatch would
+take turns kicking each other's book out.
 
 ### The API
 
@@ -317,7 +366,7 @@ gap widths are the python script's flags, spelled the same way.
 
 **Kokoro through ONNX.** `onnx-community/Kokoro-82M-v1.0-ONNX`, fp32 `model.onnx`, driven by `ort`. Three inputs: phoneme token ids wrapped in the boundary token `$`, a 256-float style vector picked out of the voice pack **by phoneme count** (that is how Kokoro gets its pacing right), and a speed scalar. Output is f32 mono at 24 kHz — the same rate and layout `app/tts.py` produces, so nothing downstream knows which engine rendered a chunk.
 
-**espeak-ng is a subprocess, not a library.** libespeak-ng keeps process-global state, is not thread-safe, and a wedge or a segfault inside it would take the server with it. A fork costs a few milliseconds against a chunk that takes a second or two to synthesize, and it can be killed on a timeout. It also deletes the Python image's entire `espeakng_loader` symlink surgery: the apt binary and its data are simply what `espeak-ng` on PATH resolves to and can never be a mismatched pair.
+**espeak-ng is a subprocess, not a library.** libespeak-ng keeps process-global state, is not thread-safe, and a wedge or a segfault inside it would take the server with it. A fork costs a few milliseconds against a chunk that takes a second or two to synthesize, and it **is** killed on a timeout — `ESPEAK_TIMEOUT`'s 15 s, spent polling rather than in `Command::output()`, which waits forever and for a while did. The pipes are drained on their own threads, because a child that fills the 64 KB pipe buffer while the caller polls for its exit is the same hang by another route. `probe()` is bounded too: it runs inside `Engine::load`, on the render thread. It also deletes the Python image's entire `espeakng_loader` symlink surgery: the apt binary and its data are simply what `espeak-ng` on PATH resolves to and can never be a mismatched pair.
 
 **G2P is the fallback half of misaki, not all of it.** Kokoro's real front end looks English words up in a lexicon first and only falls back to espeak-ng; this implements the fallback for every word, with misaki's `EspeakFallback.E2M` mapping table verbatim. Measured cost on the GATE 0 passage: 269.25 s against the PyTorch render's 271.57 s (0.9 %), with per-chunk boundaries lining up.
 
@@ -371,7 +420,8 @@ Measured on this machine (16 x86 cores), chapter 1 of *Lord of Mysteries*, 33 ch
 | Rust + ONNX Kokoro, in the container, 7 Powers ch. 2 | **4.87×** |
 | Rust + ONNX Kokoro, in the container, *Lord of Mysteries* ch. 1 | **4.67×** |
 
-So: parity on synthesis, within noise. The Oracle A1 is the number that actually matters and it has not been measured.
+So: parity on synthesis, within noise — on a desktop. The box is a different
+machine and a different conclusion; see [the A1](#the-a1-measured).
 
 Everything *around* the synthesis is a different story, and it is where the
 reader's waiting actually was. On the 1433-chapter *Lord of Mysteries*
@@ -386,20 +436,136 @@ reader's waiting actually was. On the 1433-chapter *Lord of Mysteries*
 
 The cold parse being seventeen times faster is just Rust against ebooklib + BeautifulSoup + lxml; the second one is [the parse cache](#what-this-server-does-that-the-python-one-does-not).
 
-**Whisper is not measured yet.** A 4.3 s memo took 2m10s end to end, twice —
-but both runs happened while an emulated aarch64 `docker buildx` had the box at
-load 59 on 16 cores, and a second run with the model already resident was no
-faster, which is what saturation looks like rather than a warm-up cost. The
-number means nothing until it is taken on an idle machine, and the one that
-matters is the A1's anyway. Take it with
-`time curl -XPOST .../api/note` twice in a row (the first call pays a 574 MB
-model load) before trusting the voice-memo path to feel responsive.
+### The A1, measured
+
+The Oracle A1 — 2 cores, 11 GB — is the machine that matters, and none of the
+numbers above came from it. These do, taken on the running box while it was
+rendering *Lord of Mysteries* (which is the normal condition, not a spoiled
+measurement: this box is always rendering something):
+
+| | A1 | this 16-core x86 |
+|---|---|---|
+| Kokoro synthesis (`/api/status`'s `rtf`, cumulative over hours) | **0.26–0.30×** realtime | 4.3–4.9× |
+| `GET /api/chapters`, 1433 rows | 25 ms cold, 7 ms memoised, 273 kB | 9 ms, 244 kB |
+| `GET /api/chapters?from=0&to=30` | 2–26 ms, 6.0 kB | 12 ms, 5.3 kB |
+| `GET /api/chapters?from=700&to=760` | 1.5–4.7 ms, 11.8 kB | — |
+| `GET /api/status` | 20 ms, 631 B | — |
+| `POST /api/load`, cached plan | 0.30 s | 0.36 s |
+
+**Synthesis runs at about a quarter of realtime here** — roughly four seconds of
+compute per second of audio, against 4.5× *faster* than realtime on the desktop.
+That is the most consequential number in this file, and it is not a regression:
+it is 2 ARM cores against 16 x86 ones. What it means is that the box can never
+render a book as fast as anyone listens to it, so the prerender span, the
+download-ahead drawer and the chapter queue are not optimisations — they are the
+only reason the reader works at all. A 12-minute chapter is the better part of an
+hour of rendering, and a 74-chapter download is an overnight job.
+
+**`/api/chapters` pagination: measured, and not needed.** The full 1433-row
+response is 273 kB and 25 ms cold on the A1 — 7 ms while the 1.5 s memo holds,
+which is most polls — and the drawer polls it every two seconds only while it is
+open. A cursor would add API surface, a second code path through the row scan and
+a new way for the reader's list to be half-built, to save a quarter of a
+megabyte over a tailnet on the one screen that is *about* those rows. The window
+that already exists (`?from=&to=`, requirement 6) covers the case that actually
+wanted paging — a reader that only shows a screenful — at 6 kB and 2 ms. So: no
+cursor, deliberately, until a number says otherwise.
+
+### Whisper on the A1
+
+**Measured at last, and it is the bad news of this round.** A 10.0 s memo
+(synthetic speech, webm/opus, exactly the payload the reader posts), against a
+throwaway container on the box with a temp work dir and no vault mounted:
+
+| `large-v3-turbo-q5_0` | wall | × realtime |
+|---|---|---|
+| 2 threads (the default: every core), first call — pays the 574 MB model load | 311 s | 31× |
+| 2 threads, second call, model resident | 473 s | 47× |
+| 1 thread (`WHISPER_THREADS=1`), model resident | 534 s | 53× |
+
+The transcript was word-perfect — `large-v3-turbo` is a good model and the prompt
+biasing works — and that is the only good part. **Thirty to fifty times realtime
+means a one-minute memo is half an hour of CPU.** Two threads beat one, so the
+default (every core) stays; but the second call being *slower* than the first,
+with the model already resident, says what the real constraint is. The renderer
+had the other core. Whisper took about one core's worth (≈ 95–99 % of one CPU)
+either way, because on a 2-core box the other core is always busy synthesizing,
+and every one of these numbers was taken with it busy — which is the honest
+condition to measure in, since that is when a memo actually gets recorded. The
+thread count is not the lever.
+
+The lever is the model, and the options are:
+
+1. **A smaller ggml model.** `small` is ~6× less compute than `large-v3-turbo`
+   and `base` ~20×; either would bring a 10 s memo under a minute. The cost is
+   accuracy on proper nouns — which `WHISPER_PROMPT` plus the book and chapter
+   titles already exist to patch. This is the obvious first move: change
+   `WHISPER_MODEL` in `/etc/narrator-rs.env`, fetch the ggml file into
+   `models/whisper/`, restart. **Not done here** — it is a quality trade only
+   Fernando can judge, and it wants his ear on a real memo.
+2. **Transcribe somewhere else.** The memo is already a queued blob in the
+   reader's outbox; nothing says the transcriber has to be the reader's server.
+   A bigger machine (his desktop) with the same endpoint would do, at the cost
+   of a second deployment target.
+3. **Accept the latency.** Nothing breaks today: the outbox holds the recording
+   until a 2xx comes back, the note is written minutes later, and Fernando is
+   not waiting on the screen for it. The failure mode is not data loss, it is a
+   note that appears in the vault five minutes after the thought.
+
+What is *not* an option is leaving this undocumented, which is why it is here:
+the voice-memo path works, and it works at a tenth of the speed anyone would
+guess from the desktop numbers.
+
+### The STT priority gate
+
+**Whisper outranks the renderer and the packer, and they stand down for it.**
+The measurement above is the argument: two ARM cores, Kokoro already at 0.26×
+realtime, whisper at 30–50×, and with twenty chapters queued a ~45 s memo took
+**over seven minutes** while the render RTF fell to 0.26. Neither job got a
+machine.
+
+The tie-break is not speed, it is what is recoverable. A memo exists in exactly
+one place — IndexedDB on the phone that recorded it — until `/api/note` answers
+2xx. A rendered chunk is a file the server can make again from a book it still
+has. So:
+
+* `Whisper::transcribe` takes an RAII claim on `SttGate` (`src/stt.rs`) at its
+  very first line, and holds it across the ffmpeg decode, the **wait** for the
+  model mutex, and the transcription. Covering the wait is the point: two memos
+  arriving together park the renderer once, for both, instead of letting it wake
+  up in the gap between them.
+* The render worker parks between chunks — a bounded wait on the gate's condvar,
+  so it restarts the instant the last transcription ends. Parking is **not** a
+  render failure and does not touch the failure backoff.
+* The packer holds back a *new* encode. One already running is left to finish:
+  killing ffmpeg mid-chapter throws away every second it has spent and the
+  chapter has to be packed again from nothing, which costs the box more than the
+  transcription gains — and the packer is one chapter at a time, so the wait is
+  bounded by one encode either way.
+* `/healthz` does not call a parked renderer a stall. A one-minute memo is half
+  an hour of not rendering on the A1, comfortably past `HEALTH_STALL_S`, and the
+  watchdog restarting the container over it would kill the transcription every
+  time it was retried. A stall that is explained is not a stall.
+* Both threads log the park and the resume with its duration. A renderer that has
+  quietly stopped is the exact shape of the bug this round was about; "it is
+  parked for a memo" is only reassuring if it is written down.
+
+Release is `Drop` and nothing else — no manual path to forget. That is also what
+makes it safe under cancellation: `/api/note` transcribes inside
+`spawn_blocking`, and a phone that locks mid-memo drops the *request future*
+while the blocking job runs on. The claim belongs to the closure, not the future,
+so it goes when the work does. `tests/parity_render.rs` asserts exactly that,
+along with the renderer parking and resuming and the packer holding back.
+
+`WHISPER_THREADS` still defaults to every core, and on the A1 that finally means
+something: with the renderer parked, both cores are actually free for the
+transcription rather than one of them being Kokoro's.
 
 ## Config surface
 
 Every name the Python `AGENTS.md` documents, with the same default: `NARRATOR_PORT` (7870), `NARRATOR_VAULT`, `NARRATOR_WORK`, `NARRATOR_BOOKS`, `NARRATOR_WEB`, `BOOKS_SUBDIR`, `POSITIONS_SUBDIR` (`02 - Studies`), `NOTES_SUBDIR` (`05 - Fleeting`), `KOKORO_VOICE` (`af_heart`), `KOKORO_SPEED`, `KOKORO_GAIN` (1.0), `LOOKAHEAD` (80), `PRERENDER_CHAPTERS` (2), `PREFETCH_WHILE_PAUSED`, `MAX_AUDIO_GB` (5), `MAX_CHAPTER_GB` (20), `SILENCE_S` (0.5), `WHISPER_MODEL`, `WHISPER_PROMPT`, `WHISPER_THREADS` (every core), `CHAPTER_BITRATE` (`64k`), `CHAPTER_GAP_S` (0.30), `CHAPTER_PARA_GAP_S` (0.60), `HLS_SEGMENT_S` (6), `TEXT_SHARD_BYTES`, `TEXT_SHARD_CHAPTERS`, `HEALTH_STALL_S` (300), `AUTOPACK`, `AUTOPACK_EVERY_S`, `NARRATOR_WATCH_BOOKS`, `NARRATOR_FAKE_TTS`, `SSE_HEARTBEAT_S`, `SSE_QUEUE`, `SSE_RENDER_MIN_S`, `SSE_RETRY_MS`.
 
-New here, because the weights are not downloaded by a Python package on first use: `NARRATOR_MODELS` (`/models`), `KOKORO_MODEL`, `KOKORO_VOICES`, `WHISPER_VAD_MODEL`, `ESPEAK_BIN`, `ESPEAK_VOICE`. `HF_HOME` and `KOKORO_REPO` are gone — nothing here talks to Hugging Face at runtime.
+New here, because the weights are not downloaded by a Python package on first use: `NARRATOR_MODELS` (`/models`), `KOKORO_MODEL`, `KOKORO_VOICES`, `WHISPER_VAD_MODEL`, `ESPEAK_BIN`, `ESPEAK_VOICE`, `ESPEAK_TIMEOUT` (15 s, seconds, after which the subprocess is killed). `HF_HOME` and `KOKORO_REPO` are gone — nothing here talks to Hugging Face at runtime.
 
 A value that will not parse logs a warning and falls back. A typo in an env var is not a reason to refuse to start a reader.
 
@@ -528,15 +694,22 @@ python server left. What that sentence does not cover:
   still undecided — which is why `KOKORO_GAIN` exists and is **not** set on the
   box. Setting it mid-book would make a novel that changes loudness at the render
   frontier, so it wants a decision and a re-render, not a quiet flip.
-- **No long soak.** The longest continuous render observed is minutes, not days.
-  What only shows up over a real book: memory growth across thousands of ONNX
-  sessions (it settled flat at ~1.24 GB over five minutes here, which is the
-  arena reaching its working set rather than a leak, but five minutes is five
-  minutes), gc churn at the `MAX_AUDIO_GB` cap, and the `/api/chapters` scan
-  under a *full* 1433-chapter cache rather than a mostly-empty one.
-- **The A1's synthesis RTF is unmeasured.** Every Kokoro number below is x86.
-  The one that decides whether the box can keep ahead of a listener is the A1's,
-  and taking it means rendering a real chapter there.
+- **The soak is hours, not days.** The box has now rendered *Lord of Mysteries*
+  for hours at a stretch under real use, with a 1433-chapter cache and a
+  20-chapter download queue, and the endpoint numbers above were taken in the
+  middle of it. Resident memory on the box settles around 1.9–2.3 GB while
+  rendering (the desktop reaches ~1.24 GB in five minutes; the box has been at it
+  far longer, and 11 GB of RAM makes the difference academic) — consistent with
+  ONNX Runtime's arena rather than a leak, but *consistent with* is not *proven
+  not to be*. What still has no evidence either way: gc churn at the
+  `MAX_AUDIO_GB` cap over days, and whether anything drifts across thousands of
+  sessions.
+- **The A1 renders at a quarter of realtime, and whisper there is 30–50× it.**
+  Both are measured now ([Performance](#the-a1-measured)), and neither is a bug —
+  they are 2 ARM cores. The consequence is a design constraint rather than a
+  to-do: nothing about this reader can assume the server keeps up with a
+  listener, and the voice-memo path is minutes, not seconds. A smaller whisper
+  model is the obvious lever and is Fernando's call to pull.
 
 ## Rules
 

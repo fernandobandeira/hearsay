@@ -11,9 +11,96 @@
 //! 16 kHz mono f32. ffmpeg is already in the image for packing and export.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
+
+/// Whisper outranks everything else this process does.
+///
+/// **The A1, 2026-09-11.** The box is two ARM cores. Kokoro synthesis already
+/// runs at 0.26–0.30× realtime there, and whisper at 30–50× realtime; with
+/// twenty chapters queued, a ~45 s memo took **over seven minutes** to come back
+/// because the two of them were fighting over the same two cores, and the render
+/// RTF fell to 0.26 for the duration. Neither job got a machine.
+///
+/// The tie-break is not about speed, it is about what is recoverable. A memo
+/// exists in exactly one place — IndexedDB on a phone — until `/api/note`
+/// answers 2xx; until then it is one browser-data clear away from being gone for
+/// good. A rendered chunk is a file the server can make again from a book it
+/// still has. So when a transcription is in flight, the renderer and the packer
+/// stand down and let it have the box.
+///
+/// The gate counts memos that are *transcribing or waiting to*, so it covers the
+/// queue behind the whisper mutex as well: two memos arriving together park the
+/// renderer once, for both, rather than letting it wake up between them.
+/// Everything is released by [`SttGuard`]'s `Drop`, so an early return, a `?`, or
+/// a panic inside whisper all open the gate on the way out — there is no manual
+/// release path to forget.
+#[derive(Default)]
+pub struct SttGate {
+    /// Transcriptions in flight or queued behind the model mutex.
+    n: Mutex<usize>,
+    cv: Condvar,
+}
+
+/// The claim. Dropping it gives the machine back.
+pub struct SttGuard<'a>(&'a SttGate);
+
+impl SttGate {
+    /// Take the box for a transcription, from now until the guard is dropped.
+    pub fn enter(&self) -> SttGuard<'_> {
+        *self.count() += 1;
+        SttGuard(self)
+    }
+
+    /// Is anything transcribing (or waiting to)?
+    pub fn held(&self) -> bool {
+        *self.count() > 0
+    }
+
+    /// Block until nothing is transcribing, or `timeout` runs out. Returns
+    /// whether the gate is clear — false means "still held, come back".
+    ///
+    /// A bounded wait rather than a sleep loop: the waiter wakes the instant the
+    /// last guard drops, and the timeout is only there so the caller keeps
+    /// checking its own stop flag.
+    pub fn wait_clear(&self, timeout: Duration) -> bool {
+        let t0 = Instant::now();
+        let mut g = self.count();
+        while *g > 0 {
+            let left = timeout.saturating_sub(t0.elapsed());
+            if left.is_zero() {
+                return false;
+            }
+            match self.cv.wait_timeout(g, left) {
+                Ok((next, _)) => g = next,
+                // A poisoned count is a count, not a reason to park forever.
+                Err(e) => g = e.into_inner().0,
+            }
+        }
+        true
+    }
+
+    /// The count, recovering from poisoning rather than panicking: a gate that
+    /// cannot be read is a renderer parked for the life of the process.
+    fn count(&self) -> std::sync::MutexGuard<'_, usize> {
+        match self.n.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+}
+
+impl Drop for SttGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut g = self.0.count();
+            *g = g.saturating_sub(1);
+        }
+        self.0.cv.notify_all();
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SttError {
@@ -90,6 +177,7 @@ mod real {
         model: PathBuf,
         vad_model: Option<PathBuf>,
         threads: i32,
+        gate: SttGate,
     }
 
     impl Whisper {
@@ -103,6 +191,7 @@ mod real {
                 model: cfg.whisper_model.clone(),
                 vad_model: vad,
                 threads: cfg.whisper_threads.max(1) as i32,
+                gate: SttGate::default(),
             }
         }
 
@@ -110,7 +199,17 @@ mod real {
             self.model.exists()
         }
 
+        /// The priority gate the renderer and the packer park on.
+        pub fn gate(&self) -> &SttGate {
+            &self.gate
+        }
+
         pub fn transcribe(&self, path: &Path, prompt: &str) -> Result<Transcript, SttError> {
+            // Claimed before anything else, and held across the ffmpeg decode and
+            // the wait for the model mutex as well as the transcription itself:
+            // a memo queued behind another one is still a memo the box should be
+            // working on rather than rendering ahead of.
+            let _busy = self.gate.enter();
             if !self.model.exists() {
                 return Err(SttError::Unavailable(format!(
                     "{} is missing",
@@ -188,16 +287,25 @@ mod real {
 mod real {
     use super::*;
 
-    pub struct Whisper;
+    #[derive(Default)]
+    pub struct Whisper {
+        gate: SttGate,
+    }
 
     impl Whisper {
         pub fn new(_cfg: &Config) -> Self {
-            Self
+            Self::default()
         }
         pub fn available(&self) -> bool {
             false
         }
+        /// Present in both builds, so nothing that parks on it has to know
+        /// whether this binary can actually transcribe.
+        pub fn gate(&self) -> &SttGate {
+            &self.gate
+        }
         pub fn transcribe(&self, _p: &Path, _prompt: &str) -> Result<Transcript, SttError> {
+            let _busy = self.gate.enter();
             Err(SttError::Unavailable(
                 "built without the stt feature".into(),
             ))
@@ -226,6 +334,62 @@ mod tests {
             model_path("/opt/w/ggml-tiny.bin", m),
             Path::new("/opt/w/ggml-tiny.bin")
         );
+    }
+
+    #[test]
+    fn the_gate_is_clear_until_something_claims_it() {
+        let g = SttGate::default();
+        assert!(!g.held());
+        assert!(
+            g.wait_clear(Duration::from_millis(1)),
+            "nothing to wait for"
+        );
+        {
+            let _a = g.enter();
+            assert!(g.held());
+            // A second memo queued behind the first keeps it held, so the
+            // renderer does not wake up in the gap between them.
+            let _b = g.enter();
+            assert!(g.held());
+            assert!(!g.wait_clear(Duration::from_millis(20)), "still busy");
+        }
+        assert!(!g.held(), "both guards released on the way out of scope");
+        assert!(g.wait_clear(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn a_waiter_wakes_the_moment_the_last_guard_drops() {
+        let g = std::sync::Arc::new(SttGate::default());
+        let held = g.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let busy = held.enter();
+            tx.send(()).ok();
+            std::thread::sleep(Duration::from_millis(60));
+            drop(busy);
+        });
+        rx.recv().ok();
+        let t0 = Instant::now();
+        // Ten seconds of headroom: what is asserted is that it does not *use*
+        // them, not the exact wake-up latency.
+        assert!(g.wait_clear(Duration::from_secs(10)));
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        t.join().ok();
+    }
+
+    #[test]
+    fn a_transcription_that_panics_still_opens_the_gate() {
+        // The whole reason this is an RAII guard and not a pair of calls: there
+        // is no path out of `transcribe` — early return, `?`, or a panic inside
+        // whisper.cpp's bindings — that leaves the renderer parked forever.
+        let g = std::sync::Arc::new(SttGate::default());
+        let g2 = g.clone();
+        let t = std::thread::spawn(move || {
+            let _busy = g2.enter();
+            panic!("a transcription blowing up, on purpose");
+        });
+        assert!(t.join().is_err(), "the thread was supposed to panic");
+        assert!(!g.held(), "unwinding ran Drop");
     }
 
     #[test]
