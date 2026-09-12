@@ -89,6 +89,9 @@ jobs:
     # A failing test must block the publish - the image only builds on green.
     needs: [test]
     strategy:
+      # An arm64 failure should not shoot the amd64 job you were about to read
+      # the log of.
+      fail-fast: false
       matrix:
         include:
           - runner: ubuntu-24.04
@@ -110,8 +113,27 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           push: true
           tags: ${{ env.IMAGE }}:latest-${{ matrix.arch }}
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          # The build cache lives in GHCR, not in the Actions cache.
+          #
+          # Measured 2026-09-12: the Actions cache held 3.81 GB of buildkit
+          # blobs against a 10 GB repo cap it shares with the 1.03 GB rust-cache
+          # entry, and since November 2025 GitHub evicts LRU *hourly* - so the
+          # image cache was on its way to evicting the Rust cache. Worse, the
+          # gha backend rewrites every blob on every run: exporting cost 78s on
+          # amd64 and 47s on arm64 even when the only thing that changed was one
+          # .rs file. A registry backend skips blobs the registry already has by
+          # digest, so an unchanged 276 MB dependency layer is not re-uploaded.
+          #
+          # image-manifest + oci-mediatypes are what make GHCR accept a cache
+          # manifest at all.
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+            type=gha,scope=${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
+          # Nothing consumes the provenance attestation, and it costs an extra
+          # manifest on every export and two "unknown/unknown" entries in the
+          # manifest list the box pulls.
+          provenance: false
 
   publish:
     needs: [build]
