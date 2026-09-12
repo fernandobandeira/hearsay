@@ -32,6 +32,18 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  # Pinned at the workflow level, not per-step, because Swatinem/rust-cache
+  # hashes every CARGO_*/RUST* variable into its key: a value that appears and
+  # disappears between steps or jobs is a cache that never hits.
+  CARGO_TERM_COLOR: always
+  # Full DWARF for a tree nothing will ever attach a debugger to. Line tables
+  # keep test-failure backtraces readable and cut the object files (and so the
+  # link, and so the cache) by most of their size. CI-only: local `cargo test`
+  # is untouched, because this lives here and not in Cargo.toml.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # An empty wrapper on purpose: a wrapper leaking in from a runner image would
+  # change -C metadata and invalidate the restored cache wholesale.
+  RUSTC_WRAPPER: ""
 
 jobs:
   test:
@@ -42,6 +54,13 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          # A fixed key instead of the job name, so splitting or renaming this
+          # job later does not orphan a gigabyte of cache on the old name.
+          shared-key: ci
+          # A run that fails in clippy still paid for the dependency build; save
+          # it, or the next push pays again.
+          cache-on-failure: true
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
