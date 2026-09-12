@@ -95,7 +95,10 @@ RUN mkdir -p src/bin \
     && rm -rf src
 
 COPY src/ ./src/
-COPY tests/ ./tests/
+# tests/ is deliberately *not* copied. `cargo build --bin narrator` never
+# compiles a test target, and every fixture that lands in this stage is another
+# way an edit to a test invalidates the final compile layer for nothing. The
+# tests run in CI on the runner, against the same source.
 # Touch so cargo does not reuse the stub's fingerprint.
 RUN set -eux; \
     . /etc/ggml.sh; \
