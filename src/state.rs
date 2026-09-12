@@ -202,6 +202,12 @@ pub struct AppState {
     /// restarts each chapter has been picked back up by, and which have run out.
     /// The queues stay where they are; see [`crate::wishlist`].
     pub wishlist: Mutex<crate::wishlist::Wishlist>,
+
+    /// Since when the render worker has been stalled on the chunk under the
+    /// playhead — rule 1, the branch where somebody is waiting *right now*.
+    /// `None` whenever it is doing anything else, the lookahead included. It is
+    /// the packer's cue to hold an encode back; see [`crate::render`].
+    pub render_stalled: Mutex<Option<Instant>>,
 }
 
 impl AppState {
@@ -229,6 +235,7 @@ impl AppState {
             chstat: Mutex::new(None),
             autopack_at: Mutex::new(None),
             wishlist: Mutex::new(crate::wishlist::Wishlist::default()),
+            render_stalled: Mutex::new(None),
         })
     }
 
@@ -261,6 +268,28 @@ impl AppState {
         match self.positions.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
+        }
+    }
+
+    /// How long the renderer has been stuck under the playhead, in seconds.
+    /// Zero means it is not — which is the answer nearly always, and is what
+    /// lets the packer run at all.
+    pub fn stalled_for(&self) -> f64 {
+        self.render_stalled
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    pub fn set_stalled(&self, yes: bool) {
+        if let Ok(mut g) = self.render_stalled.lock() {
+            if yes {
+                g.get_or_insert_with(Instant::now);
+            } else {
+                *g = None;
+            }
         }
     }
 

@@ -587,3 +587,98 @@ async fn a_cancelled_request_cannot_leak_the_gate() {
     })
     .await;
 }
+
+// ------------------------------------------------- the packer's CPU policy
+
+/// The packer stands down for a renderer that is stalled under the playhead.
+///
+/// One rank below the STT gate above, and the same shape for a related reason.
+/// Two ARM cores, Kokoro at a quarter of realtime: an ffmpeg encode running
+/// while the renderer is stuck on the chunk somebody is listening to *right now*
+/// is a reader waiting longer for the chapter in their hands so that a chapter
+/// for tonight can be filed. It matters more since the wishlist, because a
+/// resumed download can fill the pack queue seconds after boot with no client
+/// involved — nobody is watching to notice the trade being made badly.
+///
+/// The policy in one line: pack when the renderer is ahead or idle, hold while
+/// it is behind. Only rule 1 counts as behind — the lookahead is 80 chunks and
+/// a packer that waited for that would never run at all — and the hold is
+/// bounded (`PACK_HOLD_MAX_S`), because a renderer that is wedged rather than
+/// slow must not turn a download into a deadlock.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pack_holds_back_while_the_renderer_is_stalled_under_the_playhead() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let ro = |p: &Path, yes: bool| {
+        std::fs::set_permissions(
+            p,
+            std::fs::Permissions::from_mode(if yes { 0o555 } else { 0o755 }),
+        )
+    };
+
+    let h = Harness::new().await;
+    h.load().await;
+    let key = key_of(&h);
+
+    // Chapter 1 is complete, so it is packable the moment it is asked for.
+    let n1 = h.state.session().plan[1].chunks.len();
+    for i in 0..n1 {
+        cache::write_wav(&cache::chunk_path(&h.work(), &key, 1, i), &[0.0f32; 24_000])
+            .expect("seed");
+    }
+
+    // Chapter 0 cannot be written to, so the chunk under the playhead will not
+    // render: rule 1 with no exit, which is exactly the stalled condition.
+    let dir = cache::chapter_dir(&h.work(), &key, 0);
+    std::fs::create_dir_all(&dir).expect("dir");
+    ro(&dir, true).expect("chmod");
+    let probe = dir.join(".probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        let _ = ro(&dir, false);
+        eprintln!("skipping: the directory is writable anyway (root?)");
+        return;
+    }
+
+    h.post_json("/api/open", json!({"chapter": 0, "chunk": 0}))
+        .await;
+    until("the renderer to report itself stalled", 20.0, || {
+        h.state.stalled_for() > 0.0
+    })
+    .await;
+
+    // The download goes in while the renderer is stuck. It is accepted and
+    // queued; what must not happen is an encode starting on top of it.
+    let (code, body) = h
+        .post_json(
+            "/api/chapters/render",
+            json!({"chapters": [1], "pack": true}),
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["packing"], json!([1]), "complete, so queued to pack");
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(
+        h.state.session().building,
+        None,
+        "no encode while the reader is waiting on a chunk"
+    );
+    assert!(
+        h.state.session().pack_queue.contains(&1),
+        "held back, not dropped"
+    );
+
+    // The disk comes back: the renderer catches up, stops being stalled, and
+    // the packer takes the chapter it was holding.
+    ro(&dir, false).expect("restore");
+    until("the renderer to catch up", 40.0, || {
+        h.state.stalled_for() == 0.0
+    })
+    .await;
+    until("the packer to take it", 40.0, || {
+        let s = h.state.session();
+        s.building == Some(1) || !s.pack_queue.contains(&1)
+    })
+    .await;
+}

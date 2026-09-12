@@ -418,11 +418,18 @@ fn worker(st: Arc<AppState>) {
         // 1. Disk truth: the chunk under the playhead outranks everything. If it
         //    is missing the reader is stalled on it right now.
         if ph < n && !exists(&st, &key, ci, ph) {
+            // And this is the one condition under which a pack would genuinely
+            // starve the renderer: two ARM cores, Kokoro at a quarter of
+            // realtime, and a listener waiting on this exact chunk. Flagged
+            // here rather than read off `status`, which also says "rendering"
+            // while the lookahead fills. See the packer's hold-back.
+            st.set_stalled(true);
             st.session().status = "rendering".into();
             attempt(&st, &key, ci, ph, chunks, &mut bo);
             render_event(&st, "progress", ci, ph + 1, n, "rendering");
             continue;
         }
+        st.set_stalled(false);
 
         // 2. The lookahead window, scanned for a real hole rather than trusted.
         let limit = n.min(ph.saturating_add(st.cfg.lookahead).saturating_add(1));
@@ -539,8 +546,18 @@ fn worker(st: Arc<AppState>) {
 
 // ----------------------------------------------------------------- the packer
 
+/// The longest the packer defers to a stalled renderer before packing anyway.
+///
+/// A courtesy, not a lock — see the hold-back in [`builder`]. Thirty seconds is
+/// many chunks on the desktop and a couple on the A1; past it the renderer is
+/// not slow, it is stuck (a wedged espeak-ng, a read-only work dir), and a
+/// download that waits on a stuck renderer forever would be a worse bug than the
+/// one the hold-back prevents.
+const PACK_HOLD_MAX_S: f64 = 30.0;
+
 fn builder(st: Arc<AppState>) {
     let mut parked: Option<Instant> = None;
+    let mut held: Option<Instant> = None;
     while !st.stop.load(Ordering::SeqCst) {
         st.build_ev.wait(Duration::from_secs(1));
         // The same rule as the renderer, for the same reason: an ffmpeg encode
@@ -563,6 +580,35 @@ fn builder(st: Arc<AppState>) {
         if let Some(t) = parked.take() {
             tracing::info!(
                 "packer resumed after {:.1}s parked for transcription",
+                t.elapsed().as_secs_f64()
+            );
+        }
+        // And the same shape one rank down: the renderer outranks the packer
+        // while somebody is actually waiting on a chunk.
+        //
+        // This is worth having now that packs arrive without a client asking for
+        // them. A wishlist resumed at boot can put twenty chapters in the pack
+        // queue seconds after the port opens, and on two ARM cores an ffmpeg
+        // encode running against a renderer that is stalled *under the playhead*
+        // is a reader waiting longer for the chapter in their hands so that a
+        // chapter for tonight can be filed. The policy, in one line: pack when
+        // the renderer is ahead or idle, hold while it is behind.
+        //
+        // Only rule 1 counts as behind — the chunk the playhead is on. The
+        // lookahead is 80 chunks and also reports "rendering", and a packer that
+        // waited for *that* would never run on this box at all.
+        let stalled = st.stalled_for();
+        if stalled > 0.0 && stalled < PACK_HOLD_MAX_S && !st.session().pack_queue.is_empty() {
+            if held.is_none() {
+                held = Some(Instant::now());
+                tracing::info!("packer holding back: the renderer is stalled under the playhead");
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        if let Some(t) = held.take() {
+            tracing::info!(
+                "packer resumed after {:.1}s held back for the renderer",
                 t.elapsed().as_secs_f64()
             );
         }
