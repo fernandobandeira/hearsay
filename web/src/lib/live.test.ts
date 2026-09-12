@@ -75,6 +75,25 @@ describe('arbitrate - what to do when the position moves somewhere else', () => 
     expect(arbitrate(pos({chunk: 41}), here({chunk: 40}), 0))
       .toEqual({t: 'follow', chapter: 576, chunk: 41});
   });
+
+  /* Reading on a plane and landing. The server's session stopped hearing from
+     this device at chapter 570; everything it can say about this book until it
+     is told otherwise describes that, including the position it writes *after*
+     the network comes back - `/api/playhead` carries only a chunk, so a report
+     from chapter 576 is filed under 570 and broadcast. Following it is the bug.
+     See `healSession` in state.tsx, which is what takes the flag down. */
+  test('a position this device has out-run is not news, wherever it points', () => {
+    const read = here({chapter: 576, chunk: 40, undelivered: true});
+    expect(arbitrate(pos({chapter: 570, chunk: 12}), read)).toEqual({t: 'ignore'});
+    // Not even while playing, where it would otherwise be an offer.
+    expect(arbitrate(pos({chapter: 570, chunk: 12}), {...read, playing: true}))
+      .toEqual({t: 'ignore'});
+  });
+
+  test('...and a delivered device follows the same event', () => {
+    expect(arbitrate(pos({chapter: 570, chunk: 12}), here({chapter: 576, chunk: 40})))
+      .toEqual({t: 'follow', chapter: 570, chunk: 12});
+  });
 });
 
 describe('parseEvent - the one part of the API that is not generated', () => {

@@ -11,7 +11,11 @@
 import {beforeEach, describe, expect, test, vi} from 'vitest';
 import {MAX_TRIES, type Memo} from './outbox';
 
-const store = vi.hoisted(() => ({memos: [] as Memo[], deleted: [] as number[]}));
+const store = vi.hoisted(() => ({
+  memos: [] as Memo[], deleted: [] as number[],
+  positions: [] as {book: string; chapter: number; chunk: number; ts: number}[],
+  droppedPositions: [] as string[],
+}));
 
 vi.mock('./db', () => ({
   allMemos: async () => store.memos,
@@ -22,11 +26,14 @@ vi.mock('./db', () => ({
     store.deleted.push(id);
     store.memos = store.memos.filter((m) => m.id !== id);
   },
-  allPositions: async () => [],
-  deletePosition: async () => {},
+  allPositions: async () => store.positions,
+  deletePosition: async (book: string) => {
+    store.droppedPositions.push(book);
+    store.positions = store.positions.filter((p) => p.book !== book);
+  },
 }));
 
-const {flushOutbox} = await import('./flush');
+const {flushOutbox, flushPositions} = await import('./flush');
 
 /** node has no FileReader, and the base64 of the blob is not what is under test. */
 class FakeReader {
@@ -61,6 +68,8 @@ const sent = (call: unknown[]) =>
 beforeEach(() => {
   store.memos = [];
   store.deleted = [];
+  store.positions = [];
+  store.droppedPositions = [];
   vi.stubGlobal('FileReader', FakeReader);
 });
 
@@ -207,5 +216,38 @@ describe('two triggers, one drain', () => {
 
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(store.deleted).toEqual([1, 7]);
+  });
+});
+
+/* The queue's other half. /api/position heals the *vault record* and nothing
+   else - the session's chapter is still where this device left it, and the next
+   thing that saves from the session overwrites what was just written. So the
+   caller has to know which books it delivered, to go and say where the reader
+   actually is (`healSession` in state.tsx). */
+describe('draining the position queue', () => {
+  const at = (book: string, chapter: number, chunk: number) =>
+    ({book, chapter, chunk, ts: 1_700_000_000_000});
+
+  test('a delivered position is dropped and named back to the caller', async () => {
+    store.positions = [at('Book (2016).epub', 576, 40)];
+    vi.stubGlobal('fetch', vi.fn(async () => ({ok: true, status: 200})));
+    expect(await flushPositions()).toEqual(['Book (2016).epub']);
+    expect(store.droppedPositions).toEqual(['Book (2016).epub']);
+  });
+
+  test('one the server would not take is named to nobody, and it keeps', async () => {
+    store.positions = [at('Book (2016).epub', 576, 40)];
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('offline'); }));
+    expect(await flushPositions()).toEqual([]);
+    expect(store.positions).toHaveLength(1);
+  });
+
+  test('each book answers for itself: one failure does not lose the others', async () => {
+    store.positions = [at('A.epub', 1, 0), at('B.epub', 2, 0)];
+    vi.stubGlobal('fetch', vi.fn(async (_u: string, init: {body: string}) =>
+      (JSON.parse(init.body).book === 'A.epub'
+        ? {ok: false, status: 500} : {ok: true, status: 200})));
+    expect(await flushPositions()).toEqual(['B.epub']);
+    expect(store.positions.map((p) => p.book)).toEqual(['A.epub']);
   });
 });

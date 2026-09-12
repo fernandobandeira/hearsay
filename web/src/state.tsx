@@ -333,8 +333,15 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const player = playerRef.current;
 
   // ------------------------------------------------------- positions, outbox
+  /* The books this device has read past what it managed to tell the server.
+     Mirrors the position queue in IndexedDB, in a ref because three things that
+     are not renders consult it: the playhead report, the reconnect flush, and
+     the live stream's arbitration. */
+  const undeliveredRef = useRef<Set<string>>(new Set());
+
   const refreshQueued = useCallback(async () => {
     const [notes, positions] = await Promise.all([db.allMemos(), db.allPositions()]);
+    undeliveredRef.current = new Set(positions.map((p) => p.book));
     setQueued({
       notes: notes.length,
       positions: positions.length,
@@ -354,10 +361,25 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     const b = bookRef.current;
     if (!b) return;
     rememberDevicePos(b.path, ciRef.current, i);
+    /* The first report after reading offline cannot be a playhead report.
+       `/api/playhead` carries only the chunk, so the server would file it under
+       whatever chapter its session still holds - the one this device left when
+       the network went - and then broadcast that as a position, which is the
+       reader watching itself get dragged back three chapters. `/api/open` names
+       the chapter too, which is the whole of what is out of date. */
+    const healing = undeliveredRef.current.has(b.name);
     try {
-      await reportPlayhead(b.key, i);
+      if (healing) await tellOpen(b.key, ciRef.current, i);
+      else await reportPlayhead(b.key, i);
+      if (healing) {
+        undeliveredRef.current.delete(b.name);
+        // Superseded by construction: same device, same book, newer position.
+        await db.deletePosition(b.name).catch(() => {});
+        void refreshQueued();
+      }
       return;
     } catch { /* refused or unreachable: it goes in the queue */ }
+    undeliveredRef.current.add(b.name);
     await db.putPosition({
       book: b.name, chapter: ciRef.current, chunk: i, ts: Date.now(),
       chapter_title: chapterTitle, chunks_total: chunks.length, chapters_total: chapters.length,
@@ -366,12 +388,42 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   }, [chapterTitle, chunks.length, chapters.length, refreshQueued]);
 
 
+  /**
+   * Tell the server where this device actually got to, chapter included.
+   *
+   * The other half of the offline queue, and the half that was missing. A
+   * position that could not be delivered is kept in IndexedDB and pushed to
+   * `/api/position` on reconnect - which fixes the *vault record* and nothing
+   * else. The session is untouched: its chapter is still the one this device
+   * left when the network went, and the next thing that saves from it (a
+   * `/api/playhead` a chunk later, a `/api/pause`, the 15 s throttle expiring)
+   * overwrites the record that was just healed and broadcasts the old chapter as
+   * a `position` event. This device then follows it, because a position from
+   * somewhere else is exactly what that event means.
+   *
+   * So: `/api/open`, which is the only call that carries a chapter, before
+   * anything else is said. It also puts the render frontier where the reader is,
+   * which for the same reason had been left on a chapter nobody is reading.
+   */
+  const healSession = useCallback(async () => {
+    const b = bookRef.current;
+    if (!b || !undeliveredRef.current.has(b.name)) return;
+    try {
+      await tellOpen(b.key, ciRef.current, idxRef.current);
+    } catch { return; }        // still unreachable, or another book: it keeps
+    undeliveredRef.current.delete(b.name);
+    await db.deletePosition(b.name).catch(() => {});
+  }, []);
+
   const flush = useCallback(async (manual = false) => {
     const {flushOutbox, flushPositions} = await import('./lib/flush');
+    // Before the vault post, not after: /api/open writes the record itself, and
+    // a stale session left running would undo whatever /api/position wrote.
+    await healSession();
     await flushPositions();
     await flushOutbox({online: onlineManager.isOnline(), manual});
     await refreshQueued();
-  }, [refreshQueued]);
+  }, [refreshQueued, healSession]);
 
   const queueNote = useCallback(async (blob: Blob) => {
     const b = bookRef.current;
@@ -914,6 +966,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
       chapter: ciRef.current,
       chunk: idxRef.current,
       playing: playerRef.current?.playing ?? false,
+      undelivered: !!b && undeliveredRef.current.has(b.name),
     });
     if (verdict.t === 'ignore') return;
     if (verdict.t === 'offer') {

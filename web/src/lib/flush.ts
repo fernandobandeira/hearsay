@@ -135,16 +135,28 @@ async function sendQueued(ctx: OutboxCtx): Promise<void> {
  * Positions go to /api/position, which names its book rather than assuming the
  * server still holds it. Last write wins, which is the right rule for one reader
  * on several devices.
+ *
+ * Returns the books it delivered. That matters for the one that is *open*: this
+ * endpoint writes the vault record and nothing else, so the session - whose
+ * chapter is still wherever it was when the network went, because
+ * `/api/playhead` carries only a chunk - is left stale and will overwrite this
+ * record the next time it saves. Healing that is the caller's job (`healSession`
+ * in state.tsx), and this is how it learns there was anything to heal.
  */
-export async function flushPositions(): Promise<void> {
+export async function flushPositions(): Promise<string[]> {
+  const delivered: string[] = [];
   for (const p of await db.allPositions()) {
     try {
       const res = await fetch('/api/position', {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(p),
       });
-      if (res.ok) await db.deletePosition(p.book);
+      if (res.ok) {
+        await db.deletePosition(p.book);
+        delivered.push(p.book);
+      }
     } catch { /* still offline; it keeps */ }
   }
+  return delivered;
 }
 
 export type {NoteResult};

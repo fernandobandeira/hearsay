@@ -173,6 +173,15 @@ export interface Here {
   chunk: number;
   /** Audio is actually playing right now. */
   playing: boolean;
+  /**
+   * This device has read on past what it managed to tell the server.
+   *
+   * Set from the position queue (lib/db's `positions`), which by construction
+   * holds only what a POST could not deliver. While it is set, nothing the
+   * server says about this book can be news: it is describing a session that
+   * stopped hearing from the reader some chapters ago.
+   */
+  undelivered?: boolean;
 }
 
 export type FollowVerdict =
@@ -207,6 +216,15 @@ export function arbitrate(ev: PositionEvent, here: Here, slack = SLACK): FollowV
   // Another book entirely. Its position is real and was saved; it is simply not
   // about the page in front of us.
   if (!here.book || ev.book !== here.book) return {t: 'ignore'};
+  /* This device read while the server could not hear it, and has not caught the
+     server up yet. Every position the server can currently produce for this book
+     predates that reading - including the ones it writes *now*, because
+     `/api/playhead` carries only a chunk and the session's chapter is still
+     wherever it was when the network went. Following one of those is precisely
+     the "came back online and jumped back three chapters" bug, so: ignore the
+     server about this book until it has been told where we are. See
+     `healSession` in state.tsx, which is what clears this. */
+  if (here.undelivered) return {t: 'ignore'};
   const sameChapter = ev.chapter === here.chapter;
   if (sameChapter && Math.abs(ev.chunk - here.chunk) <= slack) return {t: 'ignore'};
   const to = {chapter: ev.chapter, chunk: ev.chunk};

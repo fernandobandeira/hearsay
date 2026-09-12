@@ -332,6 +332,52 @@ The heartbeat query (`/api/status`) survives at a fifth of its old rate — 5 s
 instead of 1 s — as the fallback for a browser with no live stream and the source
 of the few numbers no event carries.
 
+### Coming back online drags you backwards
+
+An hour of reading offline, and the moment the tunnel came back the reader jumped
+to where it had been when the tunnel went. The position queue was not the bug —
+it worked. **`/api/position` heals the vault record and nothing else.**
+
+Playback is one server-side session, and the session's chapter only ever moves on
+`/api/open`. Offline, `openChapter`'s `tellOpen` is fire-and-forget and its
+failure is dropped, so three chapters of reading left the session exactly where
+it was. The queue meanwhile kept the right position — chapter included — and
+pushed it to `/api/position` on reconnect, which writes the vault, emits a
+`position` event, and **does not touch the session**. Then the very next thing
+that saves from that session — a `/api/playhead` one chunk later (it carries only
+a `chunk`, so the chapter is the session's stale one), a `/api/pause`, the 15 s
+throttle expiring — overwrote the record that had just been healed and broadcast
+the old chapter. The reader followed it, correctly: a position from somewhere
+else is exactly what that event means. The render frontier was on the wrong
+chapter for the same reason.
+
+Two changes, both in the reader:
+
+- **The first contact after an undelivered position is `/api/open`, not
+  `/api/playhead`.** It is the only call that carries a chapter, and the chapter
+  is the whole of what is out of date. `healSession` does it on every reconnect
+  path (`state.tsx`), and `report` does it inline, so a device that simply
+  resumes playback heals without waiting for a flush. `flushPositions` now
+  returns the books it delivered, which is how the caller knows there was
+  anything to heal; the heal runs *before* the vault post, because `/api/open`
+  writes the record itself and a session left stale would undo it either way
+  round.
+- **`arbitrate` ignores the server about a book this device has out-run.** While
+  a position for it sits undelivered in IndexedDB, nothing the server can say
+  about that book is news — it is describing a session that stopped hearing from
+  the reader some chapters ago. That closes the window between the queue draining
+  and the heal landing, and it is also the right rule on its own: last write
+  wins, and this device wrote last.
+
+**Why the obvious timestamp rule does not fix this.** Stamping the local position
+and ignoring any server record older than it is the usual answer, and
+`resolveResume` already does exactly that where it works — at *open*, against the
+record `/api/load` returns. It cannot work here: the bad event is not an old
+write, it is a **fresh write of stale content**. The server stamps it `now`, so it
+is newer than anything this device holds, and every recency rule waves it
+through. What is out of date is the session, not the record, and the only thing
+that fixes a stale session is telling it where the reader is.
+
 ## Downloading a chapter, end to end
 
 A download is two stages — render every chunk, then pack the chunks into one
