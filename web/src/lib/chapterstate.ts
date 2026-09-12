@@ -31,6 +31,12 @@ export interface ChapterState {
   tip: string;
   tone: 'ok' | 'work' | 'part' | 'done' | 'none';
   spin?: boolean;
+  /**
+   * A transient that is running *underneath* a downloaded row - a re-render, a
+   * repack, a second save. Never the row's own state: it is a whisper beside
+   * the download mark, which stays exactly what it was.
+   */
+  note?: string;
 }
 
 /**
@@ -67,8 +73,41 @@ export function textMark(saved: boolean | null, connected: boolean): TextMark | 
        tip: 'these words are not in the saved text — with no network this chapter may not open'};
 }
 
+/**
+ * **Downloaded outranks everything.** One question a row has to answer before any
+ * other: is this chapter *on this device*? Everything else on the ladder - a job
+ * this device is running, a queue or a spinner on the server, a size label - is
+ * about work in flight somewhere else, and for a while any of them could take the
+ * download mark's place, which left the list unable to say what was actually
+ * stored here. So `offline` is read first and nothing below can reach past it: a
+ * stored chapter is always the download icon in the `ok` tone. A transient
+ * running at the same time (he re-queued a render, the server is repacking)
+ * survives as `note` and inside the sentence - a secondary hint, never the state.
+ */
 export function chapterState(
   r: ChapRow, offline: boolean, fmtBytes: (n: number) => string, job?: Job,
+): ChapterState {
+  const other = elsewhereState(r, fmtBytes, job);
+  if (!offline) return other;
+  // `work` is the tone of the things that are still happening; a `ready`/
+  // `rendered`/size state is not news next to a copy that is already here.
+  const busy = other.tone === 'work' ? other.text : null;
+  return {
+    key: 'downloaded', text: r.bytes ? fmtBytes(r.bytes) : 'saved', tone: 'ok',
+    ...(busy ? {note: busy} : {}),
+    tip: busy
+      ? `downloaded — this chapter plays with no network at all (${busy}, in the background)`
+      : 'downloaded — this chapter plays with no network at all',
+  };
+}
+
+/**
+ * The rest of the ladder: what the row would say if this device had no copy -
+ * the job it is running, then whatever the server's row reports. Only ever
+ * reached through `chapterState`, which puts the download mark above all of it.
+ */
+function elsewhereState(
+  r: ChapRow, fmtBytes: (n: number) => string, job?: Job,
 ): ChapterState {
   const packing: ChapterState = {
     key: 'packing', text: 'packing', tone: 'work', spin: true,
@@ -88,11 +127,6 @@ export function chapterState(
     text: r.n && r.rendered ? `${r.rendered}/${r.n}` : 'rendering',
     tone: 'work', spin: !r.rendered,
     tip: 'the server is rendering this chapter, and the download follows it',
-  };
-  // On this device beats everything the server says about it.
-  if (offline) return {
-    key: 'downloaded', text: r.bytes ? fmtBytes(r.bytes) : 'saved', tone: 'ok',
-    tip: 'downloaded — this chapter plays with no network at all',
   };
   if (r.packing) return packing;
   if (r.pack_queued) return {

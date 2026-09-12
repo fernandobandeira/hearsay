@@ -375,6 +375,12 @@ export function ChapterManager({open, active, onPick}: {
                 <span data-testid="chapter-state"
                       className={cn('flex shrink-0 items-center gap-1 text-[10px] tabular-nums tracking-wide',
                                     TONE[s.tone])}>
+                  {/* A transient running under a row that is already on this
+                      device - dimmer than the state itself, because the news is
+                      still that the chapter is here. */}
+                  {s.note && (
+                    <span data-testid="chapter-note" className="text-work/70">{s.note}</span>
+                  )}
                   {s.text}
                   <Icon className={cn('size-3', s.spin && 'animate-spin')} aria-label={s.tip} />
                 </span>
