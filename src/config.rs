@@ -75,6 +75,7 @@ pub struct Config {
     pub chapter_bitrate: String,
     pub chapter_gap_s: f64,
     pub chapter_para_gap_s: f64,
+    pub chapter_phrase_gap_s: f64,
     pub hls_segment_s: f64,
 
     pub text_shard_bytes: usize,
@@ -174,6 +175,7 @@ impl Config {
             chapter_bitrate: env("CHAPTER_BITRATE").unwrap_or_else(|| "64k".into()),
             chapter_gap_s: num("CHAPTER_GAP_S", 0.30),
             chapter_para_gap_s: num("CHAPTER_PARA_GAP_S", 0.60),
+            chapter_phrase_gap_s: num("CHAPTER_PHRASE_GAP_S", 0.10),
             hls_segment_s: num("HLS_SEGMENT_S", 6.0),
 
             text_shard_bytes: num("TEXT_SHARD_BYTES", 1_500_000),

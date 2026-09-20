@@ -45,7 +45,7 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 ./narrator web           # npm ci && npm run build in web/ (dev serves web/dist)
 ./narrator dev           # cargo run, serving ./web and ./work
 ./narrator build && ./narrator up     # docker, port 7870 on localhost only
-./narrator test          # the whole suite: 192 tests, no model, no network
+./narrator test          # the whole suite: 197 tests, no model, no network
 ./narrator lint          # rustfmt --check + clippy -D warnings
 ./narrator client        # regenerate openapi.json + web/src/client
 ./narrator export --book books/Title.epub [--partial]   # the cache → a .m4b
@@ -83,6 +83,66 @@ flag. That is the whole cache and every stored position in Fernando's largest
 book, proven to survive the swap. It is opt-in because it needs the epub still
 sitting next to the plan; `NARRATOR_REF_WORK` and `NARRATOR_REF_BOOKS` point it
 somewhere else, and it only ever reads (the epub is copied out before parsing).
+
+### The silence between chunks
+
+Reported as "it stops in the middle of a sentence". It was two things, and
+**neither of them was the chunker**.
+
+**The gap constants were describing a quarter of the gap.** Kokoro returns each
+utterance inside its own silence, and nothing removed it. Measured on the box's
+own rendered wavs — 124 chunks of *Lord of Mysteries* — that is a median of
+**0.31 s before the speech and 0.49 s after it**, against a median chunk of
+8.8 s. So two chunks in a packed chapter were separated by 0.80 s of model
+padding *plus* the 0.30 s `CHAPTER_GAP_S` inserts: **1.10 s**, and 1.40 s at a
+paragraph. Inside a sentence that is the reported stop; between two sentences of
+the same paragraph it is still about three times a natural pause.
+
+`trim_padding` (`src/tts/kokoro.rs`) removes it, in `Engine::generate` rather
+than in the packer — the reader plays the per-chunk wavs directly while a
+chapter is still streaming, and that path has no packer in it. The threshold is
+0.5 % of the chunk's own peak with 25 ms kept either side: Kokoro's padding
+peaks at 1–7 of 32767 against speech at ~15431, a margin of about 2000×, so
+nothing is near an edge. Measured against the real model, 0.72 s comes off a
+chunk and the peak is unchanged to within a float — the speech is not touched,
+only the silence around it. A chunk is about 27 % shorter, which the cache and
+every packed m4a get for free.
+
+This changes what is *in* a rendered chunk, never which text is in it. No chunk
+index, manifest entry or stored position moves, and a chapter's manifest is
+computed from the durations actually on disk, so a cache holding both trimmed
+and untrimmed wavs stays correct — an old chapter keeps its long gaps until
+something re-renders it.
+
+**And the packer put a full stop's worth of silence in the middle of
+sentences.** It chose between the two gaps on the paragraph index alone, so
+every boundary got an inter-sentence pause whether or not a sentence had ended.
+Most had. Measured across all 1433 chapters, **978 boundaries — 8.8 % of the
+ones inside a paragraph — interrupt a phrase**:
+
+| | count | what it is |
+|---|---|---|
+| clause of an over-long sentence | 684 | `chunk_paragraph` splits a sentence longer than `max_chars` at its `,` `;` `:` |
+| abbreviation | 291 | [quirk 1](#chunking-the-one-that-cannot-move): the guards are inert, so `Mr. Franky` is two sentences and `Mr.` ends a chunk |
+| an initial | 3 | `Mr. A.` |
+
+`Gap::between` now has three answers rather than two, and the third is
+`CHAPTER_PHRASE_GAP_S` (0.10 s). Deciding it needs to know that `Mr.` is not a
+full stop, so the packer carries the word list `app/book.py`'s `_ABBR` was
+trying to guard with. **The chunker's guards stay inert** — that is what every
+stored position was chunked with, and changing it there is a migration. Here the
+same list answers a much smaller question, where being wrong costs a pause
+rather than a position.
+
+**What this does not fix**, and the decision that was not taken: the 294
+abbreviation boundaries are still *boundaries*. The pause is gone, but Kokoro
+still renders `…loudly, Mr.` as a complete utterance with a sentence-final fall,
+because that is the text it is handed. Only the chunker can fix that, and doing
+it is a migration — measured, it re-chunks **242 of 1433 chapters (16.9 %)** and
+shifts **11092 of 118831 chunk indices (9.3 %)**, invalidating exactly those
+chunks' audio; 1191 chapters are untouched. It would also break the Python
+parity guarantee this file opens with. Not attempted; it wants a decision, not
+an edit.
 
 ### Cache layout
 
@@ -914,7 +974,7 @@ transcription rather than one of them being Kokoro's.
 
 ## Config surface
 
-Every name the Python `AGENTS.md` documents, with the same default: `NARRATOR_PORT` (7870), `NARRATOR_VAULT`, `NARRATOR_WORK`, `NARRATOR_BOOKS`, `NARRATOR_WEB`, `BOOKS_SUBDIR`, `POSITIONS_SUBDIR` (`02 - Studies`), `NOTES_SUBDIR` (`05 - Fleeting`), `KOKORO_VOICE` (`af_heart`), `KOKORO_SPEED`, `KOKORO_GAIN` (1.0), `LOOKAHEAD` (80), `PRERENDER_CHAPTERS` (2), `PREFETCH_WHILE_PAUSED`, `MAX_AUDIO_GB` (5), `MAX_CHAPTER_GB` (20), `SILENCE_S` (0.5), `WHISPER_MODEL`, `WHISPER_PROMPT`, `WHISPER_THREADS` (every core), `CHAPTER_BITRATE` (`64k`), `CHAPTER_GAP_S` (0.30), `CHAPTER_PARA_GAP_S` (0.60), `HLS_SEGMENT_S` (6), `TEXT_SHARD_BYTES`, `TEXT_SHARD_CHAPTERS`, `HEALTH_STALL_S` (300), `AUTOPACK`, `AUTOPACK_EVERY_S`, `NARRATOR_WATCH_BOOKS`, `NARRATOR_FAKE_TTS`, `SSE_HEARTBEAT_S`, `SSE_QUEUE`, `SSE_RENDER_MIN_S`, `SSE_RETRY_MS`.
+Every name the Python `AGENTS.md` documents, with the same default: `NARRATOR_PORT` (7870), `NARRATOR_VAULT`, `NARRATOR_WORK`, `NARRATOR_BOOKS`, `NARRATOR_WEB`, `BOOKS_SUBDIR`, `POSITIONS_SUBDIR` (`02 - Studies`), `NOTES_SUBDIR` (`05 - Fleeting`), `KOKORO_VOICE` (`af_heart`), `KOKORO_SPEED`, `KOKORO_GAIN` (1.0), `LOOKAHEAD` (80), `PRERENDER_CHAPTERS` (2), `PREFETCH_WHILE_PAUSED`, `MAX_AUDIO_GB` (5), `MAX_CHAPTER_GB` (20), `SILENCE_S` (0.5), `WHISPER_MODEL`, `WHISPER_PROMPT`, `WHISPER_THREADS` (every core), `CHAPTER_BITRATE` (`64k`), `CHAPTER_GAP_S` (0.30), `CHAPTER_PARA_GAP_S` (0.60), `HLS_SEGMENT_S` (6), `TEXT_SHARD_BYTES`, `TEXT_SHARD_CHAPTERS`, `CHAPTER_PHRASE_GAP_S` (0.10), `HEALTH_STALL_S` (300), `AUTOPACK`, `AUTOPACK_EVERY_S`, `NARRATOR_WATCH_BOOKS`, `NARRATOR_FAKE_TTS`, `SSE_HEARTBEAT_S`, `SSE_QUEUE`, `SSE_RENDER_MIN_S`, `SSE_RETRY_MS`.
 
 New here, because the weights are not downloaded by a Python package on first use: `NARRATOR_MODELS` (`/models`), `KOKORO_MODEL`, `KOKORO_VOICES`, `WHISPER_VAD_MODEL`, `ESPEAK_BIN`, `ESPEAK_VOICE`, `ESPEAK_TIMEOUT` (15 s, seconds, after which the subprocess is killed), `QUEUE_RESUME_DELAY_S` (10 s, how long after startup a wishlist left by the last process may start rendering — the note queue's own startup sweep may be claiming one of the box's two cores). `HF_HOME` and `KOKORO_REPO` are gone — nothing here talks to Hugging Face at runtime.
 

@@ -138,6 +138,86 @@ pub fn bytes_per_minute(spec: &str) -> f64 {
 }
 
 /// concat-demuxer quoting: close the quote, escape the quote, reopen.
+/// What separates two consecutive chunks.
+///
+/// The packer used to know only two of these, and picked between them on the
+/// paragraph index alone — so a boundary that lands in the middle of a sentence
+/// got the same pause as one between two sentences. Most do not: a chunk ends a
+/// sentence. But `chunk_paragraph` splits an over-long sentence at its clauses,
+/// and the [sentence splitter's inert abbreviation
+/// guards](crate::book#quirk-1--the-abbreviation-guards-are-inert) end a chunk
+/// at `Mr.` — measured on *Lord of Mysteries*, 978 boundaries (8.8 % of the ones
+/// inside a paragraph) interrupt a phrase, 684 at a clause and 291 at an
+/// abbreviation. Those are the ones that sounded like the reader stopping
+/// mid-thought.
+///
+/// This does not move a boundary — it only decides how long the silence at one
+/// is. Fixing the boundaries themselves is a chunker change, which is a
+/// migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gap {
+    /// A new paragraph.
+    Para,
+    /// One sentence to the next.
+    Sentence,
+    /// Mid-sentence: the chunk before this one did not finish its thought.
+    Phrase,
+}
+
+impl Gap {
+    fn between(prev: &Chunk, next: &Chunk) -> Self {
+        if prev.para != next.para {
+            Self::Para
+        } else if ends_a_sentence(&prev.text) {
+            Self::Sentence
+        } else {
+            Self::Phrase
+        }
+    }
+
+    fn secs(self, cfg: &Config) -> f64 {
+        match self {
+            Self::Para => cfg.chapter_para_gap_s,
+            Self::Sentence => cfg.chapter_gap_s,
+            Self::Phrase => cfg.chapter_phrase_gap_s,
+        }
+    }
+}
+
+/// The words `app/book.py`'s `_ABBR` lists, and the single capital of an
+/// initial. In the chunker those guards are inert and stay that way — that is
+/// [quirk 1](crate::book), it is what every stored position was chunked with,
+/// and fixing it there is a migration. Here they are only being asked a much
+/// smaller question: is the `.` at the end of this chunk a full stop, or is it
+/// `Mr.`? Getting that wrong costs a pause, not a position.
+const ABBREVIATIONS: &[&str] = &[
+    "Mr", "Mrs", "Ms", "Dr", "St", "Jr", "Sr", "vs", "etc", "i.e", "e.g",
+];
+
+/// Does this chunk's text finish a sentence? Closing quotes and brackets ride
+/// after the terminator, so they are stepped over before the test.
+fn ends_a_sentence(text: &str) -> bool {
+    let t = text
+        .trim_end()
+        .trim_end_matches(['"', '\'', '\u{201D}', '\u{2019}', ')', ']']);
+    if !t.ends_with(['.', '!', '?', '\u{2026}']) {
+        return false;
+    }
+    let Some(head) = t.strip_suffix('.') else {
+        // `!`, `?` and `…` are never an abbreviation.
+        return true;
+    };
+    // `Mr.` and friends, and `Mr. A.` — a lone capital is an initial.
+    let word = head
+        .rsplit(|c: char| c.is_whitespace() || c == '\u{201C}' || c == '(')
+        .next()
+        .unwrap_or(head);
+    if word.chars().count() == 1 && word.chars().all(char::is_uppercase) {
+        return false;
+    }
+    !ABBREVIATIONS.contains(&word)
+}
+
 fn concat_line(p: &Path) -> String {
     format!("file '{}'", p.to_string_lossy().replace('\'', "'\\''"))
 }
@@ -177,11 +257,7 @@ pub fn build(
     for (i, p) in paths.iter().enumerate() {
         let d = cache::wav_info(p)?.3;
         if i > 0 {
-            t += if chunks[i].para != chunks[i - 1].para {
-                cfg.chapter_para_gap_s
-            } else {
-                cfg.chapter_gap_s
-            };
+            t += Gap::between(&chunks[i - 1], &chunks[i]).secs(cfg);
         }
         starts.push(round3(t));
         t += d;
@@ -195,19 +271,25 @@ pub fn build(
     let t0 = std::time::Instant::now();
     let result = (|| -> Result<Manifest, PackError> {
         let tmp = tempfile::tempdir()?;
+        // One silence wav per distinct gap, written once and referenced by the
+        // concat list as many times as it is needed.
         let gap_wav = tmp.path().join("gap.wav");
         let para_wav = tmp.path().join("para.wav");
+        let phrase_wav = tmp.path().join("phrase.wav");
         cache::write_silence_wav(&gap_wav, cfg.chapter_gap_s, ch_n, rate, width)?;
         cache::write_silence_wav(&para_wav, cfg.chapter_para_gap_s, ch_n, rate, width)?;
+        cache::write_silence_wav(&phrase_wav, cfg.chapter_phrase_gap_s, ch_n, rate, width)?;
 
         let mut lines = Vec::with_capacity(paths.len() * 2);
         for (i, p) in paths.iter().enumerate() {
             if i > 0 {
-                lines.push(concat_line(if chunks[i].para != chunks[i - 1].para {
-                    &para_wav
-                } else {
-                    &gap_wav
-                }));
+                lines.push(concat_line(
+                    match Gap::between(&chunks[i - 1], &chunks[i]) {
+                        Gap::Para => &para_wav,
+                        Gap::Sentence => &gap_wav,
+                        Gap::Phrase => &phrase_wav,
+                    },
+                ));
             }
             lines.push(concat_line(&p.canonicalize().unwrap_or_else(|_| p.clone())));
         }
@@ -450,6 +532,69 @@ pub fn build_hls(cfg: &Config, key: &str, ci: usize, base_url: &str) -> Result<P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ck(text: &str, para: usize) -> Chunk {
+        Chunk {
+            text: text.into(),
+            para,
+            silent: false,
+        }
+    }
+
+    #[test]
+    fn a_boundary_inside_a_sentence_gets_a_shorter_pause() {
+        // A new paragraph is still a paragraph.
+        assert_eq!(Gap::between(&ck("Done.", 0), &ck("Next.", 1)), Gap::Para);
+        // One sentence to the next.
+        assert_eq!(
+            Gap::between(&ck("Done.", 0), &ck("Next.", 0)),
+            Gap::Sentence
+        );
+        assert_eq!(
+            Gap::between(&ck("Really?", 0), &ck("Yes.", 0)),
+            Gap::Sentence
+        );
+        assert_eq!(
+            Gap::between(&ck("\u{201C}Go.\u{201D}", 0), &ck("He left.", 0)),
+            Gap::Sentence
+        );
+        // The two that sounded like stopping mid-thought: a clause split out of
+        // an over-long sentence, and the abbreviation quirk.
+        assert_eq!(
+            Gap::between(
+                &ck("an Admiralty,", 0),
+                &ck("a ship-building committee,", 0)
+            ),
+            Gap::Phrase
+        );
+        assert_eq!(
+            Gap::between(
+                &ck("If the water gushed too loudly, Mr.", 0),
+                &ck("Franky would", 0)
+            ),
+            Gap::Phrase
+        );
+        assert_eq!(
+            Gap::between(&ck("interactions with Mr. A.", 0), &ck("The Beyonders", 0)),
+            Gap::Phrase
+        );
+        assert_eq!(
+            Gap::between(&ck("Down by the river, etc.", 0), &ck("Later on.", 0)),
+            Gap::Phrase
+        );
+        // A word that merely ends in an abbreviation's letters is a sentence.
+        assert_eq!(
+            Gap::between(&ck("He was a sir.", 0), &ck("Then he left.", 0)),
+            Gap::Sentence
+        );
+    }
+
+    #[test]
+    fn the_phrase_gap_is_the_shortest_of_the_three() {
+        let cfg = Config::from_env();
+        assert!(Gap::Phrase.secs(&cfg) < Gap::Sentence.secs(&cfg));
+        assert!(Gap::Sentence.secs(&cfg) < Gap::Para.secs(&cfg));
+    }
 
     fn man(starts: Vec<f64>) -> Manifest {
         Manifest {

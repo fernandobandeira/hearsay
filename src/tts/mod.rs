@@ -132,6 +132,10 @@ impl Engine {
                 // and `KOKORO_GAIN` is how that is answered without touching the
                 // model. At the default 1.0 this is a no-op.
                 kokoro::apply_gain(&mut wav, self.gain);
+                // Kokoro hands back each utterance inside ~0.8 s of its own
+                // silence. Left in, it is added to every gap the packer
+                // inserts, and it is the larger half of both.
+                kokoro::trim_padding(&mut wav);
                 if wav.is_empty() {
                     // Nothing came back — a beat is a better chunk file than a
                     // zero-length wav, which the reader would happily "play" as

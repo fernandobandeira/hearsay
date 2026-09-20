@@ -348,6 +348,60 @@ pub fn apply_gain(samples: &mut [f32], gain: f32) {
     }
 }
 
+/// How much of a chunk's own peak still counts as silence. Kokoro's padding is
+/// digital silence and then some: measured across 92 rendered chunks of *Lord
+/// of Mysteries* on the box, the padding peaks at 1–7 of 32767 against speech
+/// peaking at ~15431 — a margin of about 2000×. Anything in this region
+/// separates them; 0.5 % is nowhere near either edge.
+const TRIM_FLOOR: f32 = 0.005;
+/// Kept either side of the speech, so a soft onset or a trailing fricative
+/// cannot be clipped by a threshold that is looking at peaks.
+const TRIM_KEEP_S: f32 = 0.025;
+
+/// Trim the silence Kokoro pads every utterance with.
+///
+/// **The gap constants were describing a quarter of the gap.** Kokoro returns
+/// each utterance inside its own silence — measured on the box's rendered
+/// chunks, a median of 0.31 s before the speech and 0.49 s after it — and
+/// nothing removed it. So two chunks packed into a chapter were separated by
+/// 0.80 s of model padding *plus* the `CHAPTER_GAP_S` the packer inserts: 1.10 s
+/// between every pair of chunks, 1.40 s at a paragraph, against a median chunk
+/// length of 8.8 s. A pause that long inside a sentence is the "it stops in the
+/// middle" this was reported as, and at a sentence boundary it is still about
+/// three times a natural one.
+///
+/// Trimming here rather than in the packer is deliberate: the reader also plays
+/// the per-chunk wavs directly while a chapter is still streaming, and that path
+/// has no packer in it.
+///
+/// This changes the *contents* of a rendered chunk, never which text is in it —
+/// no chunk index, manifest entry or stored position moves, and a chapter's
+/// manifest is computed from the durations actually on disk, so a cache holding
+/// both trimmed and untrimmed wavs stays correct.
+pub fn trim_padding(samples: &mut Vec<f32>) {
+    let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    if !peak.is_finite() || peak <= 0.0 {
+        return;
+    }
+    // At least one step of the s16 these are written as: below that there is
+    // nothing to hear however the threshold is scaled.
+    let floor = (peak * TRIM_FLOOR).max(1.0 / 32767.0);
+    let Some(first) = samples.iter().position(|s| s.abs() > floor) else {
+        return;
+    };
+    let Some(last) = samples.iter().rposition(|s| s.abs() > floor) else {
+        return;
+    };
+    let keep = (TRIM_KEEP_S * SR as f32) as usize;
+    let end = last.saturating_add(keep + 1).min(samples.len());
+    let start = first.saturating_sub(keep);
+    if start == 0 && end == samples.len() {
+        return;
+    }
+    samples.truncate(end);
+    samples.drain(..start);
+}
+
 /// f32 -> s16, the conversion `soundfile.write(path, wav, 24000)` does for a
 /// 16-bit PCM wav. Clamped, because Kokoro can overshoot by a hair.
 pub fn to_i16(samples: &[f32]) -> Vec<i16> {
@@ -468,6 +522,59 @@ mod tests {
         assert!((near[0] - 1.26_f32).abs() > 0.2, "the knee did its work");
         assert!(near.iter().all(|v| *v <= 1.0 && *v > KNEE));
         assert!(near[1] >= near[0] && near[2] >= near[1]);
+    }
+
+    #[test]
+    fn trimming_removes_the_padding_and_keeps_the_speech() {
+        let sr = SR as usize;
+        let keep = (TRIM_KEEP_S * SR as f32) as usize;
+        let mut w = vec![0.0f32; sr]; // 1 s of silence
+                                      // 100 ms of "speech" in the middle.
+        for s in w.iter_mut().skip(sr / 2).take(sr / 10) {
+            *s = 0.5;
+        }
+        let n = w.len();
+        trim_padding(&mut w);
+        assert_eq!(w.len(), sr / 10 + 2 * keep, "kept the pad either side");
+        assert!(w.len() < n / 2);
+        // Every sample of the speech survived, at full amplitude.
+        assert_eq!(w.iter().filter(|s| **s == 0.5).count(), sr / 10);
+    }
+
+    #[test]
+    fn trimming_never_eats_a_whole_chunk() {
+        // Digital silence: nothing to find, so nothing is done.
+        let mut all_quiet = vec![0.0f32; 1000];
+        trim_padding(&mut all_quiet);
+        assert_eq!(all_quiet.len(), 1000);
+        // Empty stays empty rather than panicking.
+        let mut empty: Vec<f32> = Vec::new();
+        trim_padding(&mut empty);
+        assert!(empty.is_empty());
+        // Speech edge to edge is returned untouched.
+        let mut full = vec![0.4f32; 1000];
+        trim_padding(&mut full);
+        assert_eq!(full.len(), 1000);
+        // A single loud sample still leaves a chunk, not nothing.
+        let mut spike = vec![0.0f32; 1000];
+        spike[500] = 1.0;
+        trim_padding(&mut spike);
+        assert!(!spike.is_empty());
+        assert!(spike.contains(&1.0));
+    }
+
+    /// The threshold is relative to the chunk's own peak, so a quiet chunk is
+    /// trimmed like a loud one rather than being erased by an absolute floor.
+    #[test]
+    fn trimming_scales_with_the_chunk() {
+        let sr = SR as usize;
+        let mut quiet = vec![0.0f32; sr];
+        for s in quiet.iter_mut().skip(sr / 2).take(sr / 10) {
+            *s = 0.01;
+        }
+        trim_padding(&mut quiet);
+        assert_eq!(quiet.iter().filter(|s| **s == 0.01).count(), sr / 10);
+        assert!(quiet.len() < sr / 2);
     }
 
     #[test]
