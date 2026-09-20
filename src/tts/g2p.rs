@@ -36,10 +36,11 @@ const MARKS: &[char] = &[
 /// misaki `EspeakFallback.E2M`, longest key first (the table is applied in that
 /// order there too, via `sorted(key=lambda kv: -len(kv[0]))`).
 const E2M: &[(&str, &str)] = &[
-    ("\u{294}\u{32C}n\u{329}", "\u{294}n"), // 'ʔˌn̩'
+    // 'ʔˌn̩' — the mark between is U+02CC, espeak-ng's secondary stress, not
+    // U+032C, a combining caron below. With the wrong one this never matched
+    // and a glottalised syllabic n kept a stray schwa.
+    ("\u{294}\u{2CC}n\u{329}", "\u{294}n"),
     ("\u{294}n\u{329}", "\u{294}n"),
-    ("\u{2B2}o", "jo"),
-    ("\u{2B2}\u{259}", "j\u{259}"),
     ("a^\u{26A}", "I"),
     ("a^\u{28A}", "W"),
     ("d^\u{292}", "\u{2A4}"),
@@ -47,6 +48,8 @@ const E2M: &[(&str, &str)] = &[
     ("t^\u{283}", "\u{2A7}"),
     ("\u{254}^\u{26A}", "Y"),
     ("\u{259}^l", "\u{1D4A}l"),
+    ("\u{2B2}o", "jo"),
+    ("\u{2B2}\u{259}", "j\u{259}"),
     ("\u{2B2}", ""),
     ("\u{25A}", "\u{259}\u{279}"),
     ("e", "A"),
@@ -107,13 +110,26 @@ impl Phonemizer {
 
     /// Phonemize one chunk of text, preserving the punctuation between runs.
     pub fn phonemize(&self, text: &str) -> Result<String, TtsError> {
+        // Numbers first: espeak-ng reads currency and years wrong, and the
+        // rewrite is in words, so everything after this is ordinary text.
+        let text = crate::tts::numbers::normalize(text);
         let mut out = String::new();
-        for seg in split_punctuation(text) {
+        for seg in split_punctuation(&text) {
             match seg {
                 Segment::Mark(c) => out.push(c),
+                // The space either side of a run of words is a word boundary
+                // and Kokoro has a symbol for it, but espeak-ng does not put
+                // one back — so `begin, he said` came out as `bɪɡˈɪn,hi sˈɛd`
+                // with the two words run together across the comma.
                 Segment::Words(w) => {
+                    if w.starts_with(char::is_whitespace) {
+                        out.push(' ');
+                    }
                     let ipa = self.espeak(w)?;
                     out.push_str(&map_ipa(&ipa));
+                    if w.ends_with(char::is_whitespace) {
+                        out.push(' ');
+                    }
                 }
             }
         }
@@ -124,7 +140,8 @@ impl Phonemizer {
         if text.trim().is_empty() {
             return Ok(String::new());
         }
-        let out = self.run(&["-q", "--ipa=2", "-v", &self.voice, "--", text])?;
+        let text = apply_overrides(text);
+        let out = self.run(&["-q", "--ipa=2", "-v", &self.voice, "--", &text])?;
         if !out.status.success() {
             return Err(TtsError::Espeak(format!(
                 "espeak-ng exited {}: {}",
@@ -259,6 +276,76 @@ fn wait_deadline(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     }
 }
 
+/// The override table: words espeak-ng gets wrong often enough to be worth
+/// saying outright, spelled in espeak-ng's own phoneme alphabet.
+///
+/// This is the small version of the lexicon this front end does not have.
+/// Kokoro's real G2P looks a word up in misaki's gold lexicon first and only
+/// falls back to espeak-ng; here everything goes to espeak-ng, and for `I` that
+/// is audibly wrong. espeak-ng applies sentence prosody and de-stresses a
+/// subject pronoun — `I think it is fine` phonemizes to `a͡ɪ θˈɪŋk …` with no
+/// stress mark at all — where misaki's lexicon says `ˈI` unconditionally.
+/// Kokoro renders the difference as 60 ms at half the amplitude of the word
+/// after it, against 120 ms at full amplitude, which is why it sounds like the
+/// `I` was skipped at the start of a sentence.
+///
+/// The substitution is espeak-ng's own `[[…]]` escape rather than a separate
+/// call per word, which matters: it forces the pronunciation of exactly one
+/// word and leaves the rest of the sentence in one utterance, so every
+/// neighbour keeps the stress espeak-ng chose for it. Phonemizing the word on
+/// its own instead would make each fragment a fresh utterance and give the
+/// words around it citation stress.
+///
+/// Grow it a word at a time, with a test, when one is actually reported wrong.
+const OVERRIDES: &[(&str, &str)] = &[("I", "'aI")];
+
+/// Replace whole words in the override table with their `[[…]]` escapes.
+///
+/// A word here is a run of alphanumerics *and apostrophes*, so `I'm` is one
+/// word and does not match `I` — espeak-ng reads `[['aI]]'m` as "I em".
+fn apply_overrides(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut out: Option<String> = None;
+    let mut last = 0usize;
+    for (start, end) in word_spans(text) {
+        let Some((_, ps)) = OVERRIDES.iter().find(|(w, _)| *w == &text[start..end]) else {
+            continue;
+        };
+        let o = out.get_or_insert_with(|| String::with_capacity(text.len() + 8));
+        o.push_str(&text[last..start]);
+        o.push_str("[[");
+        o.push_str(ps);
+        o.push_str("]]");
+        last = end;
+    }
+    match out {
+        None => std::borrow::Cow::Borrowed(text),
+        Some(mut o) => {
+            o.push_str(&text[last..]);
+            std::borrow::Cow::Owned(o)
+        }
+    }
+}
+
+fn word_spans(text: &str) -> Vec<(usize, usize)> {
+    let is_word = |c: char| c.is_alphanumeric() || c == '\'' || c == '\u{2019}';
+    let mut spans = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        match (is_word(c), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                spans.push((s, i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        spans.push((s, text.len()));
+    }
+    spans
+}
+
 enum Segment<'a> {
     Words(&'a str),
     Mark(char),
@@ -270,7 +357,7 @@ fn split_punctuation(text: &str) -> Vec<Segment<'_>> {
     let mut out = Vec::new();
     let mut start = 0usize;
     for (i, c) in text.char_indices() {
-        if MARKS.contains(&c) {
+        if MARKS.contains(&c) && !inside_a_number(text, i, c) {
             if i > start {
                 out.push(Segment::Words(&text[start..i]));
             }
@@ -282,6 +369,27 @@ fn split_punctuation(text: &str) -> Vec<Segment<'_>> {
         out.push(Segment::Words(&text[start..]));
     }
     out
+}
+
+/// Is this `,`, `.` or `:` part of a number rather than punctuation?
+///
+/// Splitting there is what turned `1,000` into "one, zero zero zero", `1.8`
+/// into "one. eight" and `3:45` into "three: forty-five": each half went to
+/// espeak-ng as its own utterance with a spoken pause between them, and a
+/// bare `000` is three zeroes. espeak-ng reads all three correctly when it is
+/// handed the whole number, so the fix is to stop taking them apart — a
+/// separator is only punctuation when it is *not* between two digits.
+///
+/// Deliberately strict about "between": the digits have to be immediately
+/// either side, so a sentence ending in a year keeps its full stop and
+/// `page 12, line 3` keeps its comma.
+fn inside_a_number(text: &str, i: usize, c: char) -> bool {
+    if !matches!(c, ',' | '.' | ':') {
+        return false;
+    }
+    let before = text[..i].chars().next_back();
+    let after = text[i + c.len_utf8()..].chars().next();
+    matches!((before, after), (Some(a), Some(b)) if a.is_ascii_digit() && b.is_ascii_digit())
 }
 
 /// misaki's `EspeakFallback.__call__`, minus the phonemizer plumbing.
@@ -366,6 +474,71 @@ mod tests {
             })
             .collect();
         assert_eq!(rendered, "a, b. c");
+    }
+
+    fn rendered(text: &str) -> String {
+        split_punctuation(text)
+            .iter()
+            .map(|s| match s {
+                Segment::Words(w) => (*w).to_string(),
+                Segment::Mark(c) => format!("<{c}>"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_separator_between_two_digits_is_part_of_the_number() {
+        // The bug: each of these went to espeak-ng in halves, so `1,000` was
+        // read "one, zero zero zero" and `1.8` was read "one. eight".
+        assert_eq!(
+            rendered("There were 1,000 of them"),
+            "There were 1,000 of them"
+        );
+        assert_eq!(rendered("He was 1.8 meters"), "He was 1.8 meters");
+        assert_eq!(rendered("It was 3:45"), "It was 3:45");
+        assert_eq!(rendered("$1,500.50 a year"), "$1,500.50 a year");
+        assert_eq!(rendered("1,000,000"), "1,000,000");
+    }
+
+    #[test]
+    fn a_separator_that_is_not_between_two_digits_still_splits() {
+        assert_eq!(rendered("In 2016."), "In 2016<.>");
+        assert_eq!(rendered("page 12, line 3"), "page 12<,> line 3");
+        assert_eq!(rendered("Chapter 1. The start"), "Chapter 1<.> The start");
+        assert_eq!(
+            rendered("He turned 40. 5 minutes on"),
+            "He turned 40<.> 5 minutes on"
+        );
+        assert_eq!(rendered("a, b. c"), "a<,> b<.> c");
+        // Not every mark is a number separator.
+        assert_eq!(rendered("1;2"), "1<;>2");
+    }
+
+    #[test]
+    fn overrides_only_match_whole_words() {
+        assert_eq!(apply_overrides("I think"), "[['aI]] think");
+        assert_eq!(apply_overrides("so I think"), "so [['aI]] think");
+        assert_eq!(
+            apply_overrides("But I saw, and I knew"),
+            "But [['aI]] saw, and [['aI]] knew"
+        );
+        // `[['aI]]'m` is read "I em", and there is no `I` inside `It` or `aIr`.
+        for untouched in ["I'm sure", "It is fine", "an Idea", "hI", "I\u{2019}ll go"] {
+            assert_eq!(apply_overrides(untouched), untouched);
+        }
+        // Nothing to do is the borrowed path.
+        assert!(matches!(
+            apply_overrides("nothing here"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// misaki sorts `E2M` by descending key length and applies it in that
+    /// order, so a longer pattern always wins over a shorter one it contains.
+    #[test]
+    fn the_mapping_table_is_longest_key_first() {
+        let lens: Vec<usize> = E2M.iter().map(|(k, _)| k.chars().count()).collect();
+        assert!(lens.windows(2).all(|w| w[0] >= w[1]), "{lens:?}");
     }
 
     #[test]
@@ -455,6 +628,49 @@ mod tests {
         assert!(ps.ends_with('.'), "{ps}");
         assert!(ps.len() > 8, "{ps}");
         assert_eq!(ps, g.phonemize("hello there, judge.").expect("again"));
+        // A mark does not glue the words either side of it together.
+        assert!(ps.contains(", "), "{ps}");
+    }
+
+    /// The three defects this module had, against the real binary. Skipped
+    /// where espeak-ng is not installed, like every other test that needs it.
+    #[test]
+    fn a_real_espeak_reads_numbers_and_reduced_vowels_and_i() {
+        let g = Phonemizer::new("en-us");
+        if g.probe().is_err() {
+            eprintln!("skipping: no espeak-ng");
+            return;
+        }
+        // "one thousand", not "one, zero zero zero".
+        let thousand = g.phonemize("1,000").expect("phonemize");
+        assert!(!thousand.contains(','), "{thousand}");
+        assert_eq!(thousand, g.phonemize("one thousand").expect("phonemize"));
+        // "one point eight", not "one. eight". Compared without the stress
+        // marks, which espeak-ng places differently on digits and on words.
+        let unstressed = |s: &str| s.replace(['\u{2C8}', '\u{2CC}'], "");
+        let decimal = g.phonemize("1.8").expect("phonemize");
+        assert!(!decimal.contains('.'), "{decimal}");
+        assert_eq!(
+            unstressed(&decimal),
+            unstressed(&g.phonemize("one point eight").expect("phonemize"))
+        );
+
+        // The reduced vowel survives into the token stream instead of being
+        // dropped, which is the difference between "before" and "fore".
+        let before = g.phonemize("before").expect("phonemize");
+        assert!(before.contains('\u{1D7B}'), "{before}");
+        assert_eq!(
+            crate::tts::kokoro::tokenize(&before).len(),
+            before.chars().count(),
+            "{before} lost a symbol"
+        );
+
+        // espeak-ng honours the `[[...]]` escape, so `I` keeps its stress at
+        // the head of a sentence where espeak-ng would otherwise drop it.
+        let stressed = g.phonemize("I think it is fine.").expect("phonemize");
+        assert!(stressed.starts_with('\u{2C8}'), "{stressed}");
+        assert!(!stressed.contains('['), "escape not honoured: {stressed}");
+        assert!(!stressed.contains(']'), "escape not honoured: {stressed}");
     }
 
     #[test]

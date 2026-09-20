@@ -22,6 +22,10 @@ hound = "3"
 mime_guess = "2"
 ndarray = "0.16"
 notify = "8"
+# Years, for the text normalizer: `1066` is "ten sixty-six", not "one thousand
+# sixty six". The same algorithm as the Python package misaki imports, and
+# verified byte-identical to it for every year from 1000 to 2100.
+num2words = "1.2"
 ort = { version = "=2.0.0-rc.10", features = ["ndarray", "download-binaries"] }
 percent-encoding = "2"
 scraper = "0.23"

@@ -14,6 +14,7 @@
 
 pub mod g2p;
 pub mod kokoro;
+pub mod numbers;
 
 use std::sync::{Mutex, OnceLock};
 

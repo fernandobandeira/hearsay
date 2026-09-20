@@ -147,7 +147,7 @@ const VOCAB: &[(char, i64)] = &[
     ('\u{2192}', 171),
     ('\u{2197}', 172),
     ('\u{2198}', 173),
-    ('\u{1DFB}', 177),
+    ('\u{1D7B}', 177),
 ];
 
 fn token_id(c: char) -> Option<i64> {
@@ -373,6 +373,43 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for (c, _) in VOCAB {
             assert!(seen.insert(*c), "duplicate symbol {c:?}");
+        }
+    }
+
+    /// espeak-ng's reduced vowel, which it puts in the unstressed syllable of
+    /// roughly one English word in eight — `before`, `roses`, `wanted`,
+    /// `believe`. It is the last entry in Kokoro's vocabulary and it was
+    /// transcribed here as U+1DFB, a combining deletion mark, instead of
+    /// U+1D7B. `tokenize` drops what it cannot map, so every one of those
+    /// syllables lost its vowel and "before" came out as "fore".
+    #[test]
+    fn the_reduced_vowel_is_a_symbol_the_model_has() {
+        assert_eq!(token_id('\u{1D7B}'), Some(177));
+        assert_eq!(tokenize("b\u{1D7B}f\u{2C8}\u{254}\u{279}").len(), 6);
+    }
+
+    /// The vocabulary is inlined as model contract, which means nothing checks
+    /// it against the model unless something does it here. Skipped where the
+    /// weights are not fetched, which is every machine the suite runs on in CI.
+    #[test]
+    fn the_inlined_vocabulary_matches_the_shipped_tokenizer() {
+        let p = std::path::Path::new("models/kokoro/tokenizer.json");
+        let Ok(raw) = std::fs::read_to_string(p) else {
+            eprintln!("skipping: no {}", p.display());
+            return;
+        };
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("tokenizer.json");
+        let vocab = doc["model"]["vocab"]
+            .as_object()
+            .expect("model.vocab object");
+        assert_eq!(vocab.len(), VOCAB.len(), "entry count");
+        for (sym, id) in vocab {
+            let mut cs = sym.chars();
+            let (Some(c), None) = (cs.next(), cs.next()) else {
+                panic!("{sym:?} is not one character");
+            };
+            let want = id.as_i64().expect("integer id");
+            assert_eq!(token_id(c), Some(want), "U+{:04X} {c:?}", c as u32);
         }
     }
 

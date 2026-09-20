@@ -15,6 +15,7 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `src/book.rs` | EPUB → render plan. A **bug-for-bug** port of `app/book.py`: spine order, sentence-aware chunking at `max_chars` 300, `is_speakable()` silent beats. See [chunking parity](#chunking-parity-the-one-that-cannot-move). |
 | `src/tts/g2p.rs` | Text → Kokoro phonemes: espeak-ng as a **subprocess**, then misaki's `EspeakFallback` character mapping verbatim. |
 | `src/tts/kokoro.rs` | Kokoro-82M v1.0 fp32 ONNX through `ort`. The 178-symbol vocabulary is inlined as model contract; the voice pack is 510 style vectors indexed by phoneme count. |
+| `src/tts/numbers.rs` | The text normalizer: currency and years into English words before espeak-ng sees them, ported from misaki's `Lexicon.get_number`. See [numbers](#numbers-srcttsnumbersrs). |
 | `src/tts/mod.rs` | `Engine`: lazy load, never fatal, plus the deterministic fake (`NARRATOR_FAKE_TTS=1`) the whole test suite renders with. |
 | `src/stt.rs` | whisper.cpp via `whisper-rs`: `large-v3-turbo-q5_0`, CPU, one transcription at a time, ffmpeg decoding the webm, silero VAD when its model is present. |
 | `src/cache.rs` | `work/audio/<key>/chNNN/IIIII.wav` and `gc_audio`. |
@@ -44,7 +45,7 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 ./narrator web           # npm ci && npm run build in web/ (dev serves web/dist)
 ./narrator dev           # cargo run, serving ./web and ./work
 ./narrator build && ./narrator up     # docker, port 7870 on localhost only
-./narrator test          # the whole suite: 139 tests, no model, no network
+./narrator test          # the whole suite: 192 tests, no model, no network
 ./narrator lint          # rustfmt --check + clippy -D warnings
 ./narrator client        # regenerate openapi.json + web/src/client
 ./narrator export --book books/Title.epub [--partial]   # the cache → a .m4b
@@ -601,6 +602,118 @@ gap widths are the python script's flags, spelled the same way.
 
 **G2P is the fallback half of misaki, not all of it.** Kokoro's real front end looks English words up in a lexicon first and only falls back to espeak-ng; this implements the fallback for every word, with misaki's `EspeakFallback.E2M` mapping table verbatim. Measured cost on the GATE 0 passage: 269.25 s against the PyTorch render's 271.57 s (0.9 %), with per-chunk boundaries lining up.
 
+**What it was getting wrong, and what fixed them.** All reported by ear, all
+confirmed against the reference, and none of them a chunking change — the chunk
+text, the chunk indices, the manifests and every stored position are untouched.
+What changes is the audio, so a chapter already in the cache keeps the old
+pronunciation until it is re-rendered; see [what has not been
+proven](#what-has-and-has-not-been-proven).
+
+The reference for all of it is misaki itself, which is sitting in the uv cache
+the python repo already populated — `misaki/espeak.py` and `misaki/en.py`. Two
+of these were found by diffing this module against that file rather than by
+guessing.
+
+- **One English word in eight lost a vowel.** `ᵻ` (U+1D7B) is espeak-ng's
+  reduced vowel and the last entry in Kokoro's vocabulary; the inlined `VOCAB`
+  had it transcribed as U+1DFB, a combining deletion mark — a transposition, one
+  wrong entry out of 115. `tokenize` drops what it cannot map, silently and by
+  design, so the vowel never reached the model: `before` was synthesized as
+  `bfˈɔɹ` and came out "fore", `roses` as `ɹˈOzz`, `wanted` as `wˈɔntd`.
+  Synthesizing `bᵻfˈɔɹ` and `bfˈɔɹ` produced byte-identical audio, which is the
+  proof the character was never getting through. Measured over 3652 words, `ᵻ`
+  was the **only** symbol being dropped and it was dropped 446 times. Now there
+  are two tests: one on the symbol, and one that checks the whole inlined
+  vocabulary against `models/kokoro/tokenizer.json` where the weights are
+  fetched — the vocabulary is model contract, and nothing had ever compared it
+  to the model.
+- **`E2M`'s first entry never matched.** The same class of typo: misaki's key is
+  `ʔ` + U+02CC (espeak-ng's secondary stress) + `n̩`, and it was transcribed with
+  U+032C, a combining caron below. A glottalised syllabic `n` kept a stray schwa
+  and a stray stress mark instead of collapsing to `ʔn`. The table is now
+  asserted to be longest-key-first, which is the ordering misaki's
+  `sorted(key=lambda kv: -len(kv[0]))` guarantees and which two entries were out
+  of.
+- **`I` was dropped at the head of a sentence.** espeak-ng applies sentence
+  prosody and de-stresses a subject pronoun — `I think it is fine` phonemizes to
+  `a͡ɪ θˈɪŋk …`, no stress mark — where misaki's `us_gold.json` says `ˈI`, full
+  stop, and its `cap_stresses` leaves a capitalised word's primary stress alone.
+  Kokoro renders the difference as 60 ms at half the amplitude of the word after
+  it, against 120 ms at full amplitude, which is why it sounded skipped. That is
+  also the argument for forcing it rather than trusting espeak-ng's prosody:
+  every `I` in Kokoro's training input carried `ˈ`, so `ˈI` is the distribution
+  the model was fitted on. This is **the small override table** the paragraph
+  below has been promising: `OVERRIDES` in `src/tts/g2p.rs`, one entry today,
+  applied as espeak-ng's own `[[…]]` inline escape rather than a separate call
+  per word. That distinction is load-bearing — the escape forces one word's
+  pronunciation and leaves the sentence a single utterance, so `so I think`
+  keeps `sˌO`'s secondary stress, where phonemizing `I` on its own would make
+  each fragment a fresh utterance and give every neighbour citation stress.
+  Whole-word matching counts the apostrophe as part of the word, because
+  `[['aI]]'m` is read "I em".
+- **A word boundary was being eaten.** espeak-ng does not put back the space
+  around a run of words, so `Before we begin, he said` came out `bɪɡˈɪn,hi sˈɛd`
+  with the two words run together across the comma. Kokoro has a symbol for the
+  space and misaki's output always carries one.
+
+### Numbers: `src/tts/numbers.rs`
+
+**espeak-ng expands digits itself, and is good at it.** `1,000` is "one
+thousand", `1433` is "one thousand four hundred thirty three", `1.8` is "one
+point eight", `1st` is "first", `50%` is "fifty percent", `3:45` is "three
+forty-five". All of that is left alone — a second implementation of something
+already right is only a second thing to get wrong.
+
+What it was never given a chance at was the number itself. `split_punctuation`
+treated every `,` `.` `:` as prosody, so espeak-ng got the halves as separate
+utterances with a spoken pause between them: `1,000` was read "one, zero zero
+zero", `1.8` was "one. eight", `3:45` was "three: forty-five". A separator is
+now punctuation only when it is *not* between two digits, strictly — a digit
+immediately either side, so `In 2016.` keeps its full stop and `page 12, line 3`
+keeps its comma, because espeak-ng breaks the clause there itself and should.
+
+**Two readings espeak-ng gets wrong even with the whole number**, and both are
+fixed the way misaki does it, because misaki is Kokoro's real front end and this
+is the half of `Lexicon.get_number` that does not need a POS tagger:
+
+| | espeak-ng alone | now |
+|---|---|---|
+| `$5` | "dollar five" | "five dollars" |
+| `$1,500.50` | "dollar one, five hundred. fifty" | "one thousand five hundred dollars and fifty cents" |
+| `£1.50` | "pound one. fifty" | "one pound and fifty pence" |
+| `$1.5 million` | "dollar one point five million" | "one point five million dollars" |
+| `1066` | "one thousand sixty six" | "ten sixty-six" |
+| `1985` | "nineteen hundred eighty five" | "nineteen eighty-five" |
+| `1990s` | "nineteen hundred ninety z" | "nineteen nineties" |
+
+Currency is misaki's `CURRENCIES` table and its zero-half rule (`$0.50` is "fifty
+cents", not "zero dollars and fifty cents"); the amount stays in digits and
+espeak-ng expands it, because espeak-ng's cardinal is already what misaki's
+`extend_num` produces. Years are the **`num2words` crate**, which is the same
+algorithm as the Python package misaki imports — its year output was checked
+against the Python for every year from 1000 to 2100 and is byte-identical across
+the range. It is one small pure-Rust dependency and one transitive one, and it
+buys the part that is fiddly to get right by hand: "eighteen oh-five",
+"nineteen hundred", "two thousand", "ten sixty-six".
+
+Two deliberate departures from misaki, both because the question here is what a
+person would say rather than what the reference does:
+
+- **`$1.5` is an amount, not one dollar and five cents.** misaki splits on any
+  fraction of fewer than three digits; hundredths here need exactly two. And a
+  scale word after the amount moves the unit to the end, which misaki cannot do
+  because it phonemizes token by token and never sees the next word.
+- **The year reading is bounded, and only for a number standing on its own.**
+  misaki applies it to *any* four-digit number, which turns `9999` into
+  "ninety-nine ninety-nine"; here it is 1000–2099, and a group joined to more
+  digits by `-`, `/` or `:` is left alone, so `555-1066` and `1050-1066` stay
+  numbers. Inside that it is still misaki's rule and still a heuristic: `1433
+  chapters` becomes "fourteen thirty-three chapters", because nothing here knows
+  the difference between a year and a count. Four-digit numbers in prose are
+  overwhelmingly years, which is why misaki bets that way and why this does too
+  — but it is the one reading in this module that is a guess rather than a fact,
+  and the one to narrow if a book starts reading its counts as dates.
+
 **The lexicon half: what a port would take, and why it has not been done.** It is
 not a lookup table. misaki's `en.G2P` is a ~1200-line front end around two gold
 lexicons (`us_gold.json` + `us_silver.json`, ~4 MB of JSON) plus:
@@ -616,10 +729,14 @@ guesses from context. So a faithful port is a POS tagger in Rust or an ONNX
 export of one, plus number expansion, plus the stress rules: days of work, a
 ~16 MB asset addition to the image, and a new class of divergence from the
 Python render to test against. **Not attempted**, deliberately. The measured
-difference today is 0.9 % of duration with boundaries lining up, and no word has
-actually been reported as wrong. If one ever is, the cheap fix is a small
-override table (a JSON map of word → phonemes consulted before espeak-ng),
-which is an afternoon and carries none of the above.
+difference today is 0.9 % of duration with boundaries lining up, and the words
+that have been reported wrong were all fixed above without it. Number expansion
+turned out to be mostly espeak-ng's job already, with misaki's currency and year
+rules ported on top of it; the one lexicon difference that mattered (`I`) is one
+line of `OVERRIDES`. That table is the cheap fix this paragraph used to promise,
+and it is where the next word goes: add it with a test. What is still missing is
+only the tagger — `read`, `lead`, `live`, `bow`, `close`, `record` — and none of
+the above is needed until the override list is long enough to be a lexicon.
 
 **`KOKORO_GAIN`, and the delta it exists for.** The ONNX render is uniformly
 ~1.4× louder (≈ +3 dB) than `work/kokoro-test/kokoro_af_heart.wav` — same timing,
@@ -920,6 +1037,19 @@ This server *is* production: the box runs the published arm64 image, the reader
 runs against it, and the cache and the vault it adopted are the same ones the
 python server left. What that sentence does not cover:
 
+- **The pronunciation fixes have not been heard.** The defects in
+  [the engine notes](#engine-notes) are proven gone at the phoneme and token
+  level, the number readings are asserted as text, and the suite checks all of
+  it against the real binary — but nobody has listened to a chapter rendered
+  with them. They also make the cache
+  inconsistent with itself: every chunk already on the box was rendered with the
+  reduced vowel missing and the numbers spelled out digit by digit, so a book
+  mid-render changes pronunciation at the frontier. Positions, chunk indices and
+  manifests are untouched — this is not a chunker migration — so the way to
+  collect the fix on an already-rendered book is to delete its `work/audio/<key>`
+  and its packed chapters and let the worker fill them in again, which on the A1
+  is the overnight job [the A1 numbers](#the-a1-measured) describe. That is
+  Fernando's call to make per book.
 - **The listening verdict is Fernando's and has not been given.** GATE 0 is
   rendered and waiting (`./narrator listen-test`), and the ≈ +3 dB delta above is
   still undecided — which is why `KOKORO_GAIN` exists and is **not** set on the
