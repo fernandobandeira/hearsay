@@ -650,7 +650,10 @@ guessing.
   keeps `sˌO`'s secondary stress, where phonemizing `I` on its own would make
   each fragment a fresh utterance and give every neighbour citation stress.
   Whole-word matching counts the apostrophe as part of the word, because
-  `[['aI]]'m` is read "I em".
+  `[['aI]]'m` is read "I em". The escape is espeak-ng's own syntax and so the
+  one version-dependent thing in this module: verified against 1.52 on the
+  desktop and against **1.51**, which is what `debian:bookworm-slim` carries and
+  what the box runs.
 - **A word boundary was being eaten.** espeak-ng does not put back the space
   around a run of words, so `Before we begin, he said` came out `bɪɡˈɪn,hi sˈɛd`
   with the two words run together across the comma. Kokoro has a symbol for the

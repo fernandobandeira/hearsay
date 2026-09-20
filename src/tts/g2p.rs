@@ -296,6 +296,11 @@ fn wait_deadline(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
 /// its own instead would make each fragment a fresh utterance and give the
 /// words around it citation stress.
 ///
+/// The escape is the one thing here that depends on espeak-ng's own syntax, so
+/// it is checked against the binary rather than assumed: verified on 1.52
+/// (this desktop) and on **1.51**, which is what the bookworm-slim runtime
+/// carries and what the box actually runs.
+///
 /// Grow it a word at a time, with a test, when one is actually reported wrong.
 const OVERRIDES: &[(&str, &str)] = &[("I", "'aI")];
 
