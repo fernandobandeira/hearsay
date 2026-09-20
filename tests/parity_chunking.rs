@@ -10,8 +10,8 @@
 use std::path::{Path, PathBuf};
 
 use narrator::book::{
-    build_plan, chunk_paragraph, est_chapter_s, est_chunk_s, extract_chapters, is_speakable,
-    sentences, Chapter,
+    build_plan_with, chunk_paragraph, est_chapter_s, est_chunk_s, extract_chapters, is_speakable,
+    sentences, Chapter, Guards,
 };
 use serde::Deserialize;
 
@@ -34,6 +34,91 @@ struct ChunkCase {
     chunks: Vec<String>,
 }
 
+/// The one place this crate deliberately parts company with `app/book.py`.
+///
+/// Python's `_ABBR` guards are inert — the lookbehinds sit *before*
+/// `(?<=[.!?])`, so each tests the two characters ending at the split point and
+/// never the abbreviation — and `Dr. Smith` splits in two. That put a chunk
+/// boundary, a full stop's worth of silence and a sentence-final fall in the
+/// middle of a name, and the migration that fixed it is written up in
+/// AGENTS.md.
+///
+/// The golden fixture is **not** re-blessed: it is what the python produces and
+/// saying otherwise would make it worthless. Instead every case that moved is
+/// listed here with what this chunker now does, so the divergence is exactly
+/// this long and a change to any *other* case is still a failure. Ten cases
+/// moved, and all ten are abbreviations.
+const DIVERGES: &[(&str, &[&str], &[&str])] = &[
+    (
+        "Dr. Smith went home. He slept.",
+        &["Dr. Smith went home.", "He slept."],
+        &["Dr. Smith went home. He slept."],
+    ),
+    (
+        "Mr. Brown and Mrs. Green and Ms. White met.",
+        &["Mr. Brown and Mrs. Green and Ms. White met."],
+        &["Mr. Brown and Mrs. Green and Ms. White met."],
+    ),
+    (
+        "It was St. Peter, Jr. and Sr. together.",
+        &["It was St. Peter, Jr. and Sr. together."],
+        &["It was St. Peter, Jr. and Sr. together."],
+    ),
+    (
+        "Cats vs. dogs. That is the question.",
+        &["Cats vs. dogs.", "That is the question."],
+        &["Cats vs. dogs. That is the question."],
+    ),
+    (
+        "Tokenizers, e.g. this one, are slow.",
+        &["Tokenizers, e.g. this one, are slow."],
+        &["Tokenizers, e.g. this one, are slow."],
+    ),
+    (
+        "Tokenizers, i.e. this one, are slow.",
+        &["Tokenizers, i.e. this one, are slow."],
+        &["Tokenizers, i.e. this one, are slow."],
+    ),
+    (
+        "Bananas, apples, etc. were on the list.",
+        &["Bananas, apples, etc. were on the list."],
+        &["Bananas, apples, etc. were on the list."],
+    ),
+    ("See Dr. Smith.", &["See Dr. Smith."], &["See Dr. Smith."]),
+    ("vs. that", &["vs. that"], &["vs. that"]),
+    ("e.g. this", &["e.g. this"], &["e.g. this"]),
+];
+
+fn diverges(input: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    DIVERGES
+        .iter()
+        .find(|(i, _, _)| *i == input)
+        .map(|(_, s, c)| (*s, *c))
+}
+
+#[test]
+fn every_divergence_from_python_is_an_abbreviation_and_is_listed() {
+    let cases: Vec<ChunkCase> = read_json("chunking_cases.json");
+    let listed: Vec<&str> = DIVERGES.iter().map(|(i, _, _)| *i).collect();
+    // Nothing in the list is stale: each one really is still in the fixture and
+    // really does still differ from what python wrote.
+    for input in &listed {
+        let c = cases
+            .iter()
+            .find(|c| c.input == *input)
+            .unwrap_or_else(|| panic!("{input:?} is no longer in the fixture"));
+        assert_ne!(
+            (sentences(&c.input), chunk_paragraph(&c.input, c.max_chars)),
+            (c.sentences.clone(), c.chunks.clone()),
+            "{input:?} no longer diverges — take it off the list"
+        );
+    }
+    // And the divergence really is only ever about a `.` after an abbreviation.
+    for (input, _, _) in DIVERGES {
+        assert!(input.contains('.'), "{input:?} is not an abbreviation case");
+    }
+}
+
 #[test]
 fn sentence_splitting_and_chunking_match_python_exactly() {
     let cases: Vec<ChunkCase> = read_json("chunking_cases.json");
@@ -43,6 +128,23 @@ fn sentence_splitting_and_chunking_match_python_exactly() {
         let got_s = sentences(&c.input);
         let got_c = chunk_paragraph(&c.input, c.max_chars);
         let got_sp = is_speakable(&c.input);
+        // The listed abbreviation cases are asserted against what this chunker
+        // does now; every other case is still asserted against the python.
+        let (want_s, want_c) = match diverges(&c.input) {
+            Some((s, k)) => (
+                s.iter().map(|x| (*x).to_string()).collect::<Vec<_>>(),
+                k.iter().map(|x| (*x).to_string()).collect::<Vec<_>>(),
+            ),
+            None => (c.sentences.clone(), c.chunks.clone()),
+        };
+        let (c_sentences, c_chunks) = (want_s, want_c);
+        let c = &ChunkCase {
+            input: c.input.clone(),
+            max_chars: c.max_chars,
+            speakable: c.speakable,
+            sentences: c_sentences,
+            chunks: c_chunks,
+        };
         if got_s != c.sentences {
             bad.push(format!(
                 "case {i} sentences\n  input: {:?}\n  want:  {:?}\n  got:   {:?}",
@@ -74,7 +176,7 @@ fn sentence_splitting_and_chunking_match_python_exactly() {
 fn the_fixture_epub_produces_the_same_plan() {
     let want: Vec<Chapter> = read_json("fixture_plan.json");
     let raw = extract_chapters(&fixtures().join("fixture.epub")).expect("parse fixture epub");
-    let got = build_plan(&raw, 300);
+    let got = build_plan_with(&raw, 300, Guards::Inert);
     assert_eq!(got.len(), want.len(), "chapter count\ngot {got:#?}");
     for (g, w) in got.iter().zip(&want) {
         assert_eq!(g.index, w.index);
@@ -114,7 +216,7 @@ fn duration_estimates_match_python() {
     let want: EstFixture = read_json("fixture_est.json");
     assert_eq!(want.chars_per_sec, narrator::book::CHARS_PER_SEC);
     let raw = extract_chapters(&fixtures().join("fixture.epub")).expect("parse");
-    let plan = build_plan(&raw, 300);
+    let plan = build_plan_with(&raw, 300, Guards::Inert);
     for (ci, ch) in plan.iter().enumerate() {
         for (i, k) in ch.chunks.iter().enumerate() {
             let w = want.chunks[&ci.to_string()][i];
@@ -274,7 +376,11 @@ fn a_real_book_chunks_identically_to_python() {
     let copy = tmp.path().join(&want.source_name);
     std::fs::write(&copy, &bytes).expect("copy");
 
-    let plan = build_plan(&extract_chapters(&copy).expect("parse"), want.max_chars);
+    let plan = build_plan_with(
+        &extract_chapters(&copy).expect("parse"),
+        want.max_chars,
+        Guards::Inert,
+    );
     assert_eq!(plan.len(), want.chapters.len(), "chapter count");
     let mut bad = Vec::new();
     for (g, w) in plan.iter().zip(&want.chapters) {
@@ -341,7 +447,11 @@ fn the_first_chapters_of_a_real_book_match_chunk_for_chunk() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let copy = tmp.path().join(&counts.source_name);
     std::fs::copy(&path, &copy).expect("copy");
-    let plan = build_plan(&extract_chapters(&copy).expect("parse"), counts.max_chars);
+    let plan = build_plan_with(
+        &extract_chapters(&copy).expect("parse"),
+        counts.max_chars,
+        Guards::Inert,
+    );
     for w in &want {
         let g = &plan[w.index];
         assert_eq!(g.chunks.len(), w.chunks.len(), "chapter {} count", w.index);
@@ -410,7 +520,7 @@ fn a_python_written_plan_matches_chunk_for_chunk() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let copy = tmp.path().join(epub.file_name().unwrap_or_default());
         std::fs::copy(&epub, &copy).expect("copy");
-        let got = build_plan(&extract_chapters(&copy).expect("parse"), 300);
+        let got = build_plan_with(&extract_chapters(&copy).expect("parse"), 300, Guards::Inert);
 
         assert_eq!(got.len(), want.len(), "{key}: chapter count");
         let mut chunks = 0usize;

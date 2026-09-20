@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use narrator::{api, config::Config, export, render, state::AppState, watch};
+use narrator::{api, config::Config, export, migrate, render, state::AppState, watch};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
@@ -37,6 +37,17 @@ async fn main() -> anyhow::Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(String::as_str) == Some("export") {
         std::process::exit(run_export(&argv[1..]));
+    }
+    // `narrator migrate` re-chunks the cached books and drops what that
+    // invalidated. Destructive, one-shot and slow: the same reasons `export` is
+    // a CLI path and not an endpoint.
+    if argv.first().map(String::as_str) == Some("migrate") {
+        std::process::exit(run_migrate(&argv[1..]));
+    }
+    // `narrator retrim` does the same to the wavs already on disk that the
+    // renderer now does on the way out: takes off Kokoro's padding.
+    if argv.first().map(String::as_str) == Some("retrim") {
+        std::process::exit(run_retrim(&argv[1..]));
     }
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -112,6 +123,173 @@ async fn shutdown(state: Arc<AppState>) {
     state.stop.store(true, std::sync::atomic::Ordering::SeqCst);
     state.run.set();
     state.build_ev.set();
+}
+
+/// `narrator retrim` — report by default, rewrite only on `--apply`.
+fn run_retrim(argv: &[String]) -> i32 {
+    if argv.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", migrate::RETRIM_USAGE);
+        return 0;
+    }
+    let cfg = Config::from_env();
+    let args = match migrate::args_from(argv, &cfg) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("narrator retrim: {e}\n\n{}", migrate::RETRIM_USAGE);
+            return 2;
+        }
+    };
+    let keys: Vec<String> = match &args.only {
+        Some(k) => vec![k.clone()],
+        None => migrate::cached_books(&args.work),
+    };
+    let mut total = migrate::TrimReport::default();
+    for key in &keys {
+        let r = migrate::retrim(&args.work, key, args.apply);
+        println!(
+            "{key}: {} wavs, {} to trim, {} unreadable; {:.1} min -> {:.1} min (-{:.1} min)",
+            r.examined,
+            r.trimmed,
+            r.failed,
+            r.seconds_before / 60.0,
+            r.seconds_after / 60.0,
+            r.saved() / 60.0
+        );
+        total.examined += r.examined;
+        total.trimmed += r.trimmed;
+        total.failed += r.failed;
+        total.seconds_before += r.seconds_before;
+        total.seconds_after += r.seconds_after;
+    }
+    println!(
+        "\n{} wavs, {} {}, {:.1} min of silence {}",
+        total.examined,
+        total.trimmed,
+        if args.apply {
+            "trimmed"
+        } else {
+            "would be trimmed"
+        },
+        total.saved() / 60.0,
+        if args.apply {
+            "removed"
+        } else {
+            "would come off"
+        }
+    );
+    if !args.apply {
+        println!("--dry-run: nothing written. re-run with --apply to do it.");
+    } else if total.failed > 0 {
+        println!(
+            "{} wavs could not be read and were left alone.",
+            total.failed
+        );
+    }
+    if args.apply && total.trimmed > 0 {
+        println!("re-pack any chapter you want the shorter gaps in; the manifest is rebuilt from the durations on disk.");
+    }
+    i32::from(total.failed > 0 && total.examined == total.failed)
+}
+
+/// `narrator migrate` — report by default, change the cache only on `--apply`.
+///
+/// Everything is planned for every book before anything is deleted, so a run
+/// that cannot resolve one book's epub stops with the cache untouched rather
+/// than half migrated.
+fn run_migrate(argv: &[String]) -> i32 {
+    if argv.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", migrate::USAGE);
+        return 0;
+    }
+    let cfg = Config::from_env();
+    let args = match migrate::args_from(argv, &cfg) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("narrator migrate: {e}\n\n{}", migrate::USAGE);
+            return 2;
+        }
+    };
+    let keys: Vec<String> = match &args.only {
+        Some(k) => vec![k.clone()],
+        None => migrate::cached_books(&args.work),
+    };
+    if keys.is_empty() {
+        println!("no cached books under {}", args.work.display());
+        return 0;
+    }
+
+    let mut plans = Vec::new();
+    for key in &keys {
+        match migrate::plan_book(&args, key) {
+            Ok(p) => plans.push(p),
+            Err(e) => {
+                eprintln!("narrator migrate: {e}");
+                return 1;
+            }
+        }
+    }
+
+    let mut wavs = 0usize;
+    let mut derived = 0usize;
+    for p in &plans {
+        let verdict = if p.is_noop() {
+            "unchanged".to_string()
+        } else {
+            format!(
+                "{} of {} chapters re-chunk; {} chunk wavs and {} packed/HLS artifacts to delete",
+                p.changed.len(),
+                p.chapters_total,
+                p.wavs.len(),
+                p.derived.len()
+            )
+        };
+        println!(
+            "{}: {} -> {} chunks; {verdict}",
+            p.key, p.chunks_before, p.chunks_after
+        );
+        wavs += p.wavs.len();
+        derived += p.derived.len();
+    }
+
+    let fixes = match args.positions.as_ref() {
+        Some(d) => migrate::position_fixes(&narrator::vault::load_positions(d), &plans),
+        None => Vec::new(),
+    };
+    for f in &fixes {
+        println!(
+            "position: {} chapter {} chunk {} -> {} (the last chunk both chunkings agree on)",
+            f.book, f.chapter, f.from, f.to
+        );
+    }
+
+    if !args.apply {
+        println!("\n--dry-run: nothing written. {wavs} wavs and {derived} artifacts would go; {} positions would move.", fixes.len());
+        println!("re-run with --apply to do it.");
+        return 0;
+    }
+
+    for p in &plans {
+        if p.is_noop() {
+            continue;
+        }
+        if let Err(e) = migrate::apply_book(&args, p) {
+            eprintln!("narrator migrate: {e}");
+            return 1;
+        }
+        println!("migrated {}", p.key);
+    }
+    if let Some(d) = args.positions.as_ref() {
+        if let Err(e) = migrate::apply_position_fixes(d, &fixes, &plans) {
+            eprintln!("narrator migrate: {e}");
+            return 1;
+        }
+    }
+    println!(
+        "done: {wavs} wavs and {derived} artifacts deleted, {} positions moved.",
+        fixes.len()
+    );
+    println!("the render worker refills from the playhead; nothing else has to be called.");
+    0
 }
 
 /// `narrator export` — print progress on stdout, problems on stderr, and return

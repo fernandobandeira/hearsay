@@ -121,10 +121,56 @@ fn is_closer(c: char) -> bool {
     matches!(c, '"' | '\'' | '\u{201D}' | '\u{2019}' | ')' | ']')
 }
 
-/// `_SENT.split(text)` — every split point of `(?<=[.!?])["'”’)\]]*\s+`,
-/// hand-rolled because the abbreviation lookbehinds it carries are inert and
-/// writing them out would only invite someone to "fix" them.
-fn split_sentences_raw(text: &str) -> Vec<&str> {
+/// The words `_ABBR` in `app/book.py` lists, plus the single capital of an
+/// initial. A `.` after one of these is not the end of a sentence.
+const ABBREVIATIONS: &[&str] = &[
+    "Mr", "Mrs", "Ms", "Dr", "St", "Jr", "Sr", "vs", "etc", "i.e", "e.g",
+];
+
+/// Is the `.` ending at `dot` an abbreviation's rather than a sentence's?
+///
+/// The word before it is read back over letters and interior dots, so `i.e.`
+/// and `e.g.` are found whole, and it has to start at a word boundary — the
+/// `\b` the Python regex asks for — so `sir.` is not `Sr.` and `cars.` is not
+/// `Sr.` either.
+fn is_abbreviation(text: &str, dot: usize) -> bool {
+    let head = &text[..dot];
+    let start = head
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_alphanumeric() || *c == '.')
+        .last()
+        .map_or(head.len(), |(i, _)| i);
+    let word = &head[start..];
+    if word.is_empty() {
+        return false;
+    }
+    // `\b`: whatever precedes the word must not be part of it.
+    if head[..start]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric())
+    {
+        return false;
+    }
+    // A lone capital is an initial: `Mr. A. Smith`.
+    if word.chars().count() == 1 && word.chars().all(char::is_uppercase) {
+        return true;
+    }
+    ABBREVIATIONS.contains(&word)
+}
+
+/// `_SENT.split(text)` — every split point of `(?<=[.!?])["'”’)\]]*\s+`, with
+/// the abbreviation guard `_ABBR` was reaching for.
+///
+/// **This is the one place that deliberately does not reproduce the Python.**
+/// `_ABBR` puts its lookbehinds *before* `(?<=[.!?])`, so each one tests the two
+/// characters ending at the split point — `r.`, never `Dr` — and every guard in
+/// the list does nothing. Reproducing that faithfully is what made `Mr. Franky`
+/// two chunks, with a full stop's worth of silence and a sentence-final fall in
+/// the middle of a name. Fixing it moves boundaries, which is a migration; the
+/// one that took this divergence is written up in AGENTS.md.
+fn split_sentences_raw(text: &str, guards: Guards) -> Vec<&str> {
     let b = text.as_bytes();
     let mut parts = Vec::new();
     let mut last = 0usize;
@@ -136,6 +182,11 @@ fn split_sentences_raw(text: &str) -> Vec<&str> {
         }
         // The separator can only start immediately after . ! ?
         if i == 0 || !matches!(b[i - 1], b'.' | b'!' | b'?') {
+            i += 1;
+            continue;
+        }
+        // ... and not after an abbreviation's full stop.
+        if guards == Guards::On && b[i - 1] == b'.' && is_abbreviation(text, i - 1) {
             i += 1;
             continue;
         }
@@ -181,9 +232,32 @@ fn split_sentences_raw(text: &str) -> Vec<&str> {
     parts
 }
 
+/// Whether the abbreviation guards are asked to do anything.
+///
+/// [`Guards::Inert`] is `app/book.py` exactly as it behaves, guards and all
+/// doing nothing, and it exists for one reason: the opt-in parity suites re-chunk
+/// a real book against the `plan.json` the python server itself wrote, and that
+/// check is what proved this port faithful in the first place. Retiring it
+/// because one boundary moved on purpose would throw away the guard against
+/// every boundary that might move by accident — Python's wider `\s`, its
+/// character-counting `len()`, its `isalnum()`. So the python behaviour stays
+/// reachable and stays tested; nothing but those tests asks for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Guards {
+    /// What the python does: `Dr. Smith` is two sentences.
+    Inert,
+    /// What this server does: an abbreviation's `.` does not end a sentence.
+    On,
+}
+
 /// `sentences(text)` — split, strip, drop the empties.
 pub fn sentences(text: &str) -> Vec<String> {
-    split_sentences_raw(text)
+    sentences_with(text, Guards::On)
+}
+
+/// [`sentences`], with the choice of chunker made explicit.
+pub fn sentences_with(text: &str, guards: Guards) -> Vec<String> {
+    split_sentences_raw(text, guards)
         .into_iter()
         .map(trim_py)
         .filter(|s| !s.is_empty())
@@ -242,9 +316,14 @@ fn join_strip(a: &str, b: &str) -> String {
 /// Group whole sentences up to `max_chars`. Only a single over-long sentence is
 /// ever split, and then on clause boundaries rather than mid-phrase.
 pub fn chunk_paragraph(para: &str, max_chars: usize) -> Vec<String> {
+    chunk_paragraph_with(para, max_chars, Guards::On)
+}
+
+/// [`chunk_paragraph`], with the choice of chunker made explicit.
+pub fn chunk_paragraph_with(para: &str, max_chars: usize, guards: Guards) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
-    for s in sentences(para) {
+    for s in sentences_with(para, guards) {
         if clen(&s) > max_chars {
             if !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
@@ -308,11 +387,16 @@ pub fn est_chapter_s(chunks: &[Chunk], gap: f64, para_gap: f64, silence: f64) ->
 // ------------------------------------------------------------------- the plan
 
 pub fn build_plan(chapters: &[RawChapter], max_chars: usize) -> Vec<Chapter> {
+    build_plan_with(chapters, max_chars, Guards::On)
+}
+
+/// [`build_plan`], with the choice of chunker made explicit.
+pub fn build_plan_with(chapters: &[RawChapter], max_chars: usize, guards: Guards) -> Vec<Chapter> {
     let mut plan = Vec::new();
     for (ci, ch) in chapters.iter().enumerate() {
         let mut chunks = Vec::new();
         for (pi, para) in ch.paragraphs.iter().enumerate() {
-            for text in chunk_paragraph(para, max_chars) {
+            for text in chunk_paragraph_with(para, max_chars, guards) {
                 let silent = !is_speakable(&text);
                 chunks.push(Chunk {
                     text,
@@ -455,12 +539,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn abbreviation_guards_are_inert_bug_for_bug() {
+    /// The one deliberate divergence from `app/book.py`. Its `_ABBR` guards are
+    /// inert — the lookbehinds sit before `(?<=[.!?])` and test `r.` rather
+    /// than `Dr` — so the python splits every one of these in two, and so did
+    /// this until the migration that fixed it.
+    fn abbreviation_guards_actually_guard() {
         assert_eq!(
             sentences("Dr. Smith went home."),
-            vec!["Dr.", "Smith went home."]
+            vec!["Dr. Smith went home."]
         );
-        assert_eq!(sentences("e.g. this thing."), vec!["e.g.", "this thing."]);
+        assert_eq!(sentences("e.g. this thing."), vec!["e.g. this thing."]);
+        assert_eq!(
+            sentences("If the water gushed, Mr. Franky would ignore it. Then he left."),
+            vec![
+                "If the water gushed, Mr. Franky would ignore it.",
+                "Then he left."
+            ]
+        );
+        // A lone capital is an initial, not the end of a sentence.
+        assert_eq!(sentences("Mr. A. Smith came."), vec!["Mr. A. Smith came."]);
+        // Every guard needs its word boundary: `sir.` is not `Sr.`, and a word
+        // merely ending in an abbreviation's letters still ends its sentence.
+        assert_eq!(
+            sentences("He was a sir. Then he left."),
+            vec!["He was a sir.", "Then he left."]
+        );
+        assert_eq!(
+            sentences("He bought cars. Then he left."),
+            vec!["He bought cars.", "Then he left."]
+        );
+        // `!` and `?` are never an abbreviation's.
+        assert_eq!(
+            sentences("Really? Yes! Fine."),
+            vec!["Really?", "Yes!", "Fine."]
+        );
     }
 
     #[test]

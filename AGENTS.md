@@ -24,6 +24,7 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `src/text.rs` | The two-tier offline text bundle: `index.json` + byte-budgeted shards. |
 | `src/vault.rs` | `.narrator-positions.json`, `Reading Log.md`, fleeting notes — all byte-identical to the Python output. |
 | `src/render.rs` | The render worker and the packer, one OS thread each. |
+| `src/migrate.rs` | `narrator migrate` and `narrator retrim`: the chunker migration and the padding trim, over a work directory whose server is not running. |
 | `src/export.rs` | `narrator export`: the streaming cache packed into one `.m4b`, chapter marks and cover art included. A port of `app/export.py`. |
 | `src/events.rs`, `src/api/stream.rs` | The SSE bus and `/api/events`. |
 | `src/state.rs` | One global session, exactly like Python's process-wide `S`. |
@@ -45,9 +46,11 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 ./narrator web           # npm ci && npm run build in web/ (dev serves web/dist)
 ./narrator dev           # cargo run, serving ./web and ./work
 ./narrator build && ./narrator up     # docker, port 7870 on localhost only
-./narrator test          # the whole suite: 197 tests, no model, no network
+./narrator test          # the whole suite: 208 tests, no model, no network
 ./narrator lint          # rustfmt --check + clippy -D warnings
 ./narrator client        # regenerate openapi.json + web/src/client
+./narrator migrate       # re-chunk cached books, drop only what that invalidated
+./narrator retrim        # take Kokoro's padding out of wavs already on disk
 ./narrator export --book books/Title.epub [--partial]   # the cache → a .m4b
 ./narrator listen-test   # re-render the GATE 0 passage and report RTF
 ```
@@ -62,10 +65,10 @@ Everything below is asserted by a test. "Golden" means the fixture was produced 
 
 A chunk index *is* a reading position. It names a wav on disk, an entry in a chapter manifest, a line in the vault's `Reading Log.md`, and the passage a voice note points back to. Move one boundary and Fernando's place in a 1433-chapter book silently relocates and every packed chapter in the cache becomes a lie. So `src/book.rs` reproduces the Python exactly, **including two bugs**:
 
-- **The abbreviation guards are inert.** `_ABBR` puts lookbehinds like `(?<!\bDr)` *before* `(?<=[.!?])`, so they test the two characters ending at the split point — which are `r.`, never `Dr`. All ten guards do nothing and "Dr. Smith" splits in two.
-- **The split eats a closing quote.** `["'”’)\]]*` sits inside the separator, so `He said "go." Then` loses the `"`.
+- **~~The abbreviation guards are inert.~~** `_ABBR` puts lookbehinds like `(?<!\bDr)` *before* `(?<=[.!?])`, so they test the two characters ending at the split point — which are `r.`, never `Dr`. All ten guards do nothing and "Dr. Smith" splits in two. **This one was fixed**, as a migration — see [the migration](#the-abbreviation-migration) below. `Guards::Inert` still reproduces it, and is what the python-parity suites assert against.
+- **The split eats a closing quote.** `["'”’)\]]*` sits inside the separator, so `He said "go." Then` loses the `"`. Still reproduced: it costs a punctuation character, not a boundary, and nobody has reported hearing it.
 
-Fixing either is a migration, not an edit: it invalidates every rendered chunk, every packed chapter and every stored position. Three things Rust does *not* get for free are also handled: `len()` counts characters, Python's `\s` is wider than `char::is_whitespace`, and `str.isalnum()` includes the `Nl`/`No` categories — that last one decides whether a footnote marker like `²` is a silent beat.
+Fixing either is a migration, not an edit: it invalidates every rendered chunk that follows it, every packed chapter containing one and any stored position past one. Three things Rust does *not* get for free are also handled: `len()` counts characters, Python's `\s` is wider than `char::is_whitespace`, and `str.isalnum()` includes the `Nl`/`No` categories — that last one decides whether a footnote marker like `²` is a silent beat.
 
 Verified against `7 Powers (2016).epub` copied out of the vault: 22 chapters, 1577 chunks, 237 400 characters, identical chapter ids, titles, counts and first/last chunk text, with chapters 0–2 identical chunk for chunk.
 
@@ -83,6 +86,65 @@ flag. That is the whole cache and every stored position in Fernando's largest
 book, proven to survive the swap. It is opt-in because it needs the epub still
 sitting next to the plan; `NARRATOR_REF_WORK` and `NARRATOR_REF_BOOKS` point it
 somewhere else, and it only ever reads (the epub is copied out before parsing).
+
+That check still passes, and that is the point of [`Guards`](#the-abbreviation-migration):
+the port is still provably faithful to the python, and the one place this server
+parts company with it is a flag rather than a drift.
+
+### The abbreviation migration
+
+The first boundary ever moved on purpose. `Mr. Franky` was two chunks, which put
+a chunk boundary, a full stop's worth of silence and a sentence-final fall in the
+middle of a name; on *Lord of Mysteries* that happened 291 times, plus 3 more at
+an initial like `Mr. A.`. `is_abbreviation` in `src/book.rs` now guards the split
+the way `_ABBR` was reaching for — the word before the `.` read back over letters
+and interior dots (so `i.e.` is found whole), required to start at a word
+boundary (so `sir.` is not `Sr.`), and a lone capital treated as an initial. It
+fails toward *merging*, which is the safe direction: a missed split is a longer
+sentence, never a stop inside a name.
+
+Measured on the real book, the whole blast radius:
+
+| | |
+|---|---|
+| chapters whose chunking changes | **244 of 1433** (17.0 %) |
+| chunks whose index shifts | **11168 of 118831** (9.4 %) |
+| chunks before the first change in those chapters | kept — identical text, identical slot |
+| if whole affected chapters were dropped instead | 19332, so precision is worth 8164 chunks of re-rendering |
+| chapters untouched | 1189 |
+
+**`Guards::Inert` is why the parity claim above survives.** Retiring
+`a_python_written_plan_matches_chunk_for_chunk` because one boundary moved
+deliberately would throw away the guard against every boundary that might move by
+accident — Python's wider `\s`, its character-counting `len()`, its `isalnum()`.
+So the python behaviour stays reachable, the opt-in suites assert against it, and
+the ten golden cases that now diverge are listed one by one in
+`tests/parity_chunking.rs` rather than re-blessed. A fixture that claims to be
+python output has to be python output.
+
+**`narrator migrate` does the transition** (`src/migrate.rs`), and it is a CLI
+path for the same reasons `export` is: destructive, one-shot, and nothing is
+waiting on it.
+
+```bash
+narrator migrate           # report, touch nothing
+narrator migrate --apply   # do it
+```
+
+It re-chunks each cached book, finds the first chunk in each chapter whose text
+changed, and deletes from there to the end of that chapter — plus that chapter's
+packed m4a, its manifest and its HLS, which are built from all of it. A chapter
+that chunks identically is not touched. **The plan is written last**, so an
+interrupted run leaves a cache with holes and the old plan, which
+[the disk-truth invariant](#the-disk-truth-invariant) heals by itself; the other
+order would leave a new plan over stale audio, which nothing can detect — a
+present wav reads as rendered whatever text it holds.
+
+A stored position at or past its chapter's first changed chunk is pulled **back**
+to that chunk, never forward, and restamped: a reader who lands a paragraph early
+has lost seconds, one who lands late has lost the thread, and a healed record
+carrying its old timestamp would lose the reader's own timestamp comparison and
+be put straight back.
 
 ### The silence between chunks
 
@@ -134,15 +196,12 @@ stored position was chunked with, and changing it there is a migration. Here the
 same list answers a much smaller question, where being wrong costs a pause
 rather than a position.
 
-**What this does not fix**, and the decision that was not taken: the 294
-abbreviation boundaries are still *boundaries*. The pause is gone, but Kokoro
-still renders `…loudly, Mr.` as a complete utterance with a sentence-final fall,
-because that is the text it is handed. Only the chunker can fix that, and doing
-it is a migration — measured, it re-chunks **242 of 1433 chapters (16.9 %)** and
-shifts **11092 of 118831 chunk indices (9.3 %)**, invalidating exactly those
-chunks' audio; 1191 chapters are untouched. It would also break the Python
-parity guarantee this file opens with. Not attempted; it wants a decision, not
-an edit.
+The 294 abbreviation boundaries were then fixed at the source as well, because
+the pause was only half of it — Kokoro still rendered `…loudly, Mr.` as a
+complete utterance with a sentence-final fall, since that is the text it was
+handed. That took [the abbreviation migration](#the-abbreviation-migration).
+`Gap::Phrase` still earns its keep: 684 of the 978 are clause splits out of an
+over-long sentence, and those are boundaries no chunker change can remove.
 
 ### Cache layout
 
