@@ -989,6 +989,15 @@ and why it cannot be picked a second time.
 while it is open — it is the fast path and the fallback for a session with no
 live stream.
 
+**And the queue now survives switching books, with no change to the reader.**
+`toOrder` has always posted the book's key on both calls; what happened to those
+posts was a **409** the moment the session held something else, so a download
+started on one book and abandoned for another quietly stopped being re-placed.
+Since [ordering reaches the whole library](#ordering-a-book-you-are-not-reading)
+the same post is honoured, the worker follows it, and the packer finishes it —
+so the pending record in IndexedDB keeps meaning what it says until the chapters
+are actually on the device.
+
 ### The trim keeps what you touched
 
 A device that downloads ahead of itself has to give chapters back, or a
