@@ -1528,6 +1528,29 @@ This server *is* production: the box runs the published arm64 image, the reader
 runs against it, and the cache and the vault it adopted are the same ones the
 python server left. What that sentence does not cover:
 
+- **This round has not run on the A1.** Everything in it — the device identity,
+  the store, the library index, the scheduler's three new branches — is proven
+  by 293 Rust tests and 353 reader tests, by `cargo clippy -D warnings`, by an
+  amd64 image that builds and runs, and by a live server on this desktop that
+  was driven through the whole flow by hand: two books registered, a chapter of
+  one ordered *by name* while the other was loaded, rendered and packed without
+  that book ever being opened, the library reporting both, and the worker at
+  0.0 % CPU with `status: ready` once there was nothing left to do. What none of
+  that is, is the box. Specifically unproven there:
+  - **the scan cost.** 0.10 s for the 1433-chapter book on sixteen x86 cores;
+    the A1's `/api/chapters` ratio suggests a few hundred ms, and that is an
+    extrapolation rather than a measurement.
+  - **the ceiling against a real 50 GB cache.** The gc-versus-speculation
+    argument is sound and tested at 1 MB; the number that matters is how long
+    `gc_audio`'s walk takes over 50 GB of wavs, once a minute.
+  - **`state.db` under the box's own concurrency**, with a renderer, a packer, a
+    scanner and several devices on it at once. It is one connection behind one
+    mutex and the data is measured in hundreds of kilobytes, so the expectation
+    is that it is invisible — but *expectation* is the word.
+  - **the arbitration with real devices.** The rules are unit-tested and the
+    event fields are asserted on the wire, but the bug they fix was reported
+    from a phone and a laptop in the same house, and that is where the fix has
+    to be seen to work.
 - **The pronunciation fixes have not been heard.** The defects in
   [the engine notes](#engine-notes) are proven gone at the phoneme and token
   level, the number readings are asserted as text, and the suite checks all of
