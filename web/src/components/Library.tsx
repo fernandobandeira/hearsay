@@ -20,23 +20,33 @@
  * nothing behind it to undo with, so it asks once: the first tap arms it, the
  * second does it.
  */
-import {useCallback, useEffect, useState} from 'react';
+import {useCallback, useEffect, useMemo, useState} from 'react';
 import {ChevronLeft, ChevronRight, Trash2} from 'lucide-react';
 import {Sheet, SheetContent, SheetHeader, SheetTitle} from '@/components/ui/sheet';
 import {ScrollArea} from '@/components/ui/scroll-area';
 import {Separator} from '@/components/ui/separator';
 import {Skeleton} from '@/components/ui/skeleton';
 import {Spinner} from '@/components/ui/spinner';
-import {useBooks} from '@/lib/api';
+import {useBooks, useLibrary} from '@/lib/api';
 import {bookKey, heldBooks, storageEstimate} from '@/lib/offline';
 import {bytes as fmtBytes} from '@/lib/format';
 import {initialView, type DrawerView} from '@/lib/drawernav';
+import {
+  downloadCost, indexBooks, libraryState, orderBooks, positionLine, scanAge, scanStale,
+  type LibraryCost, type Tone,
+} from '@/lib/library';
 import {cn} from '@/lib/utils';
 import {useNarrator} from '@/state';
 import {ChapterManager} from './ChapterManager';
 import type {BookFile} from '@/lib/types';
 
 const LIB_KEY = 'narrator.lib';
+
+/** The chapter list's tones, on the level above it — see lib/library.ts. */
+const TONE: Record<Tone, string> = {
+  ok: 'text-ok', work: 'text-work', part: 'text-part',
+  done: 'text-foreground/50', none: 'text-muted-foreground/80',
+};
 
 function knownBooks(): BookFile[] {
   try {
@@ -54,8 +64,25 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
   const [held, setHeld] = useState<Set<string>>(new Set());
   const [armed, setArmed] = useState<string | null>(null);
   const [dropping, setDropping] = useState<string | null>(null);
-  const list: BookFile[] = books.data?.length ? books.data : knownBooks();
-  const loadingList = books.isPending && !list.length;
+  const found: BookFile[] = books.data?.length ? books.data : knownBooks();
+  const loadingList = books.isPending && !found.length;
+
+  /* What the box has made of each book, which is a different question from what
+     files it has. Strictly a decoration of the list above: `lib` failing (or
+     never being asked, offline) leaves every row without a readiness line and
+     changes nothing else. The list itself must never wait on it - a phone with
+     no tunnel still has to be able to pick a book it downloaded last night. */
+  const lib = useLibrary(open);
+  const index = useMemo(() => indexBooks(lib.data), [lib.data]);
+  /* Most recently opened first, which is also the order the render worker walks
+     the library in when it has nothing under a playhead to do - so the top of
+     this list is the book the box is spending its night on. Unsorted (and in the
+     order the server listed them) when there is no library answer to sort by. */
+  const list = orderBooks(found, bookKey, index);
+  /* What a minute of packed audio weighs, from the server rather than a constant
+     here: CHAPTER_BITRATE is the box's to set, and a size computed at the wrong
+     rate is wrong by exactly that ratio - silently. */
+  const perMin = n.status?.bitrate_bytes_per_min;
 
   /* Which books have anything on this device. Always asked, never remembered -
      a quota eviction (or the auto-trim) has to show up as a book with nothing
@@ -165,6 +192,12 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
                 const key = bookKey(b);
                 const title = b.name.replace(/\.epub$/i, '');
                 const here = b.path === n.book?.path;
+                /* Everything below is absent unless the library answered, and a
+                   row without it is exactly the row that was here before. */
+                const info = index.get(key);
+                const ready = info && libraryState(info);
+                const cost = info && downloadCost(info, perMin);
+                const where = info && positionLine(info);
                 return (
                   <div
                     key={b.path}
@@ -187,15 +220,51 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
                         void n.openBook(b).finally(() => setOpening(null));
                       }}
                       className={cn(
-                        'flex min-w-0 flex-1 items-baseline gap-2 py-2 pl-4 pr-2 text-left text-[13px]',
+                        'flex min-w-0 flex-1 flex-col gap-0.5 py-2 pl-4 pr-2 text-left text-[13px]',
                         'font-light text-muted-foreground transition-colors hover:text-foreground',
                         here && 'text-foreground',
                       )}
                     >
-                      <span className="min-w-0 flex-1 truncate">{title}</span>
-                      {opening === b.path
-                        ? <Spinner className="size-3 shrink-0 self-center text-muted-foreground" />
-                        : b.mb ? <span className="shrink-0 text-[10px] text-muted-foreground">{b.mb}MB</span> : null}
+                      <span className="flex w-full min-w-0 items-baseline gap-2">
+                        <span className="min-w-0 flex-1 truncate">{title}</span>
+                        {opening === b.path
+                          ? <Spinner className="size-3 shrink-0 self-center text-muted-foreground" />
+                          : b.mb ? <span className="shrink-0 text-[10px] text-muted-foreground">{b.mb}MB</span> : null}
+                      </span>
+
+                      {/* The readiness line: what the box has made of this book,
+                          answered without loading it. Everything on it is
+                          `shrink-0` but the position, which truncates - the row
+                          has a name and a delete button to keep, and this line
+                          may not push either off a phone. */}
+                      {ready && (
+                        <span
+                          data-testid="book-ready"
+                          data-phase={ready.key}
+                          title={readyTip(ready.tip, cost)}
+                          className="flex w-full min-w-0 items-center gap-1.5 text-[10px] tracking-wide tabular-nums"
+                        >
+                          <span className={cn('shrink-0', TONE[ready.tone])}>{ready.text}</span>
+                          {where && (
+                            <span data-testid="book-position" className="min-w-0 truncate text-muted-foreground/80">
+                              {where}
+                            </span>
+                          )}
+                          {/* The *server's* session, not this device's - which
+                              is the interesting case when they differ. The row
+                              highlight still means "what you are reading". */}
+                          {info?.loaded && (
+                            <span data-testid="book-loaded" className="shrink-0 text-muted-foreground/60">
+                              open
+                            </span>
+                          )}
+                          {sizeOf(cost) && (
+                            <span data-testid="book-size" className="ml-auto shrink-0 text-muted-foreground/80">
+                              {sizeOf(cost)}
+                            </span>
+                          )}
+                        </span>
+                      )}
                     </button>
 
                     {/* Only for a book this device actually holds something for,
@@ -230,6 +299,23 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
                   </div>
                 );
               })}
+
+              {/* Only when it is actually stale. Every figure on every row above
+                  comes from a background scan, and a stale index does not look
+                  broken - it looks like a book nobody has rendered, which is the
+                  one thing this screen could get wrong in silence. A line that
+                  always said "scanned just now" would be noise, so it is not
+                  there until the scanner has missed two of its five-minute
+                  ticks. */}
+              {lib.data && scanStale(lib.data.scanned_ms) && (
+                <div
+                  data-testid="lib-stale"
+                  title="These figures come from a background scan of the server's cache, not from this moment."
+                  className="px-4 py-2 text-[10px] text-muted-foreground/60"
+                >
+                  readiness scanned {scanAge(lib.data.scanned_ms)}
+                </div>
+              )}
             </ScrollArea>
           </div>
 
@@ -254,6 +340,33 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
       </SheetContent>
     </Sheet>
   );
+}
+
+/**
+ * The one number on the readiness line, and it is deliberately the *measured*
+ * one when there is one: "12 MB" is what could come down this second, which is
+ * the question being asked. Only a book with nothing packed falls back to the
+ * estimate, because then the estimate is the only answer there is - and it
+ * carries the `~` that says so. A book with nothing packed and no bitrate from
+ * the server says nothing at all rather than a number computed from a guess.
+ */
+function sizeOf(cost: LibraryCost | undefined): string {
+  if (!cost) return '';
+  if (cost.packed > 0) return fmtBytes(cost.packed);
+  return cost.rest ? `~${fmtBytes(cost.rest)}` : '';
+}
+
+/** The readiness sentence, with what the whole book would weigh under it. */
+function readyTip(tip: string, cost: LibraryCost | undefined): string {
+  if (!cost) return tip;
+  if (cost.packed > 0) {
+    return cost.rest
+      ? `${tip}\n${fmtBytes(cost.packed)} can be downloaded now; the whole book about ${fmtBytes(cost.total)}`
+      : `${tip}\n${fmtBytes(cost.packed)} on this book — all of it downloadable`;
+  }
+  return cost.rest
+    ? `${tip}\nnothing packed yet; the whole book would be about ${fmtBytes(cost.rest)}`
+    : tip;
 }
 
 /**

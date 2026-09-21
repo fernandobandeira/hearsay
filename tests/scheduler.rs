@@ -303,7 +303,10 @@ async fn an_order_on_another_book_is_not_invisible() {
     assert_eq!(code, axum::http::StatusCode::OK, "{loaded}");
     let other_key = loaded["key"].as_str().unwrap_or_default().to_string();
     let (code, _) = h
-        .post_json("/api/chapters/render", json!({"chapters": [1], "pack": false}))
+        .post_json(
+            "/api/chapters/render",
+            json!({"chapters": [1], "pack": false}),
+        )
         .await;
     assert_eq!(code, axum::http::StatusCode::OK);
 

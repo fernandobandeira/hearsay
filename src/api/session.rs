@@ -187,29 +187,6 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
         s.pack_queue.clear();
     }
 
-    // The library register. `/api/load` is the one moment the server learns a
-    // book's key, name, path, title and size all at once, and writing it down is
-    // what lets everything else answer about a book the session is not holding —
-    // the readiness view, the scheduler's "the most recently opened book", a
-    // standing order placed on something else entirely.
-    if let Some(db) = st.store() {
-        let now_ms = chrono::Local::now().timestamp_millis();
-        let row = crate::store::BookRow {
-            key: key.clone(),
-            name: name.clone(),
-            path: body.path.clone(),
-            title: title.clone(),
-            chapters: plan.len(),
-            last_open_ms: Some(now_ms),
-            scanned_ms: Some(now_ms),
-        };
-        if let Err(e) = db.put_book(&row) {
-            tracing::warn!("could not register {key}: {e}");
-        } else if let Err(e) = db.touch_book_open(&key, now_ms) {
-            tracing::warn!("could not stamp {key} as opened: {e}");
-        }
-    }
-
     // ... and then this book's own wishlist back, if it has one.
     //
     // Clearing the queues above is right — they are indices into the plan that
@@ -252,6 +229,44 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
     if !reused || !bundle.exists() || !crate::text::gz_path(&bundle).exists() {
         if let Err(e) = crate::text::write_bundle(&st.cfg, &plan, &est, &key, &name, &title) {
             tracing::warn!("could not write text bundle: {e}");
+        }
+    }
+
+    // The library register, *after* the plan and the bundle are on disk.
+    //
+    // `/api/load` is the one moment the server learns a book's key, name, path,
+    // title and chapter count all at once, and writing it down is what lets
+    // everything else answer about a book the session is not holding — the
+    // readiness view, the scheduler's "the most recently opened book", a
+    // standing order placed on something else entirely.
+    //
+    // The index is written from the plan **in memory** rather than through
+    // `library::rescan_book`, which re-reads `plan.json`. That is not an
+    // optimisation: on a cold load the plan is written a few lines above this,
+    // so a version of this that read the file had to sit below it anyway — and
+    // reading back what we are already holding is a way to be subtly wrong for
+    // no gain. Without it the book reports zero chapters and zero chunks until
+    // the scanner's next tick, which is up to `LIBRARY_SCAN_EVERY_S` of a
+    // freshly opened book looking empty.
+    if let Some(db) = st.store() {
+        let now_ms = chrono::Local::now().timestamp_millis();
+        let row = crate::store::BookRow {
+            key: key.clone(),
+            name: name.clone(),
+            path: body.path.clone(),
+            title: title.clone(),
+            chapters: plan.len(),
+            last_open_ms: Some(now_ms),
+            scanned_ms: Some(now_ms),
+        };
+        if let Err(e) = db.put_book(&row) {
+            tracing::warn!("could not register {key}: {e}");
+        } else if let Err(e) = db.touch_book_open(&key, now_ms) {
+            tracing::warn!("could not stamp {key} as opened: {e}");
+        }
+        let rows = crate::library::scan_book(&st.cfg, &key, &plan);
+        if let Err(e) = db.put_chapter_index(&key, &rows) {
+            tracing::warn!("could not index {key}: {e}");
         }
     }
 

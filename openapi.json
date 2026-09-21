@@ -2206,7 +2206,9 @@
           "packing",
           "queue",
           "live",
-          "positions_dir"
+          "positions_dir",
+          "store",
+          "devices"
         ],
         "properties": {
           "book": {
@@ -2220,6 +2222,11 @@
               "string",
               "null"
             ]
+          },
+          "devices": {
+            "type": "integer",
+            "description": "How many devices are holding an event stream right now.\n\n`live` counts subscribers to the bus; this counts the ones that said who\nthey are. The two disagreeing means something is connected that is not\nthis reader — the Obsidian plugin, a stray `curl` — which is worth being\nable to see when a position seems to be moving on its own.",
+            "minimum": 0
           },
           "live": {
             "type": "integer",
@@ -2262,6 +2269,10 @@
           },
           "status": {
             "type": "string"
+          },
+          "store": {
+            "type": "boolean",
+            "description": "Whether `work/state.db` opened.\n\n**Not** a problem when it is false, deliberately — everything that\nmattered before the store existed still works without it, and refusing to\nbe healthy over a degraded extra would have the watchdog restart the\ncontainer in a loop for a fault a restart cannot fix. It is reported\nbecause the alternative is a box that quietly stops remembering standing\norders and answering for the library, with nothing anywhere saying so."
           },
           "threads": {
             "type": "array",

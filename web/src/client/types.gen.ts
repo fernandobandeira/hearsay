@@ -236,6 +236,15 @@ export type Health = {
     book: string | null;
     build_error: string | null;
     /**
+     * How many devices are holding an event stream right now.
+     *
+     * `live` counts subscribers to the bus; this counts the ones that said who
+     * they are. The two disagreeing means something is connected that is not
+     * this reader — the Obsidian plugin, a stray `curl` — which is worth being
+     * able to see when a position seems to be moving on its own.
+     */
+    devices: number;
+    /**
      * Open SSE streams.
      */
     live: number;
@@ -248,6 +257,17 @@ export type Health = {
     since_progress_s: number;
     stall_limit_s: number;
     status: string;
+    /**
+     * Whether `work/state.db` opened.
+     *
+     * **Not** a problem when it is false, deliberately — everything that
+     * mattered before the store existed still works without it, and refusing to
+     * be healthy over a degraded extra would have the watchdog restart the
+     * container in a loop for a fault a restart cannot fix. It is reported
+     * because the alternative is a box that quietly stops remembering standing
+     * orders and answering for the library, with nothing anywhere saying so.
+     */
+    store: boolean;
     threads: Array<string>;
     uptime_s: number;
     /**

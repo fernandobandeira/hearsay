@@ -313,3 +313,21 @@ async fn an_anonymous_stream_puts_nobody_on_the_roster() {
     assert!(h.state.roster.active(Duration::from_secs(60)).is_empty());
     drop(body);
 }
+
+#[tokio::test]
+async fn health_says_whether_the_store_opened() {
+    // Not a *problem* when it has not — everything that worked before the store
+    // existed still works without it, and a 503 over it would have the watchdog
+    // restart the container in a loop for a fault a restart cannot fix. But a box
+    // that has quietly stopped remembering standing orders and answering for the
+    // library should say so somewhere, and this is the somewhere.
+    let h = Harness::new().await;
+    let (code, body) = h.get_json("/healthz").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(body["store"].as_bool(), Some(true));
+    assert_eq!(body["devices"].as_u64(), Some(0));
+    assert!(
+        body["problems"].as_array().is_some_and(|p| p.is_empty()),
+        "a healthy server, store and all: {body}"
+    );
+}

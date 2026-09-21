@@ -46,6 +46,22 @@ pub struct Health {
     /// every book quietly opens at chapter one.
     pub vault: Option<String>,
     pub positions_dir: String,
+    /// Whether `work/state.db` opened.
+    ///
+    /// **Not** a problem when it is false, deliberately — everything that
+    /// mattered before the store existed still works without it, and refusing to
+    /// be healthy over a degraded extra would have the watchdog restart the
+    /// container in a loop for a fault a restart cannot fix. It is reported
+    /// because the alternative is a box that quietly stops remembering standing
+    /// orders and answering for the library, with nothing anywhere saying so.
+    pub store: bool,
+    /// How many devices are holding an event stream right now.
+    ///
+    /// `live` counts subscribers to the bus; this counts the ones that said who
+    /// they are. The two disagreeing means something is connected that is not
+    /// this reader — the Obsidian plugin, a stray `curl` — which is worth being
+    /// able to see when a position seems to be moving on its own.
+    pub devices: usize,
 }
 
 #[utoipa::path(
@@ -143,6 +159,8 @@ pub async fn healthz(State(st): State<Arc<AppState>>) -> Response {
         live: st.bus.subscribers(),
         vault: st.cfg.vault.as_ref().map(|p| p.display().to_string()),
         positions_dir: st.cfg.positions_dir.display().to_string(),
+        store: st.store().is_some(),
+        devices: st.roster.len(),
         problems,
     };
     let code = if body.ok {

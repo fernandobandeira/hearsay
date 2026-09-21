@@ -30,6 +30,7 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `src/state.rs` | One global session, exactly like Python's process-wide `S`. |
 | `src/store.rs` | `work/state.db`: the durable **intent and identity** — devices, per-device positions and high-water marks, standing orders, per-device inventory, the scanned chapter index, the book registry. Two rules it never breaks: [it is not disk truth](#the-store-and-the-two-things-it-is-not), and it does not replace the vault files. |
 | `src/api/device.rs` | Who is asking (`X-Narrator-Device`), and who is *here* (the in-memory roster). See [naming the devices](#naming-the-devices). |
+| `src/library.rs`, `src/api/library.rs` | The library index — a background scan of what is rendered and packed across *every* book, and `GET /api/library` over it. A cache of a filesystem scan, never truth. |
 | `src/api/` | Every endpoint, with typed request/response structs that **generate** the OpenAPI document. |
 | `src/watch.rs` | The library watcher (`notify`), which turns "the vault's git sync pulled an epub onto the server" into a `books` event. |
 | `src/wishlist.rs` | The chapters someone asked for, kept across restarts — now in `state.db`'s `intent` table, with `work/audio/<key>/queue.json` still written beside it. Intent only, never progress. See [downloading a chapter](#downloading-a-chapter-end-to-end). |
@@ -38,6 +39,8 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `scripts/gen-client.sh` | OpenAPI → the reader's typed TS client (`web/src/client/`), and the `--check` gate CI runs. |
 | `listen-test/` | GATE 0: the ONNX engine rendered against the PyTorch render Fernando accepted. |
 | `web/src/client/` | **Generated**, committed, and the reader's only description of the API. Never hand-edited; see [the gate](#openapi-is-the-contract). |
+| `web/src/lib/library.ts` | The readiness ladder behind each book row — what is rendered, what is packed, what it would cost to take. See [the reader's half](#the-readers-half-readiness-on-the-book-row). |
+| `web/src/lib/device.ts` | This device's id, minted once into `localStorage`. See [naming the devices](#naming-the-devices). |
 | `web/` | **The reader itself** — the Vite/React/Tailwind PWA, source and all. It moved in from the python repo; the build is no longer vendored (`web/.gitignore` ignores `dist/`), because two images are built from this tree now. See [the two images](#two-images-server-and-reader). `web/placeholder/` is the fallback page when there is no build at all. |
 | `deploy/` | systemd templates for the Oracle A1 — **applied by hand, never by a playbook**, like the python repo's. |
 
@@ -567,6 +570,51 @@ stop asking the filesystem.
 
 With no store at all it answers `200` with an empty list rather than an error,
 because every failure path here logs and degrades.
+
+### The reader's half: readiness on the book row
+
+`web/src/lib/library.ts` is the pure part, and the drawer's Books view renders
+it as a second line under each title. What it says, and the two decisions worth
+recording:
+
+**`ready` outranks `rendered`, even at one packed chapter against a whole
+rendered book.** The question a library row exists to answer is "what could I
+take with me right now", and a rendered *chunk* is not a file any device can
+hold — packing is what turns the box's night of work into something
+downloadable. So the first packed chapter is the news, and a fully rendered book
+with nothing packed reads as `rendered`, which is true and is not the same
+claim.
+
+**Progress is counted in chunks, not chapters.** On the 1433-chapter book the
+renderer can spend hours inside chapter one, and `rendered_chapters` says 0 for
+all of it. `rendered_chunks / total_chunks` says 1 %, which is both true and
+useful, and it is clamped at both ends so that 0 % and 100 % stay categorical
+rather than reachable by rounding.
+
+The download estimate takes `bitrate_bytes_per_min` **as a parameter** and has
+no default. That is [requirement 8](#what-this-server-does-that-the-python-one-does-not)
+being obeyed rather than re-broken: the reader used to hard-code 480000, so
+changing `CHAPTER_BITRATE` on the box made every size in the UI silently wrong
+by that ratio. With no rate available the row says so instead of showing a
+number it guessed.
+
+Book order is most recently opened first, nulls last — **the same order the
+worker renders in**, which is the point rather than a coincidence: the top of
+the list is what the box is working on.
+
+**The offline path is untouched**, and that is load-bearing. The list still
+falls back to the books this device has opened before (localStorage) when the
+server cannot be reached, nothing gates on the readiness query, and a row with
+no readiness is byte-for-byte the row that was there before. The one place the
+two meet is the sort, where an empty index ties every comparison and `Array`'s
+stable sort leaves the offline list in the order it came in.
+
+The scan's age is shown **only when it is stale** (two missed ticks plus slack).
+A line that always says "scanned just now" is noise. And `/api/library` is
+invalidated by the live stream on `hello`, on `books`, and on a `render` event
+with `kind: "packed"` — but deliberately not on `progress`, which is throttled to
+one a second and would refetch the whole library at that rate for a number the
+list does not show.
 
 ## OpenAPI is the contract
 

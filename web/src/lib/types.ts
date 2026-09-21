@@ -27,7 +27,10 @@ export type {
   CancelResult,
 } from '@/client';
 
-import type {BookFile as ServerBookFile, ChapterRow, StampedPosition} from '@/client';
+import type {
+  BookFile as ServerBookFile, ChapterIndexRow, ChapterRow, LibraryBook, LibraryResult,
+  StampedPosition,
+} from '@/client';
 
 /**
  * A book in the library.
@@ -43,3 +46,17 @@ export type ChapRow = ChapterRow;
 
 /** What `save_position()` writes into the vault, as `/api/load` hands it back. */
 export type SavedPosition = StampedPosition;
+
+/**
+ * One book's readiness, as `/api/library` reports it — how much is rendered,
+ * how much is packed, and where the reading position is.
+ *
+ * Re-exported here rather than imported from `@/client` at the use site for the
+ * same reason everything else in this file is: this is the one place the reader
+ * says what it calls the server's types, so a field that moves in Rust is a
+ * TypeScript error in one file rather than in five.
+ */
+export type LibraryRow = LibraryBook;
+export type Library = LibraryResult;
+/** A chapter's scanned state. Only present with `?book=&chapters=true`. */
+export type ChapterIndex = ChapterIndexRow;

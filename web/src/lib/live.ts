@@ -490,6 +490,7 @@ export function connectLive(qc: QueryClient, opts: LiveOptions = {}): () => void
         invalidate(keys.status);
         invalidate(keys.chapters);
         invalidate(keys.books);
+        invalidate(keys.library);
         break;
       case 'position':
         // The vault is the position's home; /api/status carries the session's.
@@ -498,9 +499,17 @@ export function connectLive(qc: QueryClient, opts: LiveOptions = {}): () => void
       case 'render':
         invalidate(keys.chapters);
         invalidate(keys.status);
+        /* A pack is the one render event that changes a *library* row, because
+           packing is what turns the box's night of work into a file a device can
+           hold - which is the question the library list exists to answer. The
+           other kinds move a chapter's progress, which that list does not show,
+           and invalidating on every throttled `progress` would refetch every
+           book in the library once a second. */
+        if (ev.data.kind === 'packed') invalidate(keys.library);
         break;
       case 'books':
         invalidate(keys.books);
+        invalidate(keys.library);
         break;
       case 'note':
         // Nothing server-side to refetch: the note is in the vault, and the

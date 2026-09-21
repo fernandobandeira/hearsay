@@ -342,7 +342,8 @@ describe('connectLive - events become refetches', () => {
   test('hello refetches everything: a reconnect missed whatever happened', () => {
     const w = wire();
     w.src.send('hello', {heartbeat_s: 15, book: 'A.epub', key: 'A', chapter: 0});
-    expect(w.keysOf()).toEqual(['["status"]', '["chapters"]', '["books"]']);
+    expect(w.keysOf())
+      .toEqual(['["status"]', '["chapters"]', '["books"]', '["library"]']);
     expect(w.states).toEqual(['connecting', 'live']);
     w.stop();
   });
@@ -356,16 +357,25 @@ describe('connectLive - events become refetches', () => {
     w2.src.send('render', {kind: 'progress', chapter: 3});
     expect(w2.keysOf()).toEqual(['["chapters"]', '["status"]']);
 
+    // A packed chapter is the one render kind that changes a *library* row:
+    // packing is what turns the box's night of work into a file a device can
+    // hold, which is the question that list answers. `progress` must not, or a
+    // throttled event once a second would refetch every book in the library.
+    const w2b = wire();
+    w2b.src.send('render', {kind: 'packed', chapter: 3, ok: true});
+    expect(w2b.keysOf()).toEqual(['["chapters"]', '["status"]', '["library"]']);
+
+    // A new epub is a new library row, so both lists move.
     const w3 = wire();
     w3.src.send('books', {changed: ['New.epub'], count: 1});
-    expect(w3.keysOf()).toEqual(['["books"]']);
+    expect(w3.keysOf()).toEqual(['["books"]', '["library"]']);
 
     // A filed note is already in the vault; there is nothing to refetch.
     const w4 = wire();
     w4.src.send('note', {file: '202609112000 a thought.md'});
     expect(w4.keysOf()).toEqual([]);
     expect(w4.seen.map((e) => e.name)).toEqual(['note']);
-    [w, w2, w3, w4].forEach((x) => x.stop());
+    [w, w2, w2b, w3, w4].forEach((x) => x.stop());
   });
 
   test('a dropped stream is a state, not an error - EventSource is reconnecting', () => {

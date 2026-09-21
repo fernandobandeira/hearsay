@@ -151,6 +151,7 @@ export const awaitedRetry = retryWhileOnline(() => onlineManager.isOnline());
 
 export const keys = {
   books: ['books'] as const,
+  library: ['library'] as const,
   status: ['status'] as const,
   chapters: ['chapters'] as const,
   bookIndex: (k: string | null) => ['book-index', k] as const,
@@ -164,6 +165,35 @@ export function useBooks() {
     queryKey: keys.books,
     queryFn: () => call(sdk.books()),
     staleTime: 60_000,
+  });
+}
+
+/**
+ * What has been made of each book, without opening one.
+ *
+ * `/api/books` lists epub *files*; this is the index of what the box has
+ * actually rendered, packed and last read of them. Separate calls on purpose:
+ * the file list is what a tap acts on and it must keep working when this one
+ * cannot be reached, which is the whole of the offline library.
+ *
+ * `enabled` is the drawer being open. The answer is an in-memory index rather
+ * than a walk of the cache, so re-asking is cheap — but it is also the one
+ * screen nobody is looking at while reading, and a poll behind a closed drawer
+ * would be a request per thirty seconds for a whole night of rendering.
+ *
+ * Deliberately *not* asked with `chapters: true`: the per-chapter rows are what
+ * `useChapters` is for, and on *Lord of Mysteries* they are 1433 of them —
+ * megabytes over a tunnel to answer a question about shelves.
+ */
+export function useLibrary(enabled = true) {
+  return useQuery({
+    queryKey: keys.library,
+    queryFn: () => call(sdk.library()),
+    refetchInterval: enabled ? 30_000 : false,
+    staleTime: 15_000,
+    enabled,
+    // One retry. There is a list on screen either way - this only decorates it.
+    retry: (count, e) => count < 1 && isRetryable(e instanceof ApiError ? e.status : 0),
   });
 }
 

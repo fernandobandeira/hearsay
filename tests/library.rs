@@ -298,17 +298,65 @@ async fn a_book_found_only_on_disk_is_adopted() {
 /// behind them.
 #[tokio::test]
 async fn an_unscanned_book_reports_zero_rather_than_a_guess() {
+    // A row the scanner has never reached says zero, and zero is a *fact about
+    // the index*, not an estimate of the book. The failure this guards against
+    // is the opposite: filling the gap from the plan, so a book with no audio at
+    // all reads as though it had some.
+    //
+    // `/api/load` no longer leaves a book in this state — it writes the index
+    // from the plan it is already holding, because otherwise a freshly opened
+    // book looks empty for up to `LIBRARY_SCAN_EVERY_S`. So the state is reached
+    // the way it is actually reached in the field: a book registered in the
+    // library that has never been indexed.
+    let h = Harness::new().await;
+    let Some(db) = h.state.store() else {
+        panic!("the harness has a store");
+    };
+    db.put_book(&narrator::store::BookRow {
+        key: "Never Scanned".into(),
+        name: "Never Scanned.epub".into(),
+        path: "/books/Never Scanned.epub".into(),
+        title: "Never Scanned".into(),
+        chapters: 12,
+        last_open_ms: None,
+        scanned_ms: None,
+    })
+    .expect("register");
+
+    let (code, body) = h.get_json("/api/library").await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let b = book(&body, "Never Scanned");
+    assert_eq!(b["chapters"], json!(12), "what the register knows: {b}");
+    assert_eq!(b["total_chunks"], json!(0), "what it does not: {b}");
+    assert_eq!(b["rendered_chunks"], json!(0), "{b}");
+    assert_eq!(b["est_min"], json!(null), "nothing measured: {b}");
+    assert_eq!(body["scanned_ms"], json!(null), "{body}");
+}
+
+#[tokio::test]
+async fn loading_a_book_indexes_it_there_and_then() {
+    // The other half of the rule above, and the reason it changed: a book that
+    // has just been opened is the one most likely to be asked about, and waiting
+    // up to five minutes for the scanner's next tick made it report zero
+    // chapters and zero chunks — not a guess, but indistinguishable from one.
     let h = Harness::new().await;
     let load = h.load().await;
     let key = load["key"].as_str().unwrap_or("").to_string();
-    // `/api/load` registers the book; no scan has run.
+
     let (code, body) = h.get_json("/api/library").await;
     assert_eq!(code, StatusCode::OK, "{body}");
     let b = book(&body, &key);
-    assert!(b["chapters"].as_u64().unwrap_or(0) > 0, "{b}");
-    assert_eq!(b["total_chunks"], json!(0), "{b}");
-    assert_eq!(b["est_min"], json!(null), "nothing measured: {b}");
-    assert_eq!(body["scanned_ms"], json!(null), "{body}");
+    assert!(
+        b["total_chunks"].as_u64().unwrap_or(0) > 0,
+        "the plan was in memory; there was nothing to wait for: {b}"
+    );
+    assert_eq!(
+        b["rendered_chunks"],
+        json!(0),
+        "and nothing rendered yet: {b}"
+    );
+    assert!(b["est_min"].as_f64().unwrap_or(0.0) > 0.0, "{b}");
+    assert!(body["scanned_ms"].as_i64().is_some(), "{body}");
 }
 
 /// One book, rescanned on its own — the call the render worker should make when
