@@ -1298,6 +1298,9 @@ measurement: this box is always rendering something):
 | `GET /api/chapters?from=700&to=760` | 1.5–4.7 ms, 11.8 kB | — |
 | `GET /api/status` | 20 ms, 631 B | — |
 | `POST /api/load`, cached plan | 0.30 s | 0.36 s |
+| `GET /api/library`, 4 books | **3.4–4.3 ms, 2.2 kB** | — |
+| `GET /api/library?book=…&chapters=true`, 1433 rows | **4.2 ms, 236 kB** | — |
+| a full library scan — 4 books, 1522 chapters | **0.40 s** | 0.11 s |
 
 **Synthesis runs at about a quarter of realtime here** — roughly four seconds of
 compute per second of audio, against 4.5× *faster* than realtime on the desktop.
@@ -1307,6 +1310,13 @@ render a book as fast as anyone listens to it, so the prerender span, the
 download-ahead drawer and the chapter queue are not optimisations — they are the
 only reason the reader works at all. A 12-minute chapter is the better part of an
 hour of rendering, and a 74-chapter download is an overnight job.
+
+**The library index is cheap, and that is the whole reason it exists.** A
+readiness answer for every book costs 3.4 ms and 2.2 kB out of the scanned
+index; the scan behind it walks 1522 chapters in 0.40 s and runs every five
+minutes, standing down for a voice memo and for a renderer under the playhead.
+The same question asked the old way — open each book, poll `/api/chapters` —
+was a `/api/load` per book and a few thousand `stat`s per poll.
 
 **`/api/chapters` pagination: measured, and not needed.** The full 1433-row
 response is 273 kB and 25 ms cold on the A1 — 7 ms while the 1.5 s memo holds,
@@ -1537,29 +1547,30 @@ This server *is* production: the box runs the published arm64 image, the reader
 runs against it, and the cache and the vault it adopted are the same ones the
 python server left. What that sentence does not cover:
 
-- **This round has not run on the A1.** Everything in it — the device identity,
-  the store, the library index, the scheduler's three new branches — is proven
-  by 293 Rust tests and 353 reader tests, by `cargo clippy -D warnings`, by an
-  amd64 image that builds and runs, and by a live server on this desktop that
-  was driven through the whole flow by hand: two books registered, a chapter of
-  one ordered *by name* while the other was loaded, rendered and packed without
-  that book ever being opened, the library reporting both, and the worker at
-  0.0 % CPU with `status: ready` once there was nothing left to do. What none of
-  that is, is the box. Specifically unproven there:
-  - **the scan cost.** 0.10 s for the 1433-chapter book on sixteen x86 cores;
-    the A1's `/api/chapters` ratio suggests a few hundred ms, and that is an
-    extrapolation rather than a measurement.
-  - **the ceiling against a real 50 GB cache.** The gc-versus-speculation
-    argument is sound and tested at 1 MB; the number that matters is how long
-    `gc_audio`'s walk takes over 50 GB of wavs, once a minute.
-  - **`state.db` under the box's own concurrency**, with a renderer, a packer, a
-    scanner and several devices on it at once. It is one connection behind one
-    mutex and the data is measured in hundreds of kilobytes, so the expectation
-    is that it is invisible — but *expectation* is the word.
-  - **the arbitration with real devices.** The rules are unit-tested and the
-    event fields are asserted on the wire, but the bug they fix was reported
-    from a phone and a laptop in the same house, and that is where the fix has
-    to be seen to work.
+- **This round is on the box**, and the adoption was uneventful: the arm64 image
+  was pulled, `work/state.db` created, the session restored on *Lord of
+  Mysteries* at chapter 847, the four books registered and 1522 chapters
+  indexed, and chunks landing again within seconds. `/healthz` reports
+  `store: true`, no problems, and no warning in the log. The three `queue.json`
+  files were adopted and each turned out to hold `items: []` — the orders had
+  already finished, so nothing was owed, which is the right answer rather than a
+  missed migration. See [the A1 numbers](#the-a1-measured) for what it measured.
+  What is **still** unproven there:
+  - **the ceiling against a real 50 GB cache.** The cache is 9 GB today against
+    a 50 GB cap, so the 80 % line has not been approached, let alone the
+    collector below it. The argument is sound and the behaviour is tested at
+    1 MB; the number nobody has is how long `gc_audio`'s walk takes over 50 GB
+    of wavs, once a minute.
+  - **the arbitration with real devices.** The rules are unit-tested, the event
+    fields are asserted on the wire, and the box is now sending them — but the
+    bug they fix was reported from a phone and a laptop in the same house, and
+    that is where the fix has to be *seen* to work. The one position row on the
+    box still carries the anonymous device id, because it was written before the
+    new reader was picked up.
+  - **days rather than hours.** Resident memory is 1.07 GB a few minutes in,
+    which is the same shape as before; gc churn at the cap over days, and
+    whether anything drifts across thousands of sessions, still has no evidence
+    either way.
 - **The pronunciation fixes have not been heard.** The defects in
   [the engine notes](#engine-notes) are proven gone at the phoneme and token
   level, the number readings are asserted as text, and the suite checks all of
