@@ -239,7 +239,7 @@
             }
           },
           "409": {
-            "description": "the session holds another book",
+            "description": "the session holds another book. This is a *read*: to ask about a book that is not loaded, use `/api/library`, which answers for the whole library out of the scanned index.",
             "content": {
               "application/json": {
                 "schema": {
@@ -290,7 +290,7 @@
             }
           },
           "409": {
-            "description": "the session holds another book",
+            "description": "no such book — the name given is neither the loaded book nor one the library knows. A *known* book that is not the loaded one is acted on rather than refused: the order goes to that book and the worker picks it up.",
             "content": {
               "application/json": {
                 "schema": {
@@ -307,7 +307,6 @@
         "tags": [
           "chapters"
         ],
-        "summary": "Drop chapters from the queues. An empty body clears both.",
         "operationId": "chapters_cancel",
         "requestBody": {
           "content": {
@@ -331,7 +330,7 @@
             }
           },
           "409": {
-            "description": "the session holds another book",
+            "description": "no such book — the name given is neither the loaded book nor one the library knows. A *known* book that is not the loaded one is acted on rather than refused: the order goes to that book and the worker picks it up.",
             "content": {
               "application/json": {
                 "schema": {
@@ -382,7 +381,7 @@
             }
           },
           "409": {
-            "description": "the session holds another book",
+            "description": "no such book — the name given is neither the loaded book nor one the library knows. A *known* book that is not the loaded one is acted on rather than refused: the order goes to that book and the worker picks it up.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2048,7 +2047,7 @@
               "string",
               "null"
             ],
-            "description": "The book these chapters belong to. **Additive, and the one worth\nsending**: this is the endpoint where a race costs hours. The reader\npolls `/api/chapters`, the reader taps \"download the rest\", and in\nbetween the watcher may have picked up an epub, the Obsidian plugin may\nhave opened something, another device may have loaded another book — and\n74 chapters of rendering then land on that one. Supplied and mismatched,\nthis is a **409**; omitted, it means \"whatever is loaded\", as before."
+            "description": "The book these chapters belong to. **Additive, and the one worth\nsending**: this is the endpoint where a race costs hours. The reader\npolls `/api/chapters`, the reader taps \"download the rest\", and in\nbetween the watcher may have picked up an epub, the Obsidian plugin may\nhave opened something, another device may have loaded another book — and\n74 chapters of rendering then land on that one. Omitted, it means\n\"whatever is loaded\", as before.\n\nSupplied and naming a *different* book that the library knows, the order\nis placed on **that** book — the worker follows standing orders across\nthe library and the packer packs them, so naming one is a request the\nserver can honour rather than a race it has to refuse. Supplied and\nnaming nothing the library has, it is a **409**, which is now a real\nrefusal rather than a limitation wearing one's clothes."
           },
           "chapters": {
             "type": [

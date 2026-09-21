@@ -415,23 +415,43 @@ const IDLE_BOOKS: usize = 20;
 /// Completion is still disk truth — an order whose chunks all exist simply
 /// leaves the list the first time this looks at it, exactly as `next_queued`
 /// does for the loaded book.
-fn next_elsewhere(st: &Arc<AppState>, cur_key: &str) -> Option<Idle> {
+fn next_elsewhere(
+    st: &Arc<AppState>,
+    cur_key: &str,
+    plans: &mut Option<(String, Arc<Vec<crate::book::Chapter>>)>,
+) -> Option<Idle> {
     for (key, items) in crate::wishlist::all_outstanding(st) {
         if key == cur_key {
             continue; // `next_queued` owns this one.
         }
-        let Some(plan) = crate::plancache::read_raw(&st.cfg.work, &key) else {
-            continue;
+        // Reading `plan.json` is 0.30 s on the 1433-chapter book, and this runs
+        // once per chunk rendered. Holding the last one read is what keeps that
+        // from being the dominant cost of the branch: an order is worked through
+        // one book at a time, so the cache hits on every iteration but the first.
+        let plan = match plans {
+            Some((k, p)) if *k == key => p.clone(),
+            _ => {
+                let Some(p) = crate::plancache::read_raw(&st.cfg.work, &key) else {
+                    continue;
+                };
+                *plans = Some((key.clone(), p.clone()));
+                p
+            }
         };
         for it in items {
             if it.parked {
                 continue; // out of attempts: still wanted, no longer tried.
             }
             let Some(ch) = plan.get(it.chapter) else {
+                // Not a chapter of this book any more — a re-chunk, a different
+                // epub under the same name. Nothing to render and nothing to
+                // wait for.
+                retire(st, &key, it.chapter, 0, false);
                 continue;
             };
             let n = ch.chunks.len();
             if n == 0 {
+                retire(st, &key, it.chapter, 0, false);
                 continue;
             }
             if let Some(j) = first_missing(st, &key, it.chapter, 0, n) {
@@ -442,9 +462,40 @@ fn next_elsewhere(st: &Arc<AppState>, cur_key: &str) -> Option<Idle> {
                     plan,
                 });
             }
+            // Every chunk is on disk. Completion is disk truth, so this is where
+            // the order ends: hand it to the packer if it asked to be packed,
+            // and take it off the list either way.
+            //
+            // Retiring it here is not tidiness. An order that is never dropped
+            // is walked again on every pass of the worker loop, for the life of
+            // the process — a `read_dir` per chapter and, without the cache
+            // above, a plan read too. A finished order that stays on the list is
+            // a slow leak with a healthy-looking log, which is the shape of
+            // failure this whole round is about.
+            retire(st, &key, it.chapter, n, it.pack);
         }
     }
     None
+}
+
+/// Take a finished (or impossible) order off the list, packing it first if that
+/// is what was asked for.
+fn retire(st: &Arc<AppState>, key: &str, ci: usize, n: usize, pack: bool) {
+    // `n` matters: a manifest whose chunk count disagrees with the plan is a
+    // manifest for a chapter that has since been re-rendered, and packing again
+    // is exactly right. Passing a wrong `n` here would either re-pack a finished
+    // chapter on every pass or accept a stale file as done.
+    if pack && !chapters::chapter_packed(&st.cfg.work, key, ci, n) {
+        // The packer drops the intent when the encode lands, so the order
+        // survives a restart that happens mid-pack.
+        enqueue_build_elsewhere(st, key, ci);
+        return;
+    }
+    if let Some(db) = st.store() {
+        if let Err(e) = db.drop_intent(key, ci) {
+            tracing::warn!("could not clear the order for {key} ch{ci}: {e}");
+        }
+    }
 }
 
 /// First unrendered chunk of the chapter queue the UI filled, or None.
@@ -593,6 +644,23 @@ pub fn enqueue_build(st: &Arc<AppState>, ci: usize) {
     ensure_build_thread(st);
 }
 
+/// The same, for a chapter of a book the session is not holding.
+///
+/// Ranked below `pack_queue` by the builder, which is the right way round: the
+/// book in front of the reader is the one whose file somebody may be waiting
+/// for.
+pub fn enqueue_build_elsewhere(st: &Arc<AppState>, key: &str, ci: usize) {
+    {
+        let mut s = st.session();
+        let job = (key.to_string(), ci);
+        if !s.pack_elsewhere.contains(&job) {
+            s.pack_elsewhere.push(job);
+        }
+    }
+    st.build_ev.set();
+    ensure_build_thread(st);
+}
+
 // ----------------------------------------------------------------- the worker
 
 fn worker(st: Arc<AppState>) {
@@ -603,6 +671,9 @@ fn worker(st: Arc<AppState>) {
     // has already been logged — once per spell, not once a second.
     let mut measured: Option<Instant> = None;
     let mut said_full = false;
+    // The last foreign plan read, so a standing order on another book does not
+    // cost a `plan.json` parse per chunk. See `next_elsewhere`.
+    let mut plans: Option<(String, Arc<Vec<crate::book::Chapter>>)> = None;
     let mut bo = Backoff::default();
     let mut parked: Option<Instant> = None;
     while !st.stop.load(Ordering::SeqCst) {
@@ -743,7 +814,7 @@ fn worker(st: Arc<AppState>) {
         //     standing order on. Below the loaded book's queue, above the
         //     speculative branch: an explicit ask beats a guess, and the book in
         //     front of the reader beats one that is not.
-        if let Some(t) = next_elsewhere(&st, &key) {
+        if let Some(t) = next_elsewhere(&st, &key, &mut plans) {
             {
                 let mut s = st.session();
                 s.status = "queued".into();
@@ -961,8 +1032,35 @@ fn builder(st: Arc<AppState>) {
             let mut s = st.session();
             match s.pack_queue.first().copied() {
                 None => {
-                    st.build_ev.clear();
-                    None
+                    // Nothing for the loaded book. A chapter of some *other*
+                    // book that somebody ordered is next — see
+                    // `Session::pack_elsewhere` for why that list exists at all.
+                    // Its plan is read raw, like everything else that touches a
+                    // book this process is not holding.
+                    match s.pack_elsewhere.first().cloned() {
+                        None => {
+                            st.build_ev.clear();
+                            None
+                        }
+                        Some((k, cj)) => {
+                            drop(s);
+                            match crate::plancache::read_raw(&st.cfg.work, &k) {
+                                Some(plan) => {
+                                    st.session().building = Some(cj);
+                                    Some((cj, plan, k, String::new()))
+                                }
+                                None => {
+                                    // No plan, so nothing that could be packed.
+                                    // Drop it rather than spin on it.
+                                    tracing::warn!("cannot pack {k} ch{cj}: no plan.json");
+                                    st.session()
+                                        .pack_elsewhere
+                                        .retain(|j| j.0 != k || j.1 != cj);
+                                    None
+                                }
+                            }
+                        }
+                    }
                 }
                 Some(ci) => {
                     s.building = Some(ci);
@@ -1020,9 +1118,24 @@ fn builder(st: Arc<AppState>) {
             let mut s = st.session();
             s.building = None;
             s.pack_queue.retain(|c| *c != ci);
+            s.pack_elsewhere.retain(|j| *j != (key.clone(), ci));
             s.build_want.remove(&ci);
             s.chapter
         };
+        // A foreign chapter that packed has nothing left to want: the order was
+        // "render it and pack it", and both have happened. Dropping the intent
+        // here rather than leaving it for the renderer to notice is what keeps
+        // `next_elsewhere` from walking a list that never shrinks.
+        if let Some(db) = st.store() {
+            if st.session().key().as_deref() != Some(key.as_str()) {
+                if let Err(e) = db.drop_intent(&key, ci) {
+                    tracing::warn!("could not clear the order for {key} ch{ci}: {e}");
+                }
+            }
+        }
+        // The library row for a book nobody has loaded has just changed in the
+        // one way that matters: it became downloadable.
+        crate::library::rescan_book(&st, &key);
         // Whether it packed or not. A failed encode already leaves the queues
         // here rather than being retried forever in this process, and the file
         // has to say the same thing — a pack that fails on every restart is the

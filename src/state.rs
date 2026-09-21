@@ -47,6 +47,19 @@ pub struct Session {
     pub build_want: BTreeSet<usize>,
     /// Chapters waiting for the packer, and the one it is on.
     pub pack_queue: Vec<usize>,
+    /// The same, for chapters of a book this session is **not** holding.
+    ///
+    /// A separate list rather than a key on `pack_queue`, for one reason:
+    /// `pack_queue` is in `/api/status` as a list of chapter numbers and that is
+    /// a frozen shape. This is additive beside it.
+    ///
+    /// It exists because a standing order outlives the book being loaded. Order
+    /// seventy-four chapters, then open something else: the renderer follows
+    /// them (see `next_elsewhere`), and without this the packer could not, so a
+    /// night of rendering would produce no files at all until that book was
+    /// opened again — which is the exact bug `pack: true` was introduced to fix,
+    /// one level up.
+    pub pack_elsewhere: Vec<(String, usize)>,
     pub building: Option<usize>,
     pub build_error: Option<String>,
 }

@@ -875,6 +875,40 @@ reason), that a hole punched under the playhead still gets filled first, that
 rendering ahead does not read as a stall to `/healthz`, that a finished library
 stops rather than spins, and that a finished book moves on to the next one.
 
+### Ordering a book you are not reading
+
+Requirement 7 gave the chapter verbs a `book` field and a **409** on a mismatch,
+and the reasoning holds: one tap is 74 chapters, and 74 chapters of rendering on
+the wrong novel is an afternoon of the worker. But refusing was only ever half
+the right answer. The client *named* a book; the correct thing is to act on that
+one.
+
+Nothing stood in the way any more. The worker follows standing orders across the
+library (branch 4) and the packer can pack a chapter of a book the session is
+not holding (`Session::pack_elsewhere`). So `/api/chapters/render`,
+`/api/chapters/build` and `/api/chapters/cancel` now act on any book **the
+library knows**, and a 409 means *no such book* — a real refusal rather than a
+limitation wearing one's clothes. `GET /api/chapters` keeps its 409, because it
+is a read and `/api/library` is the endpoint that answers for the whole library.
+
+That is what makes the readiness line on a book row something you can act on:
+see that a book is half packed, ask for the rest, and never open it.
+
+Three things that had to be true for it to be safe, all tested:
+
+- **A finished order is retired.** An order that is never dropped is walked
+  again on every pass of the worker loop for the life of the process — a
+  `read_dir` per chapter and a `plan.json` parse, which on the 1433-chapter book
+  is 0.30 s *per chunk rendered*. A completed order hands itself to the packer if
+  it asked to be packed and leaves the list either way. A slow leak with a
+  healthy-looking log is the exact shape of failure this round is about.
+- **The foreign plan is cached.** One book is worked through at a time, so the
+  cache hits on every iteration but the first.
+- **Cancelling reaches as far as ordering.** A download that could be started and
+  never stopped is hours of the box's only spare core on something nobody wants
+  any more. A chapter the packer has already picked up is left alone, exactly as
+  the loaded book's `building` is.
+
 ### The CPU policy: pack when the renderer is ahead or idle
 
 Two ARM cores, Kokoro at a quarter of realtime, and now packs that arrive with no

@@ -177,8 +177,15 @@ export type ChapterSetBody = {
      * polls `/api/chapters`, the reader taps "download the rest", and in
      * between the watcher may have picked up an epub, the Obsidian plugin may
      * have opened something, another device may have loaded another book — and
-     * 74 chapters of rendering then land on that one. Supplied and mismatched,
-     * this is a **409**; omitted, it means "whatever is loaded", as before.
+     * 74 chapters of rendering then land on that one. Omitted, it means
+     * "whatever is loaded", as before.
+     *
+     * Supplied and naming a *different* book that the library knows, the order
+     * is placed on **that** book — the worker follows standing orders across
+     * the library and the packer packs them, so naming one is a request the
+     * server can honour rather than a race it has to refuse. Supplied and
+     * naming nothing the library has, it is a **409**, which is now a real
+     * refusal rather than a limitation wearing one's clothes.
      */
     book?: string | null;
     chapters?: Array<number> | null;
@@ -716,7 +723,7 @@ export type ChaptersListData = {
 
 export type ChaptersListErrors = {
     /**
-     * the session holds another book
+     * the session holds another book. This is a *read*: to ask about a book that is not loaded, use `/api/library`, which answers for the whole library out of the scanned index.
      */
     409: ApiError;
 };
@@ -739,7 +746,7 @@ export type ChaptersBuildData = {
 export type ChaptersBuildErrors = {
     400: ApiError;
     /**
-     * the session holds another book
+     * no such book — the name given is neither the loaded book nor one the library knows. A *known* book that is not the loaded one is acted on rather than refused: the order goes to that book and the worker picks it up.
      */
     409: ApiError;
 };
@@ -761,7 +768,7 @@ export type ChaptersCancelData = {
 
 export type ChaptersCancelErrors = {
     /**
-     * the session holds another book
+     * no such book — the name given is neither the loaded book nor one the library knows. A *known* book that is not the loaded one is acted on rather than refused: the order goes to that book and the worker picks it up.
      */
     409: ApiError;
 };
@@ -784,7 +791,7 @@ export type ChaptersRenderData = {
 export type ChaptersRenderErrors = {
     400: ApiError;
     /**
-     * the session holds another book
+     * no such book — the name given is neither the loaded book nor one the library knows. A *known* book that is not the loaded one is acted on rather than refused: the order goes to that book and the worker picks it up.
      */
     409: ApiError;
 };

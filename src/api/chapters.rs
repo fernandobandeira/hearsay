@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::{err, round1, round3, ApiError};
+use crate::api::device::Device;
 use crate::cache;
 use crate::chapters as pack;
 use crate::render;
@@ -180,7 +181,9 @@ pub fn chapter_rows(st: &Arc<AppState>) -> Vec<ChapterRow> {
     get, path = "/api/chapters", tag = "chapters",
     params(ChaptersQuery),
     responses((status = 200, body = ChaptersResult),
-              (status = 409, body = ApiError, description = "the session holds another book"))
+              (status = 409, body = ApiError, description = "the session holds another book. \
+This is a *read*: to ask about a book that is not loaded, use `/api/library`, \
+which answers for the whole library out of the scanned index."))
 )]
 pub async fn chapters_list(
     State(st): State<Arc<AppState>>,
@@ -271,8 +274,15 @@ pub struct ChapterSetBody {
     /// polls `/api/chapters`, the reader taps "download the rest", and in
     /// between the watcher may have picked up an epub, the Obsidian plugin may
     /// have opened something, another device may have loaded another book — and
-    /// 74 chapters of rendering then land on that one. Supplied and mismatched,
-    /// this is a **409**; omitted, it means "whatever is loaded", as before.
+    /// 74 chapters of rendering then land on that one. Omitted, it means
+    /// "whatever is loaded", as before.
+    ///
+    /// Supplied and naming a *different* book that the library knows, the order
+    /// is placed on **that** book — the worker follows standing orders across
+    /// the library and the packer packs them, so naming one is a request the
+    /// server can honour rather than a race it has to refuse. Supplied and
+    /// naming nothing the library has, it is a **409**, which is now a real
+    /// refusal rather than a limitation wearing one's clothes.
     #[serde(default)]
     pub book: Option<String>,
 }
@@ -304,6 +314,84 @@ fn wanted(body: &ChapterSetBody, n: usize) -> Vec<usize> {
         .collect()
 }
 
+/// Place a standing order on a book the session is **not** holding.
+///
+/// `wrong_book` answers 409 for a named book that is not the loaded one, and
+/// that was right while it was the only answer available: acting on the loaded
+/// book when the client meant another one is the expensive mistake this endpoint
+/// exists to prevent — one tap is 74 chapters of rendering, and on the wrong
+/// novel that is an afternoon of the worker.
+///
+/// But refusing was only ever half of the right answer. The client named a book;
+/// the correct thing is to act on **that** one, and since the worker learned to
+/// follow orders across the library (`next_elsewhere`) and the packer to pack
+/// them, nothing stands in the way. A 409 here now means "no such book",
+/// which is a real refusal, rather than "not the one in front of me", which was
+/// a limitation wearing a refusal's clothes.
+///
+/// Returns `None` when the key is not one the library knows, leaving the caller
+/// to refuse as before.
+#[allow(clippy::result_large_err)]
+fn order_elsewhere(
+    st: &Arc<AppState>,
+    key: &str,
+    body: &ChapterSetBody,
+    dev: &Device,
+    pack: bool,
+) -> Option<Result<RenderResult, Response>> {
+    let db = st.store()?;
+    // Known to the library *and* backed by a plan. Both matter: the register
+    // says the book exists, and `plan.json` is what the chapter numbers in the
+    // request are indices into. Without the second, a request could queue
+    // chapter 900 of a four-chapter book.
+    db.book(key).ok().flatten()?;
+    let plan = crate::plancache::read_raw(&st.cfg.work, key)?;
+    let want = wanted(body, plan.len());
+    if want.is_empty() {
+        return Some(Err(err(
+            StatusCode::BAD_REQUEST,
+            "no chapters in range for that book",
+        )));
+    }
+    let now_ms = chrono::Local::now().timestamp_millis();
+    if let Err(e) = db.add_intent(key, &want, &dev.id, pack, now_ms) {
+        return Some(Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not record the order: {e}"),
+        )));
+    }
+    // Anything already rendered never reaches the worker, exactly as on the
+    // loaded book's path — hand it straight to the packer rather than leaving it
+    // to be noticed.
+    let mut ready = Vec::new();
+    if pack {
+        for ci in &want {
+            let n = plan.get(*ci).map(|c| c.chunks.len()).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let dir = cache::chapter_dir(&st.cfg.work, key, *ci);
+            if cache::rendered_count(&dir, n) >= n
+                && !pack::chapter_packed(&st.cfg.work, key, *ci, n)
+            {
+                render::enqueue_build_elsewhere(st, key, *ci);
+                ready.push(*ci);
+            }
+        }
+    }
+    st.run.set();
+    render::ensure_render_thread(st);
+    let queue = db
+        .intents(key)
+        .map(|rows| rows.into_iter().map(|r| r.chapter).collect())
+        .unwrap_or_else(|_| want.clone());
+    Some(Ok(RenderResult {
+        ok: true,
+        queue,
+        packing: ready,
+    }))
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RenderResult {
     pub ok: bool,
@@ -318,14 +406,26 @@ pub struct RenderResult {
     post, path = "/api/chapters/render", tag = "chapters",
     request_body = ChapterSetBody,
     responses((status = 200, body = RenderResult), (status = 400, body = ApiError),
-              (status = 409, body = ApiError, description = "the session holds another book"))
+              (status = 409, body = ApiError, description = "no such book — the name given is \
+neither the loaded book nor one the library knows. A *known* book that is not the \
+loaded one is acted on rather than refused: the order goes to that book and the \
+worker picks it up."))
 )]
 pub async fn chapters_render(
     State(st): State<Arc<AppState>>,
+    dev: Device,
     Json(body): Json<ChapterSetBody>,
 ) -> Response {
     if let Some(r) = super::session::wrong_book(&st, body.book.as_deref()) {
-        return r;
+        // Named, and not the loaded book — but the library may still know it, in
+        // which case acting on it is what was asked for. See `order_elsewhere`.
+        let key = cache::safe_key(body.book.as_deref().unwrap_or_default());
+        let pack = body.pack.unwrap_or(false);
+        return match order_elsewhere(&st, &key, &body, &dev, pack) {
+            Some(Ok(r)) => Json(r).into_response(),
+            Some(Err(e)) => e,
+            None => r,
+        };
     }
     match queue_chapters(&st, &body).await {
         Err(e) => e,
@@ -437,14 +537,35 @@ pub struct BuildResult {
     post, path = "/api/chapters/build", tag = "chapters",
     request_body = ChapterSetBody,
     responses((status = 200, body = BuildResult), (status = 400, body = ApiError),
-              (status = 409, body = ApiError, description = "the session holds another book"))
+              (status = 409, body = ApiError, description = "no such book — the name given is \
+neither the loaded book nor one the library knows. A *known* book that is not the \
+loaded one is acted on rather than refused: the order goes to that book and the \
+worker picks it up."))
 )]
 pub async fn chapters_build(
     State(st): State<Arc<AppState>>,
+    dev: Device,
     Json(body): Json<ChapterSetBody>,
 ) -> Response {
     if let Some(r) = super::session::wrong_book(&st, body.book.as_deref()) {
-        return r;
+        // A build on a book that is not loaded is the same standing order a
+        // render with `pack: true` places — the packer cannot encode a chapter
+        // whose chunks are not all there, so "pack it" and "render it and then
+        // pack it" are one request for any book the worker has to visit anyway.
+        // What it is *not* is a refusal, which is all this could say before.
+        let key = cache::safe_key(body.book.as_deref().unwrap_or_default());
+        return match order_elsewhere(&st, &key, &body, &dev, true) {
+            Some(Ok(o)) => Json(BuildResult {
+                ok: true,
+                built: Vec::new(),
+                building: o.packing,
+                rendering: o.queue,
+                refused: Vec::new(),
+            })
+            .into_response(),
+            Some(Err(e)) => e,
+            None => r,
+        };
     }
     let n = st.session().plan.len();
     if n == 0 {
@@ -530,18 +651,84 @@ pub struct CancelResult {
 }
 
 /// Drop chapters from the queues. An empty body clears both.
+/// Drop a standing order on a book the session is not holding.
+///
+/// The mirror of [`order_elsewhere`], and it exists for the same reason: an
+/// order that can be placed from the library view has to be cancellable from
+/// there too. Chapters named, those chapters; no chapters named, the whole
+/// book's order — the same "all of it" convention the loaded-book path uses.
+///
+/// A chapter the packer has already picked up is left alone, exactly as the
+/// loaded book's `building` is: abandoning an encode mid-chapter throws away
+/// every second it has spent.
+fn cancel_elsewhere(st: &Arc<AppState>, key: &str, body: &ChapterSetBody) -> Option<Response> {
+    let db = st.store()?;
+    db.book(key).ok().flatten()?;
+    let named: Option<Vec<usize>> = body.chapters.as_ref().filter(|c| !c.is_empty()).map(|_| {
+        let n = crate::plancache::read_raw(&st.cfg.work, key)
+            .map(|p| p.len())
+            .unwrap_or(usize::MAX);
+        wanted(body, n)
+    });
+    let dropped: Vec<usize> = match &named {
+        None => match db.intents(key) {
+            Ok(rows) => {
+                let all: Vec<usize> = rows.into_iter().map(|r| r.chapter).collect();
+                if let Err(e) = db.drop_intents_for_book(key) {
+                    tracing::warn!("could not cancel the order for {key}: {e}");
+                }
+                all
+            }
+            Err(e) => {
+                tracing::warn!("could not read the order for {key}: {e}");
+                Vec::new()
+            }
+        },
+        Some(w) => w
+            .iter()
+            .filter(|c| db.drop_intent(key, **c).unwrap_or(false))
+            .copied()
+            .collect(),
+    };
+    {
+        let mut s = st.session();
+        let building = s.building;
+        s.pack_elsewhere
+            .retain(|(k, c)| k != key || (!dropped.contains(c) || Some(*c) == building));
+    }
+    Some(
+        Json(CancelResult {
+            ok: true,
+            queue: dropped,
+        })
+        .into_response(),
+    )
+}
+
 #[utoipa::path(
     post, path = "/api/chapters/cancel", tag = "chapters",
     request_body = ChapterSetBody,
     responses((status = 200, body = CancelResult),
-              (status = 409, body = ApiError, description = "the session holds another book"))
+              (status = 409, body = ApiError, description = "no such book — the name given is \
+neither the loaded book nor one the library knows. A *known* book that is not the \
+loaded one is acted on rather than refused: the order goes to that book and the \
+worker picks it up."))
 )]
 pub async fn chapters_cancel(
     State(st): State<Arc<AppState>>,
     Json(body): Json<ChapterSetBody>,
 ) -> Response {
     if let Some(r) = super::session::wrong_book(&st, body.book.as_deref()) {
-        return r;
+        // Cancelling has to reach as far as ordering does, or a download placed
+        // on a book you are not reading could be started and never stopped —
+        // which on this box is hours of the worker on something nobody wants any
+        // more. Same rule as `order_elsewhere`: a book the library knows is
+        // acted on, anything else is a 409.
+        let key = cache::safe_key(body.book.as_deref().unwrap_or_default());
+        return match cancel_elsewhere(&st, &key, &body) {
+            Some(r) => r,
+            None => r,
+        };
     }
     let (queue, want) = {
         let mut s = st.session();

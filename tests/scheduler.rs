@@ -326,3 +326,186 @@ async fn an_order_on_another_book_is_not_invisible() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn an_order_on_another_book_is_packed_as_well_as_rendered() {
+    // The other half of the branch above, and the half whose absence would have
+    // been a trap. "Download these chapters" is `pack: true`, and the packer used
+    // to be able to pack only the loaded book's chapters — so an order that
+    // finished rendering while another book was open produced no file at all
+    // until you went back to it. That is exactly the bug `pack: true` was
+    // introduced to fix, one level up, and it would have come back here.
+    let h = Harness::with(|c| {
+        c.lookahead = 4;
+        c.prerender_chapters = 0;
+    })
+    .await;
+
+    let other = h.add_book("Wanted (2026).epub");
+    let (code, loaded) = h.post_json("/api/load", json!({"path": other})).await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{loaded}");
+    let other_key = loaded["key"].as_str().unwrap_or_default().to_string();
+    let (code, _) = h
+        .post_json(
+            "/api/chapters/render",
+            json!({"chapters": [1], "pack": true}),
+        )
+        .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+
+    // Away to a different book, whose own work is all done.
+    h.load().await;
+    let key = key_of(&h);
+    for (ci, n) in chapters_of(&h).into_iter().enumerate() {
+        seed_chapter(&h, &key, ci, n, 2400);
+    }
+    h.post_json("/api/open", json!({"chapter": 0, "chunk": 0}))
+        .await;
+
+    let (m4a, _) = narrator::chapters::chapter_files(&h.work(), &other_key, 1);
+    until(
+        "the ordered chapter of the other book to be packed",
+        30.0,
+        || m4a.exists(),
+    )
+    .await;
+
+    // ...and the order is then gone, which is not tidiness: an order that is
+    // never retired is walked again on every pass of the worker loop for the
+    // life of the process.
+    until("the finished order to be retired", 10.0, || {
+        narrator::wishlist::all_outstanding(&h.state)
+            .iter()
+            .all(|(k, items)| *k != other_key || items.is_empty())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_book_can_be_downloaded_without_being_opened() {
+    // The endpoint half of the branch above, and what makes the library view
+    // actionable: readiness is now visible for every book, so asking for one has
+    // to be possible for every book too.
+    //
+    // `wrong_book` used to answer 409 for any named book that was not the loaded
+    // one. That was right while it was the only answer available — one tap is 74
+    // chapters, and on the wrong novel that is an afternoon of the worker — but
+    // it refused the *correct* request along with the dangerous one. A 409 here
+    // now means "no such book", which is a real refusal.
+    let h = Harness::with(|c| {
+        c.lookahead = 4;
+        c.prerender_chapters = 0;
+    })
+    .await;
+
+    // Register the other book, then move away from it.
+    let other = h.add_book("Elsewhere (2026).epub");
+    let (code, loaded) = h.post_json("/api/load", json!({"path": other})).await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{loaded}");
+    let other_key = loaded["key"].as_str().unwrap_or_default().to_string();
+    h.load().await;
+    let key = key_of(&h);
+    assert_ne!(key, other_key);
+    for (ci, n) in chapters_of(&h).into_iter().enumerate() {
+        seed_chapter(&h, &key, ci, n, 2400);
+    }
+
+    // Ask for a chapter of the book we are *not* on, by name.
+    let (code, body) = h
+        .post_json(
+            "/api/chapters/render",
+            json!({"book": other_key, "chapters": [2], "pack": true}),
+        )
+        .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["queue"], json!([2]), "the order is the answer: {body}");
+
+    let (m4a, _) = narrator::chapters::chapter_files(&h.work(), &other_key, 2);
+    until(
+        "a book nobody opened to render and pack on request",
+        30.0,
+        || m4a.exists(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_book_the_library_has_never_heard_of_is_still_refused() {
+    // The refusal that remains, and the reason the change above is safe: naming
+    // a book nobody has is not a request the server can act on, and quietly
+    // acting on the loaded one instead is the failure `wrong_book` exists to
+    // prevent.
+    let h = Harness::new().await;
+    h.load().await;
+    let (code, body) = h
+        .post_json(
+            "/api/chapters/render",
+            json!({"book": "No Such Book", "chapters": [0]}),
+        )
+        .await;
+    assert_eq!(code, axum::http::StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("No Such Book"),
+        "and it says which book it could not find: {body}"
+    );
+    assert!(
+        h.state.session().queue.is_empty(),
+        "nothing was queued instead"
+    );
+}
+
+#[tokio::test]
+async fn an_order_placed_from_the_library_can_be_taken_back() {
+    // Ordering and cancelling have to reach equally far. A download placed on a
+    // book you are not reading that could be started and never stopped is hours
+    // of this box's only spare core spent on something nobody wants any more.
+    let h = Harness::with(|c| {
+        c.lookahead = 4;
+        c.prerender_chapters = 0;
+    })
+    .await;
+    let other = h.add_book("Regretted (2026).epub");
+    let (code, loaded) = h.post_json("/api/load", json!({"path": other})).await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{loaded}");
+    let other_key = loaded["key"].as_str().unwrap_or_default().to_string();
+    h.load().await;
+
+    let (code, _) = h
+        .post_json(
+            "/api/chapters/render",
+            json!({"book": other_key, "chapters": [1, 2, 3], "pack": true}),
+        )
+        .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+
+    let outstanding = |k: &str| -> Vec<usize> {
+        narrator::wishlist::all_outstanding(&h.state)
+            .into_iter()
+            .find(|(b, _)| b == k)
+            .map(|(_, items)| items.into_iter().map(|i| i.chapter).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(outstanding(&other_key), vec![1, 2, 3]);
+
+    // One chapter back...
+    let (code, body) = h
+        .post_json(
+            "/api/chapters/cancel",
+            json!({"book": other_key, "chapters": [2]}),
+        )
+        .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(body["queue"], json!([2]), "it says what it dropped: {body}");
+    assert_eq!(outstanding(&other_key), vec![1, 3]);
+
+    // ...and then all of it, which is what naming no chapters means.
+    let (code, body) = h
+        .post_json("/api/chapters/cancel", json!({"book": other_key}))
+        .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{body}");
+    assert!(outstanding(&other_key).is_empty(), "{body}");
+}

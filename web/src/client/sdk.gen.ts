@@ -66,9 +66,6 @@ export const chaptersBuild = <ThrowOnError extends boolean = false>(options: Opt
     }
 });
 
-/**
- * Drop chapters from the queues. An empty body clears both.
- */
 export const chaptersCancel = <ThrowOnError extends boolean = false>(options: Options<ChaptersCancelData, ThrowOnError>): RequestResult<ChaptersCancelResponses, ChaptersCancelErrors, ThrowOnError> => (options.client ?? client).post<ChaptersCancelResponses, ChaptersCancelErrors, ThrowOnError>({
     url: '/api/chapters/cancel',
     ...options,
