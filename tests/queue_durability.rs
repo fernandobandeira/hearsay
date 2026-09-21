@@ -14,6 +14,16 @@
 //! a watchdog, a file that names another book is never worked on, and resumed
 //! work stands down for a voice memo exactly like work that was asked for a
 //! moment ago.
+//!
+//! The second half of the file is the same contract against the second record.
+//! The order now also lives in `state.db`'s `intent` table, because the file per
+//! book cannot answer "what does this box owe, across the library, in the order
+//! it was promised" — so what is asserted there is that the file the running box
+//! already has is adopted rather than thrown away and then left where it is,
+//! that an order outlives a restart with no file to read, that a book the
+//! session is not holding is still visible and still in the order it was asked,
+//! and that with no database at all every one of the promises above holds
+//! unchanged.
 
 mod harness;
 
@@ -485,4 +495,329 @@ async fn a_book_nobody_queued_anything_for_has_no_file() {
     let (code, body) = h.get_json("/api/chapters").await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(body["queue"], json!([]), "{body}");
+}
+
+// ---------------------------------------------------------------- the store
+
+/// A second book in the library: the same words under a different name, which
+/// is a different cache key and therefore a different standing order.
+fn second_book(h: &Harness) -> String {
+    let p = h.state.cfg.books[0].join("Second Fixture (2026).epub");
+    std::fs::copy(harness::fixture_epub(), &p).expect("copy fixture epub");
+    p.to_string_lossy().to_string()
+}
+
+/// Place a standing order without waking the renderer.
+///
+/// `/api/chapters/render` does exactly this and then starts the worker, which
+/// with the fake engine finishes a fixture chapter well inside the next line of
+/// the test — and a finished chapter leaves the list, which is right and is the
+/// wrong thing to be racing. The tests above are about the endpoint; these are
+/// about what the two records hold when nothing is moving.
+fn order(h: &Harness, chapters: &[usize], pack: bool) {
+    {
+        let mut s = h.state.session();
+        for c in chapters {
+            if !s.queue.contains(c) {
+                s.queue.push(*c);
+            }
+            if pack {
+                s.build_want.insert(*c);
+            }
+        }
+    }
+    narrator::wishlist::asked(&h.state, chapters);
+}
+
+/// The book's standing order as the table holds it.
+fn intents(h: &Harness, key: &str) -> Vec<narrator::store::IntentRow> {
+    h.state
+        .store()
+        .expect("state.db")
+        .intents(key)
+        .expect("intents")
+}
+
+/// The file the running box already has is picked up, not thrown away.
+///
+/// This is the only migration there is: the A1 is holding orders in
+/// `queue.json` right now and has never had a row in `intent`. The first boot of
+/// a binary with the table has to read the file, keep the order it was asked in,
+/// keep the pack flags that say "download" rather than "render", and keep the
+/// attempt counts — dropping those last would hand a chapter that has already
+/// wedged the box four times a fresh five tries.
+#[tokio::test]
+async fn an_existing_queue_file_is_adopted_into_the_store() {
+    // Nothing may render: a chunk landing clears the very counts under test, and
+    // what is being asserted is the state of both records the instant boot ends.
+    let mut h = Harness::with(|c| c.queue_resume_delay_s = 600.0).await;
+    h.load().await;
+    let key = key_of(&h);
+    assert!(
+        intents(&h, &key).is_empty(),
+        "nothing has been asked for yet"
+    );
+
+    // Exactly what the previous binary leaves behind, counts and all.
+    let p = queue_file(&h);
+    std::fs::create_dir_all(p.parent().expect("parent")).expect("dir");
+    std::fs::write(
+        &p,
+        json!({"version": 1, "book": h.book_path(), "key": key,
+               "updated": "2026-09-20T22:00:00+02:00",
+               "items": [{"chapter": 3, "pack": true, "attempts": 2},
+                         {"chapter": 1, "pack": false}]})
+        .to_string(),
+    )
+    .expect("write");
+
+    h.restart().await;
+
+    let rows = intents(&h, &key);
+    assert_eq!(
+        rows.iter().map(|r| (r.chapter, r.pack)).collect::<Vec<_>>(),
+        vec![(3, true), (1, false)],
+        "the order asked and the reason for asking"
+    );
+    assert!(
+        rows[0].seq < rows[1].seq,
+        "`seq` is the order, not the index"
+    );
+    // Two attempts came out of the file and this boot is the third; a count that
+    // started again at zero here is the whole poison bound undone.
+    assert_eq!(rows.iter().map(|r| r.tries).collect::<Vec<_>>(), vec![3, 1]);
+    assert_eq!(h.state.wishlist().attempts(3), 3);
+    assert_eq!(h.state.session().queue, vec![3, 1]);
+    assert!(h.state.session().build_want.contains(&3));
+}
+
+/// ... and the file it was adopted from is still sitting there.
+///
+/// Deliberately not deleted, and not an oversight: `state.db` is new and the
+/// binary that predates it is one `docker pull` away, reading only this file. A
+/// rollback that cost an overnight download would be a worse failure than
+/// anything the table was added to fix, so the file keeps being written and the
+/// way back keeps working.
+#[tokio::test]
+async fn the_adopted_file_is_left_behind_as_the_way_back() {
+    let mut h = Harness::with(|c| c.queue_resume_delay_s = 600.0).await;
+    h.load().await;
+    let key = key_of(&h);
+    order(&h, &[2, 1], true);
+    h.restart().await;
+
+    // The table has it...
+    assert_eq!(
+        intents(&h, &key)
+            .iter()
+            .map(|r| r.chapter)
+            .collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+    // ... and so does the file, with the flag that makes it a download.
+    let raw = std::fs::read(queue_file(&h)).expect("queue.json survived");
+    let doc: Value = serde_json::from_slice(&raw).expect("parse");
+    assert_eq!(doc["key"], json!(key), "{doc}");
+    assert_eq!(
+        doc["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|i| (i["chapter"].clone(), i["pack"].clone()))
+            .collect::<Vec<_>>(),
+        vec![(json!(2), json!(true)), (json!(1), json!(true))],
+        "{doc}"
+    );
+}
+
+/// The order comes back with no file to read it from.
+///
+/// The file is the way back, not the way forward. Taking it away leaves the
+/// table as the only record of the night's work, which is what a box that has
+/// been running the new binary for a week actually looks like once something has
+/// tidied `work/` — and the queue has to survive that.
+#[tokio::test]
+async fn an_order_survives_a_restart_through_the_store_alone() {
+    let mut h = Harness::with(|c| c.queue_resume_delay_s = 600.0).await;
+    h.load().await;
+    order(&h, &[3, 1], true);
+    std::fs::remove_file(queue_file(&h)).expect("remove the file");
+
+    h.restart().await;
+
+    assert_eq!(h.state.session().queue, vec![3, 1], "the order was lost");
+    assert!(
+        h.state.session().build_want.contains(&3),
+        "the chapter came back without the reason it was asked for"
+    );
+    // And the boot writes the file back out, so the way back is never missing
+    // for longer than one restart.
+    assert!(queue_file(&h).exists());
+}
+
+/// A standing order on a book nobody is holding is still owed.
+///
+/// This is the question a file per book cannot answer and the reason the table
+/// exists: the scheduler has to see everything the box owes at once, and a
+/// download on the novel Fernando was reading last week is invisible to anything
+/// that only looks at the session.
+#[tokio::test]
+async fn all_outstanding_sees_a_book_the_session_is_not_holding() {
+    let h = Harness::with(|c| c.queue_resume_delay_s = 600.0).await;
+    h.load().await;
+    let first = key_of(&h);
+    order(&h, &[2], true);
+
+    // Another book takes the session. The first one's order is untouched by
+    // that — a `/api/load` is somebody changing what they are reading, not
+    // cancelling a download.
+    let (code, body) = h
+        .post_json("/api/load", json!({"path": second_book(&h)}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let second = key_of(&h);
+    assert_ne!(first, second);
+    order(&h, &[1], false);
+
+    let all = narrator::wishlist::all_outstanding(&h.state);
+    assert_eq!(
+        all.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        vec![first, second]
+    );
+    assert_eq!(
+        all[0]
+            .1
+            .iter()
+            .map(|i| (i.chapter, i.pack))
+            .collect::<Vec<_>>(),
+        vec![(2, true)],
+        "the book the session let go of"
+    );
+    assert_eq!(
+        all[1].1.iter().map(|i| i.chapter).collect::<Vec<_>>(),
+        vec![1]
+    );
+}
+
+/// Across two books, the order is the order asked.
+///
+/// `seq` is global and monotonic, so "what was promised first" has an answer
+/// that spans the library rather than one that restarts at each book. Coming
+/// back to a book adds to the end of its list rather than moving it to the
+/// front, which is the same rule inside one book and across all of them.
+#[tokio::test]
+async fn the_order_across_two_books_is_the_order_asked() {
+    let h = Harness::with(|c| c.queue_resume_delay_s = 600.0).await;
+    h.load().await;
+    let first = key_of(&h);
+    order(&h, &[3], true);
+
+    let (code, body) = h
+        .post_json("/api/load", json!({"path": second_book(&h)}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let second = key_of(&h);
+    order(&h, &[2, 1], true);
+
+    // Back to the first book, and one more chapter of it.
+    h.load().await;
+    assert_eq!(key_of(&h), first);
+    assert_eq!(
+        h.state.session().queue,
+        vec![3],
+        "re-opening the book lost its order"
+    );
+    order(&h, &[0], true);
+
+    let all = narrator::wishlist::all_outstanding(&h.state);
+    assert_eq!(
+        all.iter()
+            .map(|(k, items)| (
+                k.clone(),
+                items.iter().map(|i| i.chapter).collect::<Vec<_>>()
+            ))
+            .collect::<Vec<_>>(),
+        vec![(first, vec![3, 0]), (second, vec![2, 1])],
+        "a book asked for first comes first, and a second ask goes to the back"
+    );
+}
+
+/// With no database at all, every promise this module makes still holds.
+///
+/// `state.db` is optional on purpose — a work directory gone read-only or a file
+/// that is not a database must never be a server that will not start — and the
+/// fallback is not a reduced version of the queue, it is the file-per-book
+/// arrangement that shipped before the table existed, unchanged. Simulated the
+/// least invasive way there is: a *directory* where the database file goes, so
+/// `Store::open` fails exactly as it would on a disk nobody can write.
+#[tokio::test]
+async fn with_no_database_the_file_is_still_the_whole_contract() {
+    let mut h = Harness::with(|c| {
+        std::fs::create_dir_all(c.work.join("state.db")).expect("block state.db");
+        c.queue_resume_delay_s = 600.0;
+    })
+    .await;
+    assert!(h.state.store().is_none(), "this test has no subject");
+    h.load().await;
+    order(&h, &[3, 1], true);
+    assert!(queue_file(&h).exists(), "the file is the only record left");
+
+    h.restart().await;
+    assert!(h.state.store().is_none());
+    assert_eq!(h.state.session().queue, vec![3, 1]);
+    assert!(h.state.session().build_want.contains(&3));
+
+    // `all_outstanding` answers for the book in front of it and says nothing
+    // about any other — not a degraded answer, the only answer a file per book
+    // can give, because nothing has read the others and nothing knows to look.
+    let all = narrator::wishlist::all_outstanding(&h.state);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].0, key_of(&h));
+    assert_eq!(
+        all[0].1.iter().map(|i| i.chapter).collect::<Vec<_>>(),
+        vec![3, 1]
+    );
+
+    // And a cancel still outlives the process that took it.
+    let (code, _) = h
+        .post_json("/api/chapters/cancel", json!({"chapters": [3]}))
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    h.restart().await;
+    assert_eq!(h.state.session().queue, vec![1]);
+    assert!(narrator::wishlist::all_outstanding(&h.state)
+        .iter()
+        .all(|(_, items)| !items.iter().any(|i| i.chapter == 3)));
+}
+
+/// A damaged file is not overruled by the table, it empties it.
+///
+/// The half of `a_torn_queue_file_costs_the_queue_and_nothing_else` that is
+/// about the second record. The two are written from one snapshot, so a row the
+/// file no longer backs is a row about nothing — and leaving it would have the
+/// scheduler chasing an order this boot has already decided it does not have,
+/// on a book whose own file says nothing at all. Absent is the case the table
+/// rescues; damaged is not.
+#[tokio::test]
+async fn a_damaged_file_takes_the_table_with_it() {
+    let mut h = Harness::with(|c| c.queue_resume_delay_s = 600.0).await;
+    h.load().await;
+    let key = key_of(&h);
+    order(&h, &[2, 1], true);
+    assert_eq!(intents(&h, &key).len(), 2);
+
+    let p = queue_file(&h);
+    let whole = std::fs::read(&p).expect("the queue file");
+    std::fs::write(&p, &whole[..whole.len() / 2]).expect("truncate");
+    h.restart().await;
+
+    assert!(
+        h.state.session().queue.is_empty(),
+        "an unreadable queue is no queue"
+    );
+    assert!(
+        intents(&h, &key).is_empty(),
+        "the table kept an order the record it was written from no longer has"
+    );
+    assert!(narrator::wishlist::all_outstanding(&h.state).is_empty());
 }

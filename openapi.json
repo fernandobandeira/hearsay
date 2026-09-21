@@ -1030,6 +1030,53 @@
         }
       }
     },
+    "/api/library": {
+      "get": {
+        "tags": [
+          "library"
+        ],
+        "summary": "Every book on this box, with what is rendered and packed for each.",
+        "operationId": "library",
+        "parameters": [
+          {
+            "name": "book",
+            "in": "query",
+            "description": "One book's cache key. Unknown keys answer with an empty list rather than\na 404: this endpoint describes what is here, and \"not here\" is an answer.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "chapters",
+            "in": "query",
+            "description": "Include the per-chapter rows. Only meaningful alongside `book`; it is\nignored for the all-books answer, which would otherwise be enormous.",
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/load": {
       "post": {
         "tags": [
@@ -1845,6 +1892,67 @@
           }
         }
       },
+      "ChapterIndexRow": {
+        "type": "object",
+        "description": "A cached filesystem scan of one chapter. **Not truth** — see the module doc.\n\nThe field names are [`crate::api::chapters::ChapterRow`]'s on purpose: this\ntable exists to answer that endpoint for a book the session has not loaded,\nand a row that has to be renamed on the way out is a row that will eventually\nbe renamed wrongly.",
+        "required": [
+          "chapter",
+          "n",
+          "rendered",
+          "m4a",
+          "title",
+          "scanned_ms"
+        ],
+        "properties": {
+          "bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "chapter": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "duration": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "est_s": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Estimated spoken seconds, from the chunker's character counts."
+          },
+          "m4a": {
+            "type": "boolean"
+          },
+          "n": {
+            "type": "integer",
+            "description": "Chunks in the plan.",
+            "minimum": 0
+          },
+          "rendered": {
+            "type": "integer",
+            "description": "Chunk wavs that were on disk **when the scan ran**.",
+            "minimum": 0
+          },
+          "scanned_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
       "ChapterRow": {
         "type": "object",
         "required": [
@@ -2171,6 +2279,135 @@
               "null"
             ],
             "description": "Where positions and notes are being written. `null` means the vault is\nnot mounted and they are falling back under the work dir — which is a\nthing to *say*, not to hide: with NARRATOR_VAULT pointing at a path that\ndoes not exist, the python server writes nothing, reads back `{}`, and\nevery book quietly opens at chapter one."
+          }
+        }
+      },
+      "LibraryBook": {
+        "type": "object",
+        "description": "One book on this box.\n\nThe counts are aggregates of that book's cached scan rows; `chapters` is what\nthe `book` table records, so a book whose plan is on disk but which has never\nbeen scanned still says how long it is.",
+        "required": [
+          "key",
+          "name",
+          "path",
+          "title",
+          "chapters",
+          "last_open_ms",
+          "rendered_chapters",
+          "packed_chapters",
+          "packed_bytes",
+          "total_chunks",
+          "rendered_chunks",
+          "est_min",
+          "position",
+          "loaded"
+        ],
+        "properties": {
+          "chapter_index": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ChapterIndexRow"
+            },
+            "description": "The per-chapter rows, present only for `?book=<key>&chapters=true`.\n\nDeliberately absent from the all-books answer: *Lord of Mysteries* alone\nis 1433 of these, and a library response that carried them for every book\nwould be megabytes over a tunnel to answer a question about shelves."
+          },
+          "chapters": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "est_min": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "The whole book's spoken length, from the chunker's character counts.\nNull only when nothing has been scanned yet."
+          },
+          "key": {
+            "type": "string",
+            "description": "The cache directory name — what `?book=` takes everywhere else."
+          },
+          "last_open_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When this book was last opened, or null for one that has only ever been\nfound on disk."
+          },
+          "loaded": {
+            "type": "boolean",
+            "description": "Is this the book the session is holding? The one field here that is a\nlive fact rather than a scan result."
+          },
+          "name": {
+            "type": "string",
+            "description": "The epub file name, which is what positions are keyed by."
+          },
+          "packed_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What those weigh, measured — not estimated.",
+            "minimum": 0
+          },
+          "packed_chapters": {
+            "type": "integer",
+            "description": "Chapters with a *usable* packed m4a. A manifest that disagrees with the\nplan is not one; see [`crate::library::scan_book`].",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path on the server, or empty for a book whose audio is here and\nwhose source file is not."
+          },
+          "position": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StampedPosition",
+                "description": "Where this book was left, by **file name** — the store's newest record\nacross every device, falling back to the vault's own map for a book that\npredates the store. Null for one nobody has opened."
+              }
+            ]
+          },
+          "rendered_chapters": {
+            "type": "integer",
+            "description": "Chapters every chunk of which was on disk at the scan. A chapter with no\nchunks at all does not count: \"nothing to render\" is not \"rendered\".",
+            "minimum": 0
+          },
+          "rendered_chunks": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string"
+          },
+          "total_chunks": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "LibraryResult": {
+        "type": "object",
+        "required": [
+          "books",
+          "scanned_ms"
+        ],
+        "properties": {
+          "books": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LibraryBook"
+            }
+          },
+          "scanned_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The **oldest** scan in this answer, so the reader can say how fresh it\nis — and so one book that has not been walked since yesterday cannot hide\nbehind eleven that were walked a minute ago. Null when nothing in the\nanswer has ever been scanned."
           }
         }
       },
@@ -2885,6 +3122,10 @@
     {
       "name": "vault",
       "description": "Writes into the Obsidian vault"
+    },
+    {
+      "name": "library",
+      "description": "Every book on the box, from a cached filesystem scan"
     },
     {
       "name": "health",

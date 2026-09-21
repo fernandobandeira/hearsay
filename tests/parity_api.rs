@@ -332,7 +332,25 @@ async fn the_openapi_document_covers_the_urls_the_reader_builds() {
             .unwrap_or_else(|| panic!("{p} missing from the spec"));
         assert!(ops.get(method).is_some(), "{p} has no {method}");
     }
-    assert_eq!(paths.len(), 25, "the contract is 25 paths");
+    // The 25 paths above are the python server's contract and are frozen: a
+    // *removal* or a rename here breaks the Obsidian plugin, which is why they
+    // are listed one by one rather than counted.
+    //
+    // Anything beyond them is this server's own, and is listed here too — so
+    // that adding one stays a deliberate act with a line in a diff, rather than
+    // something that happens by accident. Every addition must be additive: no
+    // client is obliged to call it, and none of the 25 changes shape because it
+    // exists.
+    let extra = ["/api/library"];
+    for p in extra {
+        assert!(paths.contains_key(p), "{p} missing from the spec");
+    }
+    assert_eq!(
+        paths.len(),
+        25 + extra.len(),
+        "a path was added or removed without saying so here: {:?}",
+        paths.keys().collect::<Vec<_>>()
+    );
 }
 
 // ------------------------------------------------------- pre-gzipped book text

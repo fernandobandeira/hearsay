@@ -209,10 +209,34 @@ pub struct AppState {
     /// the packer's cue to hold an encode back; see [`crate::render`].
     pub render_stalled: Mutex<Option<Instant>>,
 
+    /// The durable intent-and-identity store, or `None` if it would not open.
+    ///
+    /// An `Option` rather than a hard requirement, and that is the whole policy
+    /// in one type: a work directory gone read-only, a `state.db` that is not a
+    /// database, a disk with nothing left on it — none of those is a reason to
+    /// refuse to start a reader. What is lost without it is the *extra* answers
+    /// (which device is where, what the library has ready, a standing order that
+    /// outlives the process); what keeps working is everything that was working
+    /// before the store existed, because all of it still reads the filesystem
+    /// and the vault. Every caller therefore reaches it through
+    /// [`AppState::store`] and does nothing at all when it is absent.
+    pub store: Option<Arc<crate::store::Store>>,
+
     /// Who is connected right now. Ephemeral by design — see
     /// [`crate::api::device`]'s presence section for why this is the one piece
     /// of device state that is deliberately not in the database.
     pub roster: Arc<crate::api::device::Roster>,
+
+    /// The chunk cache's size in bytes, as last measured by the gc.
+    ///
+    /// A measurement rather than a running total, because the renderer is not
+    /// the only thing that changes it — the gc deletes, `narrator migrate`
+    /// deletes, and an operator with `rm` deletes. It is read by the speculative
+    /// render branch, which must stand down well below the gc's threshold or the
+    /// two of them spend the box's spare core taking turns; see `IDLE_CEILING`
+    /// in [`crate::render`]. Stale by up to 25 chunks, which is kilobytes
+    /// against a band measured in gigabytes.
+    pub audio_bytes: AtomicU64,
 
     /// A counter that only ever goes up, stamped on every position write.
     ///
@@ -236,7 +260,18 @@ impl AppState {
         let engine = Engine::new(&cfg);
         let whisper = Whisper::new(&cfg);
         let positions = crate::vault::load_positions(&cfg.positions_dir);
+        // Logged once, loudly, and then never mentioned again: a server running
+        // without its store is a degraded one and the operator should be able to
+        // find out why from the boot log rather than from a missing feature.
+        let store = match crate::store::Store::open(&cfg.work.join("state.db")) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                tracing::error!("state.db unavailable ({e}); continuing without it");
+                None
+            }
+        };
         Arc::new(Self {
+            store,
             cfg,
             session: Mutex::new(Session::new()),
             bus,
@@ -256,9 +291,16 @@ impl AppState {
             autopack_at: Mutex::new(None),
             wishlist: Mutex::new(crate::wishlist::Wishlist::default()),
             render_stalled: Mutex::new(None),
+            audio_bytes: AtomicU64::new(0),
             roster: Arc::new(crate::api::device::Roster::default()),
             seq: AtomicU64::new(1),
         })
+    }
+
+    /// The store, if there is one. Sugar, so a caller reads as
+    /// `if let Some(db) = st.store()` rather than repeating the field's shape.
+    pub fn store(&self) -> Option<&Arc<crate::store::Store>> {
+        self.store.as_ref()
     }
 
     /// The next position stamp. Monotonic, and never zero — zero is what a

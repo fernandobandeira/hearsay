@@ -81,6 +81,19 @@ impl Harness {
         self.book.to_string_lossy().to_string()
     }
 
+    /// A second book in the library, same words, different name — and therefore
+    /// a different cache key, a different plan and a different set of chapter
+    /// directories, which is all anything under test cares about.
+    pub fn add_book(&self, name: &str) -> String {
+        let p = self
+            .book
+            .parent()
+            .map(|d| d.join(name))
+            .unwrap_or_else(|| PathBuf::from(name));
+        std::fs::copy(fixture_epub(), &p).expect("copy fixture epub");
+        p.to_string_lossy().to_string()
+    }
+
     pub fn work(&self) -> PathBuf {
         self.state.cfg.work.clone()
     }

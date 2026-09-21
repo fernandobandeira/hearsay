@@ -22,26 +22,94 @@
 //! does — including that a chapter finished while the process was down simply
 //! leaves the queue again the moment the worker looks at it.
 //!
-//! **One file per book, beside its plan**: `work/audio/<key>/queue.json`. A
-//! wishlist is chapter *indices into one book's plan*, so it belongs to that
-//! book and to nothing else; filing it under that book's own cache directory
-//! makes applying it to the wrong book impossible by construction rather than by
-//! remembering to check, and it keeps an overnight download alive across "let me
-//! look at something else for ten minutes" — which a single global file could
-//! only survive by throwing one of the two lists away. The book and the key are
-//! written *inside* the file as well, and checked on the way in, because there
-//! is one way the path can still lie: a work directory copied or restored from
-//! another box.
+//! **Two records, and each answers a question the other cannot.**
 //!
-//! **Crash safety is the rename.** Every write is a `.part`, fsynced, renamed
-//! over the real name, with the directory fsynced after — the pattern the chunk
-//! cache and the note queue already use. A `kill -9` at any instant leaves the
-//! old file or the new one, never a half of either, and that matters more here
-//! than it looks: a truncated file is a JSON error, and a JSON error is handled
-//! by throwing the wishlist away, which is exactly the hours of work this module
-//! exists to keep. A write that fails outright is a `warn!` and nothing more —
-//! the in-memory queue is untouched, the worker renders on, and the only thing
-//! lost is the ability to survive the *next* restart.
+//! `work/audio/<key>/queue.json` is still the record of the book in front of
+//! you, unchanged and still written on every mutation. [`crate::store`]'s
+//! `intent` table in `work/state.db` now holds the same items for **every** book
+//! — one row per (book, chapter), ordered by a globally monotonic `seq` that is
+//! *when it was asked for*.
+//!
+//! The table exists because of the one question a file per book cannot answer:
+//! **what does this box owe, across the whole library, in the order it was
+//! promised?** A standing order on a book the session is not holding lives in a
+//! file nothing is currently reading, in a directory nothing is currently
+//! listing; it may as well not be there. The scheduler's entire job is to see
+//! all of them at once, and [`all_outstanding`] is that question.
+//!
+//! The file stays the one that is **read first for the loaded book**, and the
+//! reason is not sentiment: it is the only one of the two that says which book
+//! it is about. A row in `intent` is keyed by cache key and nothing else, so it
+//! believes whatever directory name it finds itself under; the file carries the
+//! book path and the key *inside* it and is checked against both on the way in,
+//! which is the one guard there is against a work directory restored from
+//! another box. Reading the table first would walk straight past it. Three more
+//! reasons the file is not retired, none of them the deciding one but all of
+//! them real:
+//!
+//! - It is the **rollback**. `state.db` is new; the binary that predates it is
+//!   one `docker run` away and reads only the file. Deleting the file would make
+//!   going back cost an overnight download, which is precisely the thing this
+//!   module exists to protect.
+//! - It is what an **operator can `cat`**. A table needs a client; a file over
+//!   ssh needs nothing, and "what does the box think it owes me" is a question
+//!   Fernando asks at the console.
+//! - It **travels with the audio**. `work/audio/<key>` copied to another box
+//!   carries the order along with the chunks it is about, where one global
+//!   database would not.
+//!
+//! So: **the file if it is there, the table if it is not.** A file that is there
+//! and will not parse is a *damaged record*, not a missing one, and it costs the
+//! list exactly as it always has — the table is then made to agree with it
+//! rather than consulted as a second opinion, because the two were written from
+//! the same snapshot and a table row the file no longer backs is a row about
+//! nothing. A file that is genuinely **absent** is the case the table rescues,
+//! and it is not hypothetical: a `work/` restored without its audio, a tidy-up,
+//! a bad merge of a backup.
+//!
+//! **The two cannot drift, because they are written from one snapshot.** [`save`]
+//! builds exactly one [`Saved`] out of the session's queues and hands the same
+//! `items` to the file and to the table. There is no second derivation to get
+//! wrong, and anything that is true of the file — a cancel landing, an item
+//! leaving the moment the worker is done with it — is true of the table for the
+//! same reason and at the same instant. The file is written *first*, because it
+//! is the one that is read first: if only one of the two lands, the next boot
+//! reads the file and [`sync`] drags the table back into line with it, which
+//! heals. The other order does not — a stale file that wins the read would drag
+//! a *correct* table back to stale.
+//!
+//! **Parked is not a column.** The store keeps `tries`; parked is
+//! `tries >= MAX_ATTEMPTS`, derived on the way out. A second field would be a
+//! second thing to keep in step with the first, and it would be the field that
+//! decides whether the box spends the week on one chapter. `Store::add_intent`
+//! resets `tries` for the same reason [`asked`] clears the count — asking again
+//! *is* the retry — so the two agree by construction rather than by agreement.
+//!
+//! **The file the running box already has is adopted, not thrown away.** The A1
+//! is holding orders in `queue.json` right now and has never had a row in
+//! `intent`. The first time this process reads a book's file ([`resume`] at boot,
+//! [`adopt`] on a load) the table is made to match it — order, pack flags and
+//! attempt counts — and the file is then **left exactly where it is**. Not
+//! deleted: see the rollback above.
+//!
+//! **Crash safety is the rename, and the transaction.** Every file write is a
+//! `.part`, fsynced, renamed over the real name, with the directory fsynced after
+//! — the pattern the chunk cache and the note queue already use. A `kill -9` at
+//! any instant leaves the old file or the new one, never a half of either, and
+//! that matters more here than it looks: a truncated file is a JSON error, and a
+//! JSON error is handled by throwing the wishlist away, which is exactly the
+//! hours of work this module exists to keep. The table gets the same property
+//! from sqlite for free. A write that fails outright, either of them, is a
+//! `warn!` and nothing more — the in-memory queue is untouched, the worker
+//! renders on, and the only thing lost is the ability to survive the *next*
+//! restart.
+//!
+//! **And the store is optional.** [`AppState::store`](crate::state::AppState)
+//! is a `None` on a work directory gone read-only or a `state.db` that is not a
+//! database, and every path here falls back to precisely the behaviour that
+//! shipped before the table existed: the file is the whole record, and
+//! [`all_outstanding`] can only speak for the book that is loaded, which is all
+//! a file-per-book world was ever able to know.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write as _;
@@ -53,6 +121,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::state::{AppState, Session};
+use crate::store::{IntentRow, Store};
 
 /// Bumped when the meaning of the file changes rather than its contents. A file
 /// from a future version is ignored, not guessed at: the wrong chapters queued
@@ -192,7 +261,13 @@ pub fn save(st: &AppState) {
         // Nothing is loaded, so there is no book whose wishlist this could be.
         return;
     };
+    // The file first, then the table. Both are written from this one `doc`, so
+    // they cannot disagree about what was asked for; the order decides only
+    // which is right if the process dies between them, and it has to be the one
+    // that gets read first — a file that landed alone is healed by the next
+    // boot's `sync`, a table that landed alone is dragged back to the stale file.
     write(&path(&st.cfg.work, &doc.key), &doc);
+    store_sync(st, &doc.key, &doc.items);
 }
 
 fn snapshot(s: &Session, w: &Wishlist) -> Option<Saved> {
@@ -289,6 +364,263 @@ fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+// --------------------------------------------------------------- the store
+
+/// The `device` column of an `intent` row, as written from here.
+///
+/// Empty, which is the store's own word for "a caller that did not say". It is
+/// not a gap to be filled in later by this module: the session's queues are one
+/// list per book with no room for who asked, so anything put here would be the
+/// device that happened to touch it last rather than the one that wanted it.
+/// `/api/chapters` is where a request knows the device, and that is where a name
+/// would have to come from.
+const NO_DEVICE: &str = "";
+
+fn now_ms() -> i64 {
+    chrono::Local::now().timestamp_millis()
+}
+
+/// An `intent` row as this module's [`Item`].
+///
+/// `parked` is derived rather than stored — see the module doc. `tries` can
+/// exceed [`MAX_ATTEMPTS`] only if something outside this module wrote it, and
+/// `>=` reads that as parked, which is the safe direction: not tried is
+/// recoverable by asking again, tried forever is the failure being bounded.
+fn item_of(r: IntentRow) -> Item {
+    Item {
+        chapter: r.chapter,
+        pack: r.pack,
+        attempts: r.tries,
+        parked: r.tries >= MAX_ATTEMPTS,
+    }
+}
+
+/// Make the table say what `items` says, for this book and no other.
+///
+/// Scoped to one key on purpose: a save is about the loaded book, and a standing
+/// order on some other book is not this snapshot's to have an opinion about.
+/// That is what makes a `/api/load` of a second book harmless to the first one's
+/// overnight download.
+fn store_sync(st: &AppState, key: &str, items: &[Item]) {
+    let Some(db) = st.store() else {
+        // No database: the file is the record, exactly as it was before there
+        // was a table. Nothing to log — this is a state the server is allowed to
+        // run in, and it already said so once at boot.
+        return;
+    };
+    sync(db, key, items);
+}
+
+/// The diff itself, against a store the caller has already got hold of.
+///
+/// Add and drop rather than rewrite, because `seq` **is** the order asked and
+/// re-inserting a row would move a chapter somebody asked for last night to the
+/// back of tonight's queue. For the same reason a chapter that is already on the
+/// list is left completely alone: its place, its `created_ms` and its poison
+/// count are all facts about the original ask.
+fn sync(db: &Store, key: &str, items: &[Item]) {
+    let existing = match db.intents(key) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("wishlist: could not read the standing order for {key:?}: {e}");
+            return;
+        }
+    };
+    if items.is_empty() {
+        // Cancel-all, or a queue that has been worked through. One statement
+        // rather than a delete per row.
+        if !existing.is_empty() {
+            if let Err(e) = db.drop_intents_for_book(key) {
+                tracing::warn!("wishlist: could not clear the standing order for {key:?}: {e}");
+            }
+        }
+        return;
+    }
+    for row in &existing {
+        if !items.iter().any(|i| i.chapter == row.chapter) {
+            if let Err(e) = db.drop_intent(key, row.chapter) {
+                tracing::warn!(
+                    "wishlist: could not drop chapter {} of {key:?}: {e}",
+                    row.chapter
+                );
+            }
+        }
+    }
+    let now = now_ms();
+    // New chapters go in in snapshot order, and a run of them sharing a pack
+    // flag goes in one call — which is one transaction and one pass of `seq` for
+    // the ordinary case, "download these seventy-four".
+    let mut run: Vec<usize> = Vec::new();
+    let mut run_pack = false;
+    let mut fresh: Vec<&Item> = Vec::new();
+    for it in items {
+        match existing.iter().find(|r| r.chapter == it.chapter) {
+            Some(row) => {
+                flush(db, key, &mut run, run_pack, now);
+                if it.pack && !row.pack {
+                    // Somebody asked for the download of a chapter that was only
+                    // queued to render. That re-ask resets `tries`, which is
+                    // correct and is the same rule [`asked`] follows: a person
+                    // asking again is the retry.
+                    if let Err(e) = db.add_intent(key, &[it.chapter], NO_DEVICE, true, now) {
+                        tracing::warn!(
+                            "wishlist: could not mark chapter {} of {key:?} for packing: {e}",
+                            it.chapter
+                        );
+                    }
+                }
+            }
+            None => {
+                if !run.is_empty() && run_pack != it.pack {
+                    flush(db, key, &mut run, run_pack, now);
+                }
+                run_pack = it.pack;
+                run.push(it.chapter);
+                fresh.push(it);
+            }
+        }
+    }
+    flush(db, key, &mut run, run_pack, now);
+    // A row is born with `tries` at zero, so a chapter that arrives already
+    // carrying a count — an adopted `queue.json`, a parked item coming back —
+    // has to be walked up to it. Bounded by [`MAX_ATTEMPTS`], and only ever on a
+    // row that did not exist a moment ago.
+    for it in fresh {
+        let want = if it.parked {
+            it.attempts.max(MAX_ATTEMPTS)
+        } else {
+            it.attempts
+        };
+        for _ in 0..want {
+            if let Err(e) = db.bump_tries(key, it.chapter) {
+                tracing::warn!(
+                    "wishlist: could not restore the attempt count of chapter {} of {key:?}: {e}",
+                    it.chapter
+                );
+                break;
+            }
+        }
+    }
+}
+
+fn flush(db: &Store, key: &str, run: &mut Vec<usize>, pack: bool, now: i64) {
+    if run.is_empty() {
+        return;
+    }
+    if let Err(e) = db.add_intent(key, run, NO_DEVICE, pack, now) {
+        tracing::warn!(
+            "wishlist: could not record {} chapter(s) of {key:?}: {e}",
+            run.len()
+        );
+    }
+    run.clear();
+}
+
+/// The standing order for one book: the file if it is there, the table if it is
+/// not.
+///
+/// The asymmetry is deliberate and it is the whole of the module doc's "two
+/// records" section in one function.
+///
+/// **The file is present.** It is this book's record, whatever state it is in.
+/// It is read with every check it has always been read with — version, and the
+/// book and key written inside it, which is the only thing that catches a work
+/// directory restored from another box — and a file that fails any of them is a
+/// *damaged* record and yields nothing, exactly as it did before there was a
+/// table. Either way the table is then made to agree with what the file said:
+/// that one call is the adoption of a file this binary has never seen, the
+/// steady-state no-op when the two already match, and the tidying away of rows
+/// whose file has just been declared damaged. Rows the file no longer backs are
+/// rows about nothing, and leaving them would have the scheduler chasing an
+/// order that this boot has already decided it does not have.
+///
+/// **The file is absent.** That is the case the table is here for — a `work/`
+/// restored without its audio, a tidy-up, a bad merge of a backup — and the
+/// rows are read back as they stand. Absent is a different claim from damaged,
+/// and this is the one place in the module where the difference is worth a
+/// branch.
+fn load_items(st: &AppState, key: &str) -> Vec<Item> {
+    let p = path(&st.cfg.work, key);
+    if p.exists() {
+        let items = read(&st.cfg.work, key).map(|d| d.items).unwrap_or_default();
+        if let Some(db) = st.store() {
+            let had = db.intents(key).map(|r| r.len()).unwrap_or(0);
+            sync(db, key, &items);
+            if had == 0 && !items.is_empty() {
+                tracing::info!(
+                    "wishlist: adopted {} chapter(s) for {key:?} out of {}, which stays where it \
+                     is",
+                    items.len(),
+                    p.display()
+                );
+            }
+        }
+        return items;
+    }
+    let Some(db) = st.store() else {
+        return Vec::new();
+    };
+    match db.intents(key) {
+        Ok(rows) => {
+            if !rows.is_empty() {
+                tracing::info!(
+                    "wishlist: {} has no {}; taking its {} outstanding chapter(s) from state.db",
+                    key,
+                    p.display(),
+                    rows.len()
+                );
+            }
+            rows.into_iter().map(item_of).collect()
+        }
+        Err(e) => {
+            tracing::warn!("wishlist: could not read the standing order for {key:?}: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Every outstanding order in the library, oldest ask first.
+///
+/// One entry per book that owes something, the books in the order their oldest
+/// outstanding chapter was asked for and each book's chapters in the order
+/// *they* were asked for — so the last item of the last book is the newest thing
+/// anybody wanted. Parked chapters are included and say so: they are still
+/// owed, and whether to give one another go is the scheduler's call rather than
+/// this module's.
+///
+/// **Without a store it can only speak for the loaded book**, and it says so by
+/// returning just that one entry (or nothing at all). That is not a degraded
+/// answer to the cross-library question, it is the only answer a file-per-book
+/// arrangement can give: the other books' files exist, but nothing has read
+/// them and nothing knows which books to go looking for. A caller that needs the
+/// whole picture needs the store.
+pub fn all_outstanding(st: &AppState) -> Vec<(String, Vec<Item>)> {
+    if let Some(db) = st.store() {
+        match db.all_intents() {
+            Ok(rows) => {
+                let mut out: Vec<(String, Vec<Item>)> = Vec::new();
+                for r in rows {
+                    let book = r.book.clone();
+                    match out.iter_mut().find(|(k, _)| *k == book) {
+                        Some((_, items)) => items.push(item_of(r)),
+                        None => out.push((book, vec![item_of(r)])),
+                    }
+                }
+                return out;
+            }
+            Err(e) => {
+                tracing::warn!("wishlist: could not read the library's standing orders: {e}");
+            }
+        }
+    }
+    let w = st.wishlist();
+    let s = st.session();
+    match snapshot(&s, &w) {
+        Some(doc) if !doc.items.is_empty() => vec![(doc.key, doc.items)],
+        _ => Vec::new(),
+    }
 }
 
 // ------------------------------------------------------------------- reading
@@ -389,7 +721,29 @@ fn remember(st: &AppState, items: &[Item]) {
 /// attempts, and it does not need a new endpoint to do it.
 pub fn asked(st: &AppState, chapters: &[usize]) {
     st.wishlist().forget(chapters);
+    // The same clearing, in the table. `Store::add_intent` would do it for a
+    // chapter that is new to the list, but most of these are not new — a
+    // reconciler re-places the standing order every two minutes — and a count
+    // left behind in a row [`sync`] correctly declines to touch is a chapter
+    // that comes back parked after the person asking has already un-parked it.
+    reset_tries(st, chapters);
     save(st);
+}
+
+/// Put these chapters' poison counts back to zero in the store.
+///
+/// A chapter with no row is a no-op, which is right at every call site: nothing
+/// was asked for, so nothing has failed.
+fn reset_tries(st: &AppState, chapters: &[usize]) {
+    let Some(db) = st.store() else { return };
+    let Some(key) = st.session().key() else {
+        return;
+    };
+    for c in chapters {
+        if let Err(e) = db.reset_tries(&key, *c) {
+            tracing::warn!("wishlist: could not clear chapter {c}'s attempt count: {e}");
+        }
+    }
 }
 
 /// These chapters were cancelled — all of them, if `chapters` is None.
@@ -421,6 +775,11 @@ pub fn progress(st: &AppState, chapter: usize) {
             return;
         }
     }
+    // Only when there was a count to clear, which is why the store is touched
+    // here rather than on every chunk: the two records are kept in step, so an
+    // in-memory count of zero is a table row of zero and the early return above
+    // is not skipping a write, it is skipping a write that would change nothing.
+    reset_tries(st, &[chapter]);
     save(st);
 }
 
@@ -436,14 +795,15 @@ pub fn adopt(st: &Arc<AppState>) -> Vec<usize> {
     let Some(key) = st.session().key() else {
         return Vec::new();
     };
-    let Some(doc) = read(&st.cfg.work, &key) else {
+    let items = load_items(st, &key);
+    if items.is_empty() {
         // No wishlist for this book, or one that cannot be trusted. Either way
         // what is remembered about the last book must not follow it here.
         st.wishlist().forget_all();
         return Vec::new();
-    };
-    remember(st, &doc.items);
-    apply(st, &doc.items)
+    }
+    remember(st, &items);
+    apply(st, &items)
 }
 
 /// Pick the wishlist back up at startup, and count the attempt.
@@ -461,8 +821,8 @@ pub fn resume(st: &Arc<AppState>) -> Option<Resumed> {
         let s = st.session();
         (s.plan.clone(), s.key()?)
     };
-    let mut doc = read(&st.cfg.work, &key)?;
-    if doc.items.is_empty() {
+    let mut items = load_items(st, &key);
+    if items.is_empty() {
         return None;
     }
     // Whether a chapter still has rendering left in it, asked of the filesystem
@@ -480,7 +840,7 @@ pub fn resume(st: &Arc<AppState>) -> Option<Resumed> {
         n > 0 && crate::cache::rendered_count(&dir, n) < n
     };
     let mut out = Resumed::default();
-    for it in &mut doc.items {
+    for it in &mut items {
         if it.parked {
             out.parked.push(it.chapter);
             continue;
@@ -490,6 +850,19 @@ pub fn resume(st: &Arc<AppState>) -> Option<Resumed> {
             continue;
         }
         it.attempts = it.attempts.saturating_add(1);
+        // The table counts the same restart, here rather than in [`save`],
+        // because `sync` deliberately never touches an existing row's count —
+        // it cannot tell a bump from the count it already holds. This is the one
+        // place a restart is being counted, so it is the one place that says so
+        // to both records.
+        if let Some(db) = st.store() {
+            if let Err(e) = db.bump_tries(&key, it.chapter) {
+                tracing::warn!(
+                    "wishlist: could not count the restart against chapter {}: {e}",
+                    it.chapter
+                );
+            }
+        }
         if it.attempts >= MAX_ATTEMPTS {
             it.parked = true;
             out.parked.push(it.chapter);
@@ -504,8 +877,8 @@ pub fn resume(st: &Arc<AppState>) -> Option<Resumed> {
             out.queued.push(it.chapter);
         }
     }
-    remember(st, &doc.items);
-    apply(st, &doc.items);
+    remember(st, &items);
+    apply(st, &items);
     save(st);
     Some(out)
 }

@@ -111,7 +111,7 @@ interface Ctx {
    * arbitration: a sync that interrupts someone mid-sentence is not a feature,
    * so it waits behind a tap.
    */
-  moved: {chapter: number; chunk: number} | null;
+  moved: {chapter: number; chunk: number; device?: string} | null;
   /** Take the offer. */
   follow: () => void;
   /** Turn it down; it comes back if the other device moves again. */
@@ -258,7 +258,8 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const [bookLoading, setBookLoading] = useState(false);
   const [resumedAt, setResumedAt] = useState<Resume | null>(null);
   const [queued, setQueued] = useState({notes: 0, positions: 0, stalled: 0});
-  const [moved, setMoved] = useState<{chapter: number; chunk: number} | null>(null);
+  const [moved, setMoved] =
+    useState<{chapter: number; chunk: number; device?: string} | null>(null);
   const [live, setLive] = useState<LiveState>('connecting');
   const [fontScale, setFontScaleState] = useState(
     () => Math.min(1.8, Math.max(0.7, Number(localStorage.getItem('narrator.font')) || 1)));
@@ -996,7 +997,11 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     });
     if (verdict.t === 'ignore') return;
     if (verdict.t === 'offer') {
-      setMoved({chapter: verdict.chapter, chunk: verdict.chunk});
+      /* The label rides along so the line can say *which* device. "moved on
+         another device" is exactly as much as the reader used to know, and it
+         made the offer something to go and investigate rather than something to
+         act on from across the room. Display only - the id did the deciding. */
+      setMoved({chapter: verdict.chapter, chunk: verdict.chunk, device: ev.device_name});
       return;
     }
     // Not playing: just go there. This is the phone-down, laptop-up case, and

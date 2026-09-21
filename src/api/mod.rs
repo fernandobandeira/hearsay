@@ -10,6 +10,7 @@
 pub mod chapters;
 pub mod device;
 pub mod health;
+pub mod library;
 pub mod media;
 pub mod notes;
 pub mod session;
@@ -299,6 +300,7 @@ pub async fn json_file(path: &std::path::Path, cache: &str, missing: &str) -> Re
         (name = "chapters", description = "Chapter audio: render, pack, stream, download"),
         (name = "text", description = "The book as text, for offline reading"),
         (name = "vault", description = "Writes into the Obsidian vault"),
+        (name = "library", description = "Every book on the box, from a cached filesystem scan"),
         (name = "health", description = "A check that can actually fail"),
     )
 )]
@@ -329,6 +331,7 @@ pub fn router(state: Arc<AppState>) -> (axum::Router, utoipa::openapi::OpenApi) 
         .routes(routes!(chapters::chapters_render))
         .routes(routes!(chapters::chapters_build))
         .routes(routes!(chapters::chapters_cancel))
+        .routes(routes!(library::library))
         .routes(routes!(media::hls_segment))
         .routes(routes!(notes::note))
         .routes(routes!(stream::events))

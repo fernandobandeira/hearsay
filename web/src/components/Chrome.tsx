@@ -163,7 +163,7 @@ function Connection() {
 }
 
 /**
- * "Reading position moved on another device."
+ * "Reading position moved on <the other device>."
  *
  * The other half of lib/live.ts's arbitration, and the reason that rule exists:
  * while audio is playing, a position that moved elsewhere is *news*, not an
@@ -186,7 +186,7 @@ export function FollowOffer() {
                       text-muted-foreground shadow-lg backdrop-blur">
         <RefreshCw className="size-3 shrink-0" />
         <span className="min-w-0 truncate">
-          moved on another device{title ? ` · ${title}` : ''}
+          moved on {n.moved.device || 'another device'}{title ? ` · ${title}` : ''}
         </span>
         <button data-testid="follow-go" onClick={n.follow}
                 title="Open the chapter and chunk the other device is on"

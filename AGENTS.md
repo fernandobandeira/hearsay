@@ -28,9 +28,11 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `src/export.rs` | `narrator export`: the streaming cache packed into one `.m4b`, chapter marks and cover art included. A port of `app/export.py`. |
 | `src/events.rs`, `src/api/stream.rs` | The SSE bus and `/api/events`. |
 | `src/state.rs` | One global session, exactly like Python's process-wide `S`. |
+| `src/store.rs` | `work/state.db`: the durable **intent and identity** — devices, per-device positions and high-water marks, standing orders, per-device inventory, the scanned chapter index, the book registry. Two rules it never breaks: [it is not disk truth](#the-store-and-the-two-things-it-is-not), and it does not replace the vault files. |
+| `src/api/device.rs` | Who is asking (`X-Narrator-Device`), and who is *here* (the in-memory roster). See [naming the devices](#naming-the-devices). |
 | `src/api/` | Every endpoint, with typed request/response structs that **generate** the OpenAPI document. |
 | `src/watch.rs` | The library watcher (`notify`), which turns "the vault's git sync pulled an epub onto the server" into a `books` event. |
-| `src/wishlist.rs` | The chapters someone asked for, kept across restarts: `work/audio/<key>/queue.json`, intent only. See [downloading a chapter](#downloading-a-chapter-end-to-end). |
+| `src/wishlist.rs` | The chapters someone asked for, kept across restarts — now in `state.db`'s `intent` table, with `work/audio/<key>/queue.json` still written beside it. Intent only, never progress. See [downloading a chapter](#downloading-a-chapter-end-to-end). |
 | `tests/` | Five parity suites, the reader-requirement suite, and a harness that runs a whole server in a temp dir. |
 | `scripts/golden/` | Generates the Python golden fixtures (uv + ebooklib + bs4) the parity tests assert against. |
 | `scripts/gen-client.sh` | OpenAPI → the reader's typed TS client (`web/src/client/`), and the `--check` gate CI runs. |
@@ -284,6 +286,178 @@ Every path, method, field name, type and nullability of the Python contract, ass
 
 25 paths. `/api/events` (SSE) is implemented over a tokio broadcast channel with the same wire format, the same coalescing of `progress` and the same refusal to replay. `/healthz` returns 503 with `problems[]` for the failures that actually happen: a dead render thread, a "rendering" status with no chunk in `HEALTH_STALL_S`, an unwritable work dir.
 
+## Naming the devices
+
+**The bug, as reported:** open the PWA on the phone, and it sometimes decides
+another device has moved to a different chapter and follows it there — except
+that chapter is *behind*, so the reader loses its place going backwards.
+
+Three facts were missing, and none of them was in the arbitration logic:
+
+1. **Who wrote a position.** There was one server-side session and one record
+   per book, and nothing anywhere carried a device identity. So "is this event
+   my own echo coming back?" was answered by distance: if it landed within two
+   chunks of where this device already was, it was probably ours (`SLACK` in
+   `web/src/lib/live.ts`). That guess is wrong in both directions — it swallows
+   a genuine two-chunk move made on the laptop, and it waves through this
+   device's own report the moment the playhead has drifted three chunks by the
+   time the event arrives, which on a phone behind a tunnel is most of them.
+2. **When, unambiguously.** `save_position` serialized the *vault* record, so
+   the event carried `updated` — a naive local stamp with no zone, which a
+   browser cannot order — and not the `updated_ms` that had been added to the
+   API's edge for exactly this (requirement 3). Every recency rule in the reader
+   was reasoning from a string it could not trust, so there weren't any.
+3. **Which way.** `arbitrate` compared a book, an undelivered flag and a chunk
+   distance, and nothing else. A position *behind* this device produced
+   follow/offer identically to one ahead.
+
+**And the mechanism that fires it** is a laptop in a background tab. `hello`
+arrives on every reconnect, `healSession` posts `/api/open`, the one global
+session moves back to where *that* device is, the server writes a position there
+and broadcasts it. The phone follows — correctly, by its own rules. A position
+from somewhere else is exactly what that event means.
+
+### The header, and the one endpoint that cannot take one
+
+A device now says who it is: `X-Narrator-Device`, a uuid the reader mints once
+into `localStorage`, plus `X-Narrator-Device-Name` as a label. Set once in
+`web/src/lib/api.ts` through the generated client's `setConfig`, so it rides on
+every call rather than the handful somebody remembered.
+
+`GET /api/events` takes it as `?device=` instead, and that asymmetry is not
+laziness. `EventSource` is what gives the reader its reconnection for free — the
+browser retries on the server's own `retry:` interval, with no code here to get
+wrong — and the price is an API with **no way to set a request header**. So the
+one endpoint that most needs to know who is connected is the one that cannot be
+told the ordinary way. `src/api/device.rs` reads the header first and falls back
+to the query, which keeps it one concept with two spellings. The id is a random
+uuid rather than a credential: it identifies a browser profile to itself and
+grants nothing, which is what makes it safe in a URL that lands in an access log.
+
+**Additive, and tested as such.** A client that sends no identity is the
+anonymous device, whose id is the empty string — the Obsidian plugin, the
+python-era reader, `curl` — and it gets exactly the behaviour it had before any
+of this existed. `tests/devices.rs` asserts that rather than assuming it.
+
+### The arbitration, now seven rules
+
+`arbitrate` (`web/src/lib/live.ts`), in order, each with what it prevents:
+
+| | rule | why |
+|---|---|---|
+| 1 | another book → ignore | real, saved, and not about this page |
+| 2 | `ev.device` is ours → **ignore** | the own-echo test, exact. Only a non-empty id matches, so two unidentified clients cannot mute each other |
+| 3 | this device has undelivered writes → ignore | unchanged: the server is describing a session that stopped hearing from us chapters ago |
+| 4 | `ev.updated_ms <= our last write` → ignore | it predates something we told the server; it cannot be news |
+| 5 | same chapter, within `SLACK` chunks → ignore | the **backstop** for a client that sends no id, which is all it ever should have been |
+| 6 | behind our high-water mark → **offer**, never follow | the reported bug |
+| 7 | otherwise → playing ? offer : follow | unchanged, and still the whole feature |
+
+Rule 6 is the one worth defending. Going back to re-read a chapter on the laptop
+is a real thing to want, so a backwards position is not *ignored* — it is
+offered, as a quiet line above the player bar. It is simply never done to
+somebody without asking. The mark is chapter-granular (`narrator.furthest:`,
+which the auto-trim already keeps) and `chunk: 0` is the conservative rounding:
+an earlier position *in the same chapter* still reads as "not behind" and can be
+followed, while an earlier chapter is always offered.
+
+**Why the timestamp rule alone was never enough**, which is the same reason
+written down under [coming back online](#coming-back-online-drags-you-backwards):
+the bad event is not an old write, it is a **fresh write of stale content**. The
+server stamps it `now`, so every recency rule waves it through. Rule 4 catches
+the subset that predates our own write; rule 6 catches the rest, by asking about
+direction instead of time.
+
+### Presence, which is deliberately not in the database
+
+Who is *connected right now* lives in an in-memory `Roster` (`src/api/device.rs`),
+held by an RAII guard for the life of each `/api/events` stream — so it goes when
+the connection goes, including when the connection ends by the task being dropped
+because a phone locked, which a tidy-up at the end of the handler would miss.
+
+It is not written down, on purpose, and the reason is the same one the whole
+store rests on. A process that comes back up with nobody connected is correct. A
+process that comes back up *believing three devices are listening* would render
+ahead for readers who are not there — which is [the disk-truth
+invariant](#the-disk-truth-invariant)'s bug wearing a different hat: bookkeeping
+that outlived the thing it described.
+
+## The store, and the two things it is not
+
+`work/state.db`, SQLite through `rusqlite` (`bundled`, because the runtime image
+is `debian:bookworm-slim` with no libsqlite3 and the build is multi-arch).
+
+**Why a database at all.** Everything narrator remembered was remembered *per
+book, in a JSON file beside that book's audio* — `queue.json`, `plan.json` and
+its stamp, `session.json`. That shape answers every question about the book in
+front of you and none about the library: which device is where, how far anything
+has ever reached, which chapters somebody asked for on a book that is not loaded,
+what each phone actually holds. Those are the questions this round is about, they
+are asked by the scheduler and by the reader's reconciler, and answering them by
+walking a few thousand directories per request is how the python server's
+`/api/chapters` got slow.
+
+**Why not Postgres**: a second container, a backup surface and a network hop for
+a few megabytes on a box with two cores. **Why not PouchDB/CouchDB**: replication
+with revision trees solves multi-master conflict, and the problem here was never
+conflict — it was that there was no identity or ordering to resolve *with*. That
+would have been sync machinery bought to sit on top of the same missing facts.
+
+### It is not disk truth
+
+**This database never holds "is this chunk or chapter rendered."** That is [the
+disk-truth invariant](#the-disk-truth-invariant) and it is the exact bug this
+rewrite exists to fix. A row in `chapter_index` saying `rendered = 33` is **a
+cache of a filesystem scan**: it is there so a readiness view can answer for a
+book the session has not loaded without a thousand `read_dir` calls, and it is
+stale the instant the gc runs. Nothing in the renderer or the packer may consult
+it. Ever.
+
+This is written out at length in the module doc as well, because the next person
+to touch the file will find a `rendered` column sitting right there and be
+tempted, and the failure that follows is silent, slow to reproduce and
+indistinguishable from a network problem. The same rule is why there is no
+`chunk` table at all.
+
+### It does not replace the vault files
+
+`.narrator-positions.json` and `Reading Log.md` are a byte-level contract with the
+Obsidian plugin and with the python reference — two programs that have never
+heard of this file and never will. The direction is one-way: the store is the
+record, the vault files are a **projection** of it, written exactly as they have
+always been written.
+
+The store keeps **one row per (book, device)** where the vault keeps one per
+book, and that difference is the point. The vault record is last-write-wins,
+which is the right rule and always was; but a projection throws away exactly the
+fact the reader needed — that the laptop is at chapter 10 and the phone is at
+chapter 40, rather than that "the position" is wherever the most recent report
+came from. `newest_position` is that projection rule, ordered by `updated_ms`
+then `seq`.
+
+A **high-water mark** moves alongside it (`furthest`), forwards only. "Where I
+am" and "how far I got" are different questions — re-reading a scene must not
+shrink it — and it is what the reader's auto-trim and rule 6 above are both
+anchored on.
+
+### The sequence number
+
+Every position write is stamped with a monotonic integer, persisted in the store
+so it survives a restart. Two devices reporting inside the same millisecond is
+unlikely; a *clock* that steps is not — an ntp correction on a box that has been
+up for weeks, a container whose `/etc/localtime` changed under it — and then two
+writes compare equal or backwards and "which of these is later" has no answer at
+all. A monotonic integer always has one.
+
+### Failure is the caller's to shrug at
+
+`AppState::store()` is an `Option`. A work directory gone read-only, a
+`state.db` that is not a database, a disk with nothing left on it — none of those
+is a reason to refuse to start a reader. What is lost without it is the *extra*
+answers; what keeps working is everything that worked before it existed, because
+all of that still reads the filesystem and the vault. Every caller logs once and
+does nothing.
+
 ## What this server does that the Python one does not
 
 The reader kept a list of nine requirements written against the Python server,
@@ -344,6 +518,55 @@ The list is gone; this is what it said, and what answered it.
    every twenty seconds. It now reads the answer and keeps the repeat for a row
    that has not moved in ninety seconds, which is what a lost call actually
    looks like.
+
+### And one that is not on that list: `GET /api/library`
+
+The nine above were written against the python server. This one is new, and it
+is the endpoint the rest of this round exists to make possible.
+
+Every readiness question — is this book rendered? is it packed? how much of it
+could I take with me right now? — could only be asked about **the book the
+session had loaded**. Asking it about anything else meant *opening* that book,
+which loads it server-side, moves the one global session and drags the render
+frontier with it. That is an expensive way to ask a cheap question, and on the
+phone it is exactly the question you want answered *before* you commit to a
+book.
+
+So `/api/library` answers it for the whole library at once, out of the store's
+`chapter_index`, with no session involved:
+
+```
+GET /api/library[?book=<key>][&chapters=true]  →  200 LibraryResult
+```
+
+Per book: chapters, chapters rendered, chapters packed, packed bytes, chunks
+rendered out of total, an estimate in minutes, the stored reading position, and
+whether it is the loaded one. `?book=` narrows to one; `?chapters=true` adds the
+per-chapter rows **only** alongside `?book=`, because 1433 rows per book across
+a library is precisely what this endpoint exists to avoid.
+
+`scanned_ms` is the **oldest** stamp in the answer rather than the newest, so
+one stale book cannot hide behind eleven fresh ones — the reader shows the age
+only when it is worth showing.
+
+**It is a scan result, not a live fact**, and it says so. `src/library.rs`
+refreshes the index every `LIBRARY_SCAN_EVERY_S` (300 s) and immediately at the
+two moments a row genuinely goes stale: a chapter finishing its last chunk, and
+an m4a landing. The scanner stands down for [the STT
+gate](#the-stt-priority-gate) and for a renderer stalled under the playhead,
+with the same shape and the same bound as the packer's hold-back — a few
+thousand `stat`s is a background load on two cores, and it outranks nothing.
+
+Measured against the real python work directory: **0.10 s** for the
+1433-chapter *Lord of Mysteries*, 8 ms for a 33-chapter book, on this desktop.
+
+And the direction is one-way, which is the whole discipline of [the
+store](#the-store-and-the-two-things-it-is-not): the renderer and the packer
+**write** this index and never read it. A `rendered` column is not permission to
+stop asking the filesystem.
+
+With no store at all it answers `200` with an empty list rather than an error,
+because every failure path here logs and degrades.
 
 ## OpenAPI is the contract
 
@@ -540,6 +763,69 @@ are re-derived from the current chapter on every boot and are *not* written to
 the wishlist. Only a user-requested download is durable, which is the whole
 distinction: an order somebody placed outlives the process, a guess about what
 might be useful next does not.
+
+### Never idle: what the worker does when there is nothing to do
+
+The box renders at [about a quarter of realtime](#the-a1-measured) and can never
+keep up with anyone listening, so every second the worker spends asleep is a
+second somebody waits for later. It used to spend a great many of them: once the
+playhead's lookahead and the prerender span were full, there was no branch left
+and the loop slept — with, on *Lord of Mysteries*, fourteen hundred unrendered
+chapters behind it.
+
+So there is a sixth branch, below all the others:
+
+1. the chunk under the playhead, if it is missing — **disk truth**, always first
+2. a hole in the lookahead window
+3. a chapter somebody named in the chapter manager, on the loaded book
+4. **a standing order on any *other* book** — new, and the fix for a real hole:
+   the order was durable the whole time (`state.db`'s `intent` table, and
+   `queue.json` beside it), but nothing read it until that book was loaded
+   again, so "download these 74" followed by opening something else left 74
+   chapters waiting for an `/api/load` that might not come for days
+5. the chapter being read, if it is not finished
+6. the prerender span
+7. **the rest of this book, then the rest of the library** — most recently
+   *opened* first, each from the position it was last left at
+
+The ranking is the honest one: an explicit ask beats a guess, and the book in
+front of the reader beats one that is not.
+
+Rule 7 outranks nothing. The loop re-reads the playhead every iteration, so the
+work is abandoned the moment there is real work, and `render_stalled` is never
+set by it, so the packer is not held back either. Book order comes from the
+store's `last_open_ms`, which `/api/load` stamps — the last thing Fernando
+actually chose, rather than a guess about what he might choose next. A book that
+is not the loaded one has its plan read **straight off `plan.json`**, never
+through the parse cache: most of the library is not loaded, those epubs may have
+moved, and the chunks on disk correspond to that plan whatever has happened to
+the file they came from. (That is `plancache::read_raw`, the view `narrator
+export` has always taken.)
+
+Completion stays disk truth throughout — an order whose chunks all exist simply
+leaves the list the first time the worker looks at it. Nothing in either of these
+branches reads the library index.
+
+**The ceiling, which is the part that matters.** `gc_audio` trims the chunk cache
+to 90 % of `MAX_AUDIO_GB` once it passes 100 %, oldest first — and oldest-first is
+*precisely* the speculative work nobody has listened to yet. A renderer that ran
+to the cap would therefore not settle: it renders to the cap, the gc deletes what
+it just made, and it renders it again, for as long as the process lives. Worse,
+it is invisible — the log looks busy, the RTF looks healthy, and nothing ever
+finishes.
+
+So speculation stops at `IDLE_CEILING`, **80 %**, and the band between there and
+the collector belongs to demanded work only. The two never touch: one stops below
+the floor the other starts at. The cache size is the number `gc_audio` already
+returns (the walk has been done, so it is free), re-measured every 25 speculative
+chunks — kilobytes of staleness against a band measured in gigabytes.
+
+`tests/scheduler.rs` asserts the parts that make it dangerous rather than the part
+that makes it useful: that it renders ahead at all, that it stands down above the
+ceiling (with the seed's size asserted, so the test cannot pass for the wrong
+reason), that a hole punched under the playhead still gets filled first, that
+rendering ahead does not read as a stall to `/healthz`, that a finished library
+stops rather than spins, and that a finished book moves on to the next one.
 
 ### The CPU policy: pack when the renderer is ahead or idle
 
@@ -1033,7 +1319,8 @@ transcription rather than one of them being Kokoro's.
 
 ## Config surface
 
-Every name the Python `AGENTS.md` documents, with the same default: `NARRATOR_PORT` (7870), `NARRATOR_VAULT`, `NARRATOR_WORK`, `NARRATOR_BOOKS`, `NARRATOR_WEB`, `BOOKS_SUBDIR`, `POSITIONS_SUBDIR` (`02 - Studies`), `NOTES_SUBDIR` (`05 - Fleeting`), `KOKORO_VOICE` (`af_heart`), `KOKORO_SPEED`, `KOKORO_GAIN` (1.0), `LOOKAHEAD` (80), `PRERENDER_CHAPTERS` (2), `PREFETCH_WHILE_PAUSED`, `MAX_AUDIO_GB` (5), `MAX_CHAPTER_GB` (20), `SILENCE_S` (0.5), `WHISPER_MODEL`, `WHISPER_PROMPT`, `WHISPER_THREADS` (every core), `CHAPTER_BITRATE` (`64k`), `CHAPTER_GAP_S` (0.30), `CHAPTER_PARA_GAP_S` (0.60), `HLS_SEGMENT_S` (6), `TEXT_SHARD_BYTES`, `TEXT_SHARD_CHAPTERS`, `CHAPTER_PHRASE_GAP_S` (0.10), `HEALTH_STALL_S` (300), `AUTOPACK`, `AUTOPACK_EVERY_S`, `NARRATOR_WATCH_BOOKS`, `NARRATOR_FAKE_TTS`, `SSE_HEARTBEAT_S`, `SSE_QUEUE`, `SSE_RENDER_MIN_S`, `SSE_RETRY_MS`.
+Every name the Python `AGENTS.md` documents, with the same default: `NARRATOR_PORT` (7870), `NARRATOR_VAULT`, `NARRATOR_WORK`, `NARRATOR_BOOKS`, `NARRATOR_WEB`, `BOOKS_SUBDIR`, `POSITIONS_SUBDIR` (`02 - Studies`), `NOTES_SUBDIR` (`05 - Fleeting`), `KOKORO_VOICE` (`af_heart`), `KOKORO_SPEED`, `KOKORO_GAIN` (1.0), `LOOKAHEAD` (80), `PRERENDER_CHAPTERS` (2), `PREFETCH_WHILE_PAUSED`, `MAX_AUDIO_GB` (5), `MAX_CHAPTER_GB` (20), `SILENCE_S` (0.5), `WHISPER_MODEL`, `WHISPER_PROMPT`, `WHISPER_THREADS` (every core), `CHAPTER_BITRATE` (`64k`), `CHAPTER_GAP_S` (0.30), `CHAPTER_PARA_GAP_S` (0.60), `HLS_SEGMENT_S` (6), `TEXT_SHARD_BYTES`, `TEXT_SHARD_CHAPTERS`, `CHAPTER_PHRASE_GAP_S` (0.10), `HEALTH_STALL_S` (300), `AUTOPACK`, `AUTOPACK_EVERY_S`,
+`IDLE_RENDER` (on) and `IDLE_CEILING` (0.80) — see [never idle](#never-idle-what-the-worker-does-when-there-is-nothing-to-do); the ceiling is clamped to 0.85 on read, because a typo above the collector's trim floor would be a treadmill nobody could see, `NARRATOR_WATCH_BOOKS`, `NARRATOR_FAKE_TTS`, `SSE_HEARTBEAT_S`, `SSE_QUEUE`, `SSE_RENDER_MIN_S`, `SSE_RETRY_MS`.
 
 New here, because the weights are not downloaded by a Python package on first use: `NARRATOR_MODELS` (`/models`), `KOKORO_MODEL`, `KOKORO_VOICES`, `WHISPER_VAD_MODEL`, `ESPEAK_BIN`, `ESPEAK_VOICE`, `ESPEAK_TIMEOUT` (15 s, seconds, after which the subprocess is killed), `QUEUE_RESUME_DELAY_S` (10 s, how long after startup a wishlist left by the last process may start rendering — the note queue's own startup sweep may be claiming one of the box's two cores). `HF_HOME` and `KOKORO_REPO` are gone — nothing here talks to Hugging Face at runtime.
 

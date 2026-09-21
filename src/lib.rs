@@ -13,6 +13,7 @@ pub mod config;
 pub mod err;
 pub mod events;
 pub mod export;
+pub mod library;
 pub mod migrate;
 pub mod plancache;
 pub mod render;
@@ -33,6 +34,16 @@ pub mod wishlist;
 /// fail the boot: each restore is an `Option` and a missing one just means the
 /// process starts the way it always did.
 pub fn boot(st: &std::sync::Arc<state::AppState>) {
+    // The position counter, lifted past everything already on record. A repeated
+    // sequence number is exactly the ambiguity it exists to remove, so this runs
+    // before anything can write one — and it only ever moves the counter up, so
+    // the test harness restarting a server in place cannot walk it backwards.
+    if let Some(db) = st.store() {
+        match db.seq() {
+            Ok(n) => st.seed_seq(n),
+            Err(e) => tracing::warn!("could not read the position counter: {e}"),
+        }
+    }
     // The prerender target is one number the user chose, and a redeploy used to
     // silently drop a 13-chapter buffer back to the default.
     if let Some(h) = api::session::load_prerender(st) {
@@ -78,4 +89,11 @@ pub fn boot(st: &std::sync::Arc<state::AppState>) {
             wishlist::start_soon(st, r.queued.len());
         }
     }
+    // And last, because it is the lowest-priority thing on the box: the library
+    // index. It is what lets any device see what is rendered and packed across
+    // the whole library rather than only for the book this process happens to
+    // have loaded, and it is a few thousand `stat`s — so it stands down for a
+    // voice memo and for a renderer stalled under the playhead, exactly like the
+    // packer does, and it never blocks a boot.
+    library::start_scanner(st);
 }

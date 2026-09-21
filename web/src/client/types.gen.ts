@@ -98,6 +98,35 @@ export type ChapMeta = {
     title: string;
 };
 
+/**
+ * A cached filesystem scan of one chapter. **Not truth** — see the module doc.
+ *
+ * The field names are [`crate::api::chapters::ChapterRow`]'s on purpose: this
+ * table exists to answer that endpoint for a book the session has not loaded,
+ * and a row that has to be renamed on the way out is a row that will eventually
+ * be renamed wrongly.
+ */
+export type ChapterIndexRow = {
+    bytes?: number | null;
+    chapter: number;
+    duration?: number | null;
+    /**
+     * Estimated spoken seconds, from the chunker's character counts.
+     */
+    est_s?: number | null;
+    m4a: boolean;
+    /**
+     * Chunks in the plan.
+     */
+    n: number;
+    /**
+     * Chunk wavs that were on disk **when the scan ran**.
+     */
+    rendered: number;
+    scanned_ms: number;
+    title: string;
+};
+
 export type ChapterRow = {
     bytes: number | null;
     duration: number | null;
@@ -229,6 +258,82 @@ export type Health = {
      * every book quietly opens at chapter one.
      */
     vault?: string | null;
+};
+
+/**
+ * One book on this box.
+ *
+ * The counts are aggregates of that book's cached scan rows; `chapters` is what
+ * the `book` table records, so a book whose plan is on disk but which has never
+ * been scanned still says how long it is.
+ */
+export type LibraryBook = {
+    /**
+     * The per-chapter rows, present only for `?book=<key>&chapters=true`.
+     *
+     * Deliberately absent from the all-books answer: *Lord of Mysteries* alone
+     * is 1433 of these, and a library response that carried them for every book
+     * would be megabytes over a tunnel to answer a question about shelves.
+     */
+    chapter_index?: Array<ChapterIndexRow> | null;
+    chapters: number;
+    /**
+     * The whole book's spoken length, from the chunker's character counts.
+     * Null only when nothing has been scanned yet.
+     */
+    est_min: number | null;
+    /**
+     * The cache directory name — what `?book=` takes everywhere else.
+     */
+    key: string;
+    /**
+     * When this book was last opened, or null for one that has only ever been
+     * found on disk.
+     */
+    last_open_ms: number | null;
+    /**
+     * Is this the book the session is holding? The one field here that is a
+     * live fact rather than a scan result.
+     */
+    loaded: boolean;
+    /**
+     * The epub file name, which is what positions are keyed by.
+     */
+    name: string;
+    /**
+     * What those weigh, measured — not estimated.
+     */
+    packed_bytes: number;
+    /**
+     * Chapters with a *usable* packed m4a. A manifest that disagrees with the
+     * plan is not one; see [`crate::library::scan_book`].
+     */
+    packed_chapters: number;
+    /**
+     * Absolute path on the server, or empty for a book whose audio is here and
+     * whose source file is not.
+     */
+    path: string;
+    position: null | StampedPosition;
+    /**
+     * Chapters every chunk of which was on disk at the scan. A chapter with no
+     * chunks at all does not count: "nothing to render" is not "rendered".
+     */
+    rendered_chapters: number;
+    rendered_chunks: number;
+    title: string;
+    total_chunks: number;
+};
+
+export type LibraryResult = {
+    books: Array<LibraryBook>;
+    /**
+     * The **oldest** scan in this answer, so the reader can say how fresh it
+     * is — and so one book that has not been walked since yesterday cannot hide
+     * behind eleven that were walked a minute ago. Null when nothing in the
+     * answer has ever been scanned.
+     */
+    scanned_ms: number | null;
 };
 
 export type LoadBody = {
@@ -966,6 +1071,30 @@ export type HlsSegment2Responses = {
 };
 
 export type HlsSegment2Response = HlsSegment2Responses[keyof HlsSegment2Responses];
+
+export type LibraryData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * One book's cache key. Unknown keys answer with an empty list rather than
+         * a 404: this endpoint describes what is here, and "not here" is an answer.
+         */
+        book?: string | null;
+        /**
+         * Include the per-chapter rows. Only meaningful alongside `book`; it is
+         * ignored for the all-books answer, which would otherwise be enormous.
+         */
+        chapters?: boolean | null;
+    };
+    url: '/api/library';
+};
+
+export type LibraryResponses = {
+    200: LibraryResult;
+};
+
+export type LibraryResponse = LibraryResponses[keyof LibraryResponses];
 
 export type LoadData = {
     body: LoadBody;

@@ -84,10 +84,28 @@ pub fn render_alive(st: &AppState) -> bool {
 }
 
 fn render_event(st: &AppState, kind: &str, ci: usize, idx: usize, total: usize, status: &str) {
-    let (key, playhead) = {
-        let s = st.session();
-        (s.key(), s.playhead)
-    };
+    let key = st.session().key();
+    render_event_for(st, key.as_deref(), kind, ci, idx, total, status);
+}
+
+/// The same event, for work on a book that is **not** the loaded one.
+///
+/// The speculative branch renders across the library, and an event that took its
+/// `key` from the session would name the wrong book — which the reader acts on:
+/// it invalidates that book's chapter rows and its download reconciler reads
+/// them. A render event has always carried a key; until there was work on other
+/// books, reading it off the session happened to be the same thing.
+#[allow(clippy::too_many_arguments)]
+fn render_event_for(
+    st: &AppState,
+    key: Option<&str>,
+    kind: &str,
+    ci: usize,
+    idx: usize,
+    total: usize,
+    status: &str,
+) {
+    let playhead = st.session().playhead;
     st.bus.emit_render(
         kind,
         json!({"key": key, "chapter": ci, "render_idx": idx,
@@ -231,6 +249,204 @@ fn next_ahead(st: &AppState, key: &str, ci: usize, span: usize) -> Option<(usize
     None
 }
 
+// ------------------------------------------------------ rendering while idle
+//
+// The box has two ARM cores and renders at about a quarter of realtime, so it can
+// never keep up with a listener — which means every second it spends idle is a
+// second of audio somebody will wait for later. Before this, it spent a lot of
+// them: once the playhead's lookahead and the prerender span were full, the
+// worker slept in a 1-second loop with a whole novel unrendered behind it.
+//
+// So there is a branch below all the others that says: render the next thing
+// anybody is plausibly going to want. The rest of the current book first, then
+// the other books in the library, most recently opened first, each from the
+// position it was last left at. It outranks nothing — a playhead move, a
+// lookahead hole and a chapter somebody actually asked for all still come first,
+// and the loop re-evaluates every iteration, so this work is abandoned the
+// instant there is real work.
+//
+// # The ceiling, which is the part that matters
+//
+// `gc_audio` trims the chunk cache to 90 % of `MAX_AUDIO_GB` once it is over
+// 100 %, oldest first. A speculative renderer that runs until the cache is full
+// therefore does not settle: it renders to the cap, the gc deletes the oldest
+// chunks — which are exactly the ones nobody has listened to yet — and it renders
+// them again, forever, burning the one core the box had spare on work that is
+// thrown away before anyone hears it. Worse, it is invisible: the log looks
+// busy, the RTF looks healthy, and nothing ever finishes.
+//
+// So speculation stops at `IDLE_CEILING` (`Config::idle_ceiling`) and the band
+// between there and the gc
+// belongs to *demanded* work only. The renderer and the collector then never
+// touch: one stops below the floor the other starts at.
+/// How often the speculative branch re-measures the cache.
+///
+/// Measured in *time*, not in chunks rendered, and that is a correction rather
+/// than a preference: a count only advances when something is rendered, so the
+/// branch that stands down — the one that has decided the cache is full — would
+/// never advance it and would re-measure on every pass of a loop that ticks once
+/// a second. The measurement is a walk of every wav in the cache, which on the
+/// box is 50 GB of them. Once a minute costs nothing and is far fresher than it
+/// needs to be: the A1 renders perhaps fifteen chunks in that time, a megabyte
+/// or so, against a band between the ceiling and the collector measured in
+/// gigabytes.
+const IDLE_MEASURE_EVERY: Duration = Duration::from_secs(60);
+
+/// A speculative target: somewhere worth rendering when there is nothing to do.
+struct Idle {
+    key: String,
+    chapter: usize,
+    chunk: usize,
+    plan: Arc<Vec<crate::book::Chapter>>,
+}
+
+/// Where the reader would resume a book that is not the loaded one.
+///
+/// The stored position, because that is where a person coming back to it would
+/// start — rendering a book from chapter one when they are eighty chapters in is
+/// the most expensive possible way to be useless. Falls back to the beginning
+/// for a book nobody has opened.
+fn resume_chapter(st: &AppState, name: &str) -> usize {
+    if let Some(db) = st.store() {
+        if let Ok(Some((_, row))) = db.newest_position(name) {
+            return row.chapter.max(0) as usize;
+        }
+    }
+    st.positions()
+        .get(name)
+        .and_then(|v| v.get("chapter"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        .max(0) as usize
+}
+
+/// The first chapter of `plan` at or after `from` with a chunk missing on disk.
+fn first_hole(
+    st: &AppState,
+    key: &str,
+    plan: &[crate::book::Chapter],
+    from: usize,
+) -> Option<(usize, usize)> {
+    for (cj, ch) in plan.iter().enumerate().skip(from) {
+        let n = ch.chunks.len();
+        if n == 0 {
+            continue;
+        }
+        if let Some(j) = first_missing(st, key, cj, 0, n) {
+            return Some((cj, j));
+        }
+    }
+    None
+}
+
+/// Pick something worth rendering, or None if the whole library is done.
+///
+/// Deliberately re-derived rather than remembered: the cheapest way to be wrong
+/// here is to hold a target across a gc that deleted it, or across a book being
+/// loaded, and every branch above this one already re-reads the filesystem for
+/// the same reason. The cost is bounded — one `read_dir` per chapter until a
+/// hole is found, and a hole is usually found immediately.
+fn next_idle(
+    st: &Arc<AppState>,
+    cur_key: &str,
+    cur_plan: &Arc<Vec<crate::book::Chapter>>,
+    from: usize,
+) -> Option<Idle> {
+    // 1. The rest of the book in front of the reader. It is the one they are
+    //    most likely to want next, and its plan is already in memory.
+    if let Some((cj, j)) = first_hole(st, cur_key, cur_plan, from) {
+        return Some(Idle {
+            key: cur_key.to_string(),
+            chapter: cj,
+            chunk: j,
+            plan: cur_plan.clone(),
+        });
+    }
+    // 2. Everything else, most recently opened first — which is what Fernando
+    //    asked for in so many words, and is also the only ordering the server
+    //    can defend: it is the last thing he chose, rather than a guess about
+    //    what he might choose next.
+    let db = st.store()?;
+    let books = db
+        .recent_books(IDLE_BOOKS)
+        .map_err(|e| tracing::warn!("could not read the library: {e}"))
+        .ok()?;
+    for b in books {
+        if b.key == cur_key {
+            continue;
+        }
+        // Raw, never through the parse cache: most of these books are not
+        // loaded, their epubs may have moved, and the chunks on disk correspond
+        // to this plan whatever has happened to the file they came from.
+        let Some(plan) = crate::plancache::read_raw(&st.cfg.work, &b.key) else {
+            continue;
+        };
+        let from = resume_chapter(st, &b.name).min(plan.len().saturating_sub(1));
+        if let Some((cj, j)) = first_hole(st, &b.key, &plan, from) {
+            return Some(Idle {
+                key: b.key,
+                chapter: cj,
+                chunk: j,
+                plan,
+            });
+        }
+    }
+    None
+}
+
+/// How many books deep the speculative branch looks. Twenty is far more than
+/// the library has ever held, and the bound exists so that a pathological
+/// library cannot turn one loop iteration into a thousand plan reads.
+const IDLE_BOOKS: usize = 20;
+
+/// A standing order on a book the session is **not** holding.
+///
+/// `next_queued` above covers the loaded book, because that is where the
+/// session's `queue` lives. Everything else somebody asked for was invisible to
+/// the worker until that book was loaded again — so "download these 74 chapters"
+/// placed on the phone, followed by opening something else, left 74 chapters
+/// waiting for an `/api/load` that might not come for days. The order was
+/// durable the whole time; nothing was reading it.
+///
+/// Ranked **below** the loaded book's own queue and above the speculative
+/// branch, which is the honest order: an explicit ask beats a guess, and the
+/// book in front of the reader beats one that is not.
+///
+/// Completion is still disk truth — an order whose chunks all exist simply
+/// leaves the list the first time this looks at it, exactly as `next_queued`
+/// does for the loaded book.
+fn next_elsewhere(st: &Arc<AppState>, cur_key: &str) -> Option<Idle> {
+    for (key, items) in crate::wishlist::all_outstanding(st) {
+        if key == cur_key {
+            continue; // `next_queued` owns this one.
+        }
+        let Some(plan) = crate::plancache::read_raw(&st.cfg.work, &key) else {
+            continue;
+        };
+        for it in items {
+            if it.parked {
+                continue; // out of attempts: still wanted, no longer tried.
+            }
+            let Some(ch) = plan.get(it.chapter) else {
+                continue;
+            };
+            let n = ch.chunks.len();
+            if n == 0 {
+                continue;
+            }
+            if let Some(j) = first_missing(st, &key, it.chapter, 0, n) {
+                return Some(Idle {
+                    key,
+                    chapter: it.chapter,
+                    chunk: j,
+                    plan,
+                });
+            }
+        }
+    }
+    None
+}
+
 /// First unrendered chunk of the chapter queue the UI filled, or None.
 ///
 /// The queue is the chapter manager's "Render" button: explicit chapters, in the
@@ -282,7 +498,26 @@ fn next_queued(st: &Arc<AppState>, key: &str) -> Option<(usize, usize)> {
 
 fn gc(st: &AppState) {
     let keep = st.session().gc_keep(&st.cfg);
-    cache::gc_audio(&st.cfg.work, st.cfg.max_audio_gb, &keep);
+    let total = cache::gc_audio(&st.cfg.work, st.cfg.max_audio_gb, &keep);
+    // The walk has already been done, so the number is free. It is what the
+    // speculative branch stands down on.
+    st.audio_bytes.store(total, Ordering::Relaxed);
+}
+
+/// Is there room to render something nobody has asked for yet?
+///
+/// See `Config::idle_ceiling`. `max_audio_gb` at or below zero means the cap
+/// is disabled, and so is this check; `IDLE_RENDER=0` turns the branch off
+/// entirely.
+fn room_to_speculate(st: &AppState) -> bool {
+    if !st.cfg.idle_render {
+        return false;
+    }
+    if st.cfg.max_audio_gb <= 0.0 {
+        return true;
+    }
+    let cap = st.cfg.max_audio_gb * 1024.0_f64.powi(3);
+    (st.audio_bytes.load(Ordering::Relaxed) as f64) < cap * st.cfg.idle_ceiling
 }
 
 /// Is every chunk of this chapter on disk?
@@ -364,6 +599,10 @@ fn worker(st: Arc<AppState>) {
     st.engine.load();
     st.session().model_ready = st.engine.ready();
     let mut pre = 0usize;
+    // When the chunk cache was last measured, and whether the "it is full" line
+    // has already been logged — once per spell, not once a second.
+    let mut measured: Option<Instant> = None;
+    let mut said_full = false;
     let mut bo = Backoff::default();
     let mut parked: Option<Instant> = None;
     while !st.stop.load(Ordering::SeqCst) {
@@ -457,6 +696,14 @@ fn worker(st: Arc<AppState>) {
                 // The chapter just became packable and the renderer is about to
                 // go do speculative work; pack it now, while it matters.
                 autopack(&st, true);
+                // ...and the library index has just gone stale in the one way
+                // that matters — a chapter went from partly to fully rendered.
+                // Cheap (one plan read, one `read_dir` per chapter) and worth
+                // doing here, because the alternative is that nothing notices
+                // until the scanner's next five-minute tick. Note the direction:
+                // the worker *writes* this index and never reads it. See the
+                // disk-truth invariant.
+                crate::library::rescan_book(&st, &key);
             } else {
                 render_event(&st, "progress", ci, next, n, "rendering");
             }
@@ -492,6 +739,43 @@ fn worker(st: Arc<AppState>) {
             continue;
         }
 
+        // 3b. ...and the same thing for every *other* book somebody has a
+        //     standing order on. Below the loaded book's queue, above the
+        //     speculative branch: an explicit ask beats a guess, and the book in
+        //     front of the reader beats one that is not.
+        if let Some(t) = next_elsewhere(&st, &key) {
+            {
+                let mut s = st.session();
+                s.status = "queued".into();
+            }
+            let tn = t.plan.get(t.chapter).map(|c| c.chunks.len()).unwrap_or(0);
+            attempt(
+                &st,
+                &t.key,
+                t.chapter,
+                t.chunk,
+                t.plan
+                    .get(t.chapter)
+                    .map(|c| c.chunks.as_slice())
+                    .unwrap_or(&[]),
+                &mut bo,
+            );
+            render_event_for(
+                &st,
+                Some(&t.key),
+                "progress",
+                t.chapter,
+                t.chunk + 1,
+                tn,
+                "queued",
+            );
+            pre += 1;
+            if pre % 25 == 0 {
+                gc(&st);
+            }
+            continue;
+        }
+
         // 4. Buffered ahead within this chapter, nothing asked for.
         if n > 0 && first_missing(&st, &key, ci, 0, n).is_some() {
             {
@@ -510,13 +794,74 @@ fn worker(st: Arc<AppState>) {
         let span = st.session().prerender_span(ci, &st.cfg);
         match next_ahead(&st, &key, ci, span) {
             None => {
-                {
-                    let mut s = st.session();
-                    s.status = "ready".into();
-                    s.prerender = None;
+                // 6. Everything anybody has asked for is done and the buffer is
+                //    full. The box renders at a quarter of realtime and can never
+                //    catch up with a listener, so an idle second here is a second
+                //    of waiting later: keep going through the rest of this book
+                //    and then through the library, most recently opened first.
+                //
+                //    Below everything above it, abandoned the moment there is
+                //    real work — the loop re-reads the playhead every iteration —
+                //    and stopped well short of the gc's threshold, which is the
+                //    part that keeps it from becoming a treadmill. See
+                //    `IDLE_CEILING`.
+                if measured.is_none_or(|t: Instant| t.elapsed() >= IDLE_MEASURE_EVERY) {
+                    gc(&st);
+                    measured = Some(Instant::now());
                 }
-                autopack(&st, false);
-                std::thread::sleep(Duration::from_secs(1));
+                let target = if room_to_speculate(&st) {
+                    next_idle(&st, &key, &plan, ci + span + 1)
+                } else {
+                    if !said_full {
+                        said_full = true;
+                        tracing::info!(
+                            "rendering ahead paused: the chunk cache is within {:.0}% of {} GB",
+                            st.cfg.idle_ceiling * 100.0,
+                            st.cfg.max_audio_gb
+                        );
+                    }
+                    None
+                };
+                match target {
+                    Some(t) => {
+                        said_full = false;
+                        {
+                            let mut s = st.session();
+                            s.status = "prerendering".into();
+                            s.prerender = Some(t.chapter);
+                        }
+                        let tn = t.plan.get(t.chapter).map(|c| c.chunks.len()).unwrap_or(0);
+                        attempt(
+                            &st,
+                            &t.key,
+                            t.chapter,
+                            t.chunk,
+                            t.plan
+                                .get(t.chapter)
+                                .map(|c| c.chunks.as_slice())
+                                .unwrap_or(&[]),
+                            &mut bo,
+                        );
+                        render_event_for(
+                            &st,
+                            Some(&t.key),
+                            "progress",
+                            t.chapter,
+                            t.chunk + 1,
+                            tn,
+                            "prerendering",
+                        );
+                    }
+                    None => {
+                        {
+                            let mut s = st.session();
+                            s.status = "ready".into();
+                            s.prerender = None;
+                        }
+                        autopack(&st, false);
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
             }
             Some((cj, j)) => {
                 {
@@ -656,6 +1001,10 @@ fn builder(st: Arc<AppState>) {
                     "packed",
                     json!({"key": key, "chapter": ci, "ok": true, "n": n, "status": "packed"}),
                 );
+                // The other moment a library row genuinely goes stale: an m4a
+                // landed, so this chapter is now downloadable from any device.
+                // Same direction as the renderer's — written here, never read.
+                crate::library::rescan_book(&st, &key);
             }
             Err(msg) => {
                 tracing::warn!("pack failed - {msg}");

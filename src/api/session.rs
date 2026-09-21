@@ -187,6 +187,29 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
         s.pack_queue.clear();
     }
 
+    // The library register. `/api/load` is the one moment the server learns a
+    // book's key, name, path, title and size all at once, and writing it down is
+    // what lets everything else answer about a book the session is not holding —
+    // the readiness view, the scheduler's "the most recently opened book", a
+    // standing order placed on something else entirely.
+    if let Some(db) = st.store() {
+        let now_ms = chrono::Local::now().timestamp_millis();
+        let row = crate::store::BookRow {
+            key: key.clone(),
+            name: name.clone(),
+            path: body.path.clone(),
+            title: title.clone(),
+            chapters: plan.len(),
+            last_open_ms: Some(now_ms),
+            scanned_ms: Some(now_ms),
+        };
+        if let Err(e) = db.put_book(&row) {
+            tracing::warn!("could not register {key}: {e}");
+        } else if let Err(e) = db.touch_book_open(&key, now_ms) {
+            tracing::warn!("could not stamp {key} as opened: {e}");
+        }
+    }
+
     // ... and then this book's own wishlist back, if it has one.
     //
     // Clearing the queues above is right — they are indices into the plan that
@@ -549,7 +572,8 @@ pub async fn position(
     if let Ok(mut w) = st.pos_written.lock() {
         *w = Some(Instant::now());
     }
-    emit_position(&st, &name, &record, "api", &dev);
+    let seq = record_position(&st, &name, &record, &dev);
+    emit_position(&st, &name, &record, "api", &dev, seq);
     ok().into_response()
 }
 
@@ -573,6 +597,8 @@ pub async fn position(
 ///   a real one-chunk move and follows a laptop that is three chapters behind.
 /// * **`seq`** — monotonic, the tie-break when two writes share a millisecond or
 ///   when the clock steps under them.
+/// * **`device_name`** — that device's own label, so the line the other readers
+///   show can name it. Display only; the id is the identity.
 ///
 /// All three are additive. A reader that reads none of them sees exactly the
 /// payload it saw before.
@@ -582,6 +608,7 @@ fn emit_position(
     record: &vault::Position,
     source: &str,
     dev: &Device,
+    seq: u64,
 ) {
     let stamped = record.clone().stamped();
     let mut payload = serde_json::to_value(&stamped).unwrap_or(Value::Null);
@@ -589,9 +616,74 @@ fn emit_position(
         o.insert("book".into(), Value::String(book.to_string()));
         o.insert("source".into(), Value::String(source.to_string()));
         o.insert("device".into(), Value::String(dev.id.clone()));
-        o.insert("seq".into(), Value::from(st.next_seq()));
+        // The label, so the other devices can say "moved on iPhone" rather than
+        // "moved on another device". Display only, never matched on — the id is
+        // the identity and this is the caption.
+        o.insert("device_name".into(), Value::String(dev.name.clone()));
+        o.insert("seq".into(), Value::from(seq));
     }
     st.bus.emit("position", payload);
+}
+
+/// Record a position against the device that reported it, and say what sequence
+/// number it got.
+///
+/// The store keeps **one row per (book, device)** where the vault keeps one row
+/// per book, and that difference is the point. The vault record is a projection
+/// — last write wins, which is the right rule and always was — but a projection
+/// throws away exactly the fact the reader needed: that the laptop is at chapter
+/// 10 and the phone is at chapter 40, rather than that "the position" is
+/// wherever the most recent report happened to come from. Keeping both means the
+/// vault file stays byte-identical for the Obsidian plugin while the server can
+/// still answer who is where.
+///
+/// The high-water mark moves here too, and only ever forwards. It is a different
+/// question from "where am I" — re-reading a scene must not shrink it — and it
+/// is what the reader's auto-trim and its behind-the-high-water-mark rule are
+/// both anchored on.
+///
+/// Returns the store's sequence number, or the in-memory counter's when there is
+/// no store. Either way it is monotonic within a process; with a store it is
+/// monotonic across restarts too, which is what makes it a real tie-break rather
+/// than a decoration.
+fn record_position(st: &Arc<AppState>, book: &str, record: &vault::Position, dev: &Device) -> u64 {
+    let Some(db) = st.store() else {
+        return st.next_seq();
+    };
+    let now_ms = chrono::Local::now().timestamp_millis();
+    if dev.known() {
+        if let Err(e) = db.touch_device(&dev.id, &dev.name, now_ms) {
+            tracing::warn!("could not record device {}: {e}", dev.id);
+        }
+    }
+    let row = crate::store::PositionRow {
+        chapter: record.chapter,
+        chunk: record.chunk,
+        chapter_title: record.chapter_title.clone(),
+        chunks_total: record.chunks_total,
+        chapters_total: record.chapters_total,
+        updated_ms: vault::epoch_ms(&record.updated).unwrap_or(now_ms),
+        seq: 0, // the store stamps its own; a number the caller picks is one two
+                // callers can pick twice.
+    };
+    if let Err(e) = db.bump_furthest(
+        book,
+        &dev.id,
+        record.chapter.max(0) as usize,
+        record.chunk.max(0) as usize,
+        now_ms,
+    ) {
+        tracing::warn!("could not move the high-water mark for {book}: {e}");
+    }
+    match db.put_position(book, &dev.id, row) {
+        Ok(seq) => seq,
+        Err(e) => {
+            // The vault write has already happened or is about to; losing the
+            // per-device row costs the cross-device answers, not the position.
+            tracing::warn!("could not record the position for {book}: {e}");
+            st.next_seq()
+        }
+    }
 }
 
 /// Persist chapter+chunk of the loaded book.
@@ -657,7 +749,8 @@ pub fn save_position(st: &Arc<AppState>, force: bool, dev: &Device) {
     // Tell the other devices. This fires exactly when the position is *written*,
     // so the 15 s throttle above is also the rate every open reader follows at —
     // which is the right rate: a position is a place in a book, not a cursor.
-    emit_position(st, &name, &record, "session", dev);
+    let seq = record_position(st, &name, &record, dev);
+    emit_position(st, &name, &record, "session", dev, seq);
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

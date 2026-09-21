@@ -84,6 +84,30 @@ pub struct Config {
 
     pub autopack: bool,
     pub autopack_every_s: f64,
+    /// `LIBRARY_SCAN_EVERY_S` — how often the library index is refreshed from
+    /// the filesystem. Chosen against what makes a row wrong (a chapter
+    /// finishing, a pack landing, the gc evicting) — none of which the reader
+    /// learns from here, so this only has to be short enough that a library view
+    /// opened cold is not embarrassing, and long enough that a few thousand
+    /// `stat`s are not a background load on two cores.
+    pub library_scan_every_s: f64,
+    /// `IDLE_RENDER` — whether the worker renders ahead through the rest of the
+    /// library when it has nothing else to do. On by default: the box renders at
+    /// a quarter of realtime and can never catch up with a listener, so an idle
+    /// second is a second of waiting later. Off is for a box shared with
+    /// something else that wants the core.
+    pub idle_render: bool,
+    /// `IDLE_CEILING` — how full the chunk cache may get, as a fraction of
+    /// `MAX_AUDIO_GB`, before *speculative* rendering stands down.
+    ///
+    /// It must stay below the collector's 0.9 trim floor with room to spare, and
+    /// the reason is the failure it prevents rather than tidiness: `gc_audio`
+    /// evicts oldest-first, which is exactly the speculative work nobody has
+    /// listened to yet, so a renderer allowed to run to the cap renders, watches
+    /// it deleted and renders it again for as long as the process lives. Clamped
+    /// on read for the same reason — a typo here would be a treadmill nobody
+    /// could see.
+    pub idle_ceiling: f64,
     pub watch_books: bool,
     /// `QUEUE_RESUME_DELAY_S` — how long after startup the render worker may act
     /// on a wishlist left over from the last process. See
@@ -184,6 +208,9 @@ impl Config {
 
             autopack: flag("AUTOPACK", true),
             autopack_every_s: num("AUTOPACK_EVERY_S", 5.0),
+            library_scan_every_s: num("LIBRARY_SCAN_EVERY_S", crate::library::SCAN_EVERY_S),
+            idle_render: flag("IDLE_RENDER", true),
+            idle_ceiling: num::<f64>("IDLE_CEILING", 0.80).clamp(0.0, 0.85),
             watch_books: flag("NARRATOR_WATCH_BOOKS", true),
             queue_resume_delay_s: num("QUEUE_RESUME_DELAY_S", crate::wishlist::RESUME_DELAY_S),
 

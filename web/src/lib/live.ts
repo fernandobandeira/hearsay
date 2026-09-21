@@ -75,6 +75,15 @@ export interface PositionEvent {
    */
   device?: string;
   /**
+   * That device's own label - "iPhone", "Mac".
+   *
+   * Only ever shown to a person. The offer line used to read "moved on another
+   * device", which is exactly as much as the reader knew; naming it is the
+   * difference between a notification you have to go and investigate and one you
+   * can act on from across the room.
+   */
+  device_name?: string;
+  /**
    * A monotonic per-server counter, incremented on every position write.
    *
    * The tie-break for two writes inside the same millisecond, which the
@@ -173,6 +182,7 @@ export function parseEvent(name: string, raw: string): LiveEvent | null {
         source: str(o.source),
         updated_ms: opt(o.updated_ms),
         device: str(o.device),
+        device_name: str(o.device_name),
         seq: opt(o.seq),
       }};
     }

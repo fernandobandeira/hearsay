@@ -79,6 +79,30 @@ pub fn load(work: &Path, key: &str, want: &Stamp) -> Option<Arc<Vec<Chapter>>> {
     Some(Arc::new(plan))
 }
 
+/// Read `plan.json` **without checking the stamp** — the plan as the last write
+/// left it, whatever has happened to the epub since.
+///
+/// The distinction from [`load`] is the whole reason both exist. `load` answers
+/// "may I reuse this instead of parsing?", and a moved mtime means no, because
+/// re-chunking could move every position in the book. This answers "what text
+/// do the wavs in this directory correspond to?", and for *that* question the
+/// epub is irrelevant: the chunks on disk were made from this plan, and they
+/// still are, whether or not the file they came from has been touched.
+///
+/// `narrator export` has always taken this view — an export of audio already on
+/// disk has no business refusing to run because a sync touched the epub — and it
+/// is the view anything scanning or scheduling across the library has to take
+/// too, since most of those books are not the loaded one and none of them is
+/// going to be parsed.
+pub fn read_raw(work: &Path, key: &str) -> Option<Arc<Vec<Chapter>>> {
+    let plan: Vec<Chapter> =
+        serde_json::from_slice(&std::fs::read(crate::cache::plan_path(work, key)).ok()?).ok()?;
+    if plan.is_empty() {
+        return None;
+    }
+    Some(Arc::new(plan))
+}
+
 /// Write `plan.json` and the stamp beside it. The stamp is written *last* and
 /// only if the plan wrote cleanly, so a half-written plan can never be adopted.
 pub fn store(work: &Path, key: &str, plan: &[Chapter], s: &Stamp) -> std::io::Result<()> {
