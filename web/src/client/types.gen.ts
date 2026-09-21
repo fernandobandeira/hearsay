@@ -899,7 +899,16 @@ export type ChunkWav2Response = ChunkWav2Responses[keyof ChunkWav2Responses];
 export type EventsData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * This device's id. A query parameter rather than the `X-Narrator-Device` header every other endpoint takes, because `EventSource` cannot set request headers — and this is the endpoint that tells the server which devices are connected right now.
+         */
+        device?: string;
+        /**
+         * A label for that device, display only.
+         */
+        device_name?: string;
+    };
     url: '/api/events';
 };
 
@@ -1015,6 +1024,16 @@ export type NoteResponse = NoteResponses[keyof NoteResponses];
 
 export type OpenChapterData = {
     body: OpenBody;
+    headers?: {
+        /**
+         * Who is reporting. Additive: omitted, this is the anonymous legacy device and the behaviour is exactly the pre-device one. Supplied, it is echoed on the `position` event so other devices can tell a real move from their own echo.
+         */
+        'X-Narrator-Device'?: string | null;
+        /**
+         * A human label for that device, for display only.
+         */
+        'X-Narrator-Device-Name'?: string | null;
+    };
     path?: never;
     query?: never;
     url: '/api/open';
@@ -1037,6 +1056,16 @@ export type OpenChapterResponse = OpenChapterResponses[keyof OpenChapterResponse
 
 export type PauseData = {
     body?: never;
+    headers?: {
+        /**
+         * Who is reporting. Additive: omitted, this is the anonymous legacy device and the behaviour is exactly the pre-device one. Supplied, it is echoed on the `position` event so other devices can tell a real move from their own echo.
+         */
+        'X-Narrator-Device'?: string | null;
+        /**
+         * A human label for that device, for display only.
+         */
+        'X-Narrator-Device-Name'?: string | null;
+    };
     path?: never;
     query?: never;
     url: '/api/pause';
@@ -1050,6 +1079,16 @@ export type PauseResponse = PauseResponses[keyof PauseResponses];
 
 export type PlayheadData = {
     body: PlayheadBody;
+    headers?: {
+        /**
+         * Who is reporting. Additive: omitted, this is the anonymous legacy device and the behaviour is exactly the pre-device one. Supplied, it is echoed on the `position` event so other devices can tell a real move from their own echo.
+         */
+        'X-Narrator-Device'?: string | null;
+        /**
+         * A human label for that device, for display only.
+         */
+        'X-Narrator-Device-Name'?: string | null;
+    };
     path?: never;
     query?: never;
     url: '/api/playhead';
@@ -1072,6 +1111,16 @@ export type PlayheadResponse = PlayheadResponses[keyof PlayheadResponses];
 
 export type PositionData = {
     body: PositionBody;
+    headers?: {
+        /**
+         * Who is reporting. Additive: omitted, this is the anonymous legacy device and the behaviour is exactly the pre-device one. Supplied, it is echoed on the `position` event so other devices can tell a real move from their own echo.
+         */
+        'X-Narrator-Device'?: string | null;
+        /**
+         * A human label for that device, for display only.
+         */
+        'X-Narrator-Device-Name'?: string | null;
+    };
     path?: never;
     query?: never;
     url: '/api/position';

@@ -29,6 +29,7 @@ import {
 import {loadChapterText, shardOf, type TextSources} from './lib/chaptertext';
 import {
   arbitrate, connectLive, lostSession, type HelloEvent, type LiveState, type PositionEvent,
+
   type RenderEvent,
 } from './lib/live';
 import {isSane, type Manifest} from './lib/manifest';
@@ -41,6 +42,7 @@ import {
 import {reconcile, SWEEP_EVERY_MS, type PendingDownload} from './lib/reconcile';
 import {buildChapters, cancelChapters, renderChapters} from './lib/api';
 import {chaptersToTrim, furthestReached, KEEP_BEHIND} from './lib/autotrim';
+import {deviceId} from './lib/device';
 import {clampResume, resolveResume, type Resume} from './lib/resume';
 import * as db from './lib/db';
 import type {
@@ -361,6 +363,13 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     const b = bookRef.current;
     if (!b) return;
     rememberDevicePos(b.path, ciRef.current, i);
+    /* Stamped before the call, not after it. `lastWriteMs` exists to answer
+       "could this event predate what I just told the server?", and the honest
+       answer has to cover the write that is in flight right now: on a tunnel to
+       a box this slow, the `position` event for a report routinely arrives
+       before the POST that caused it has resolved here. Stamping late would let
+       this device's own echo through in exactly that window. */
+    lastWriteRef.current = Date.now();
     /* The first report after reading offline cannot be a playhead report.
        `/api/playhead` carries only the chunk, so the server would file it under
        whatever chapter its session still holds - the one this device left when
@@ -730,6 +739,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     // Start the renderer here. Named, so the server refuses it outright if it
     // holds another book rather than dragging that book's frontier along - which
     // is why this no longer waits to be sure.
+    lastWriteRef.current = Date.now();   // /api/open force-writes a position
     void tellOpen(b.key, target, chunk).catch(() => {});
 
     const manifest = await loadManifest(qc, b.key, target, text.chunks.length);
@@ -956,6 +966,13 @@ export function NarratorProvider({children}: {children: ReactNode}) {
      which is why nothing here holds server state of its own. The exception is
      the reading position, which is not a query - it is the page the reader is
      looking at, and moving that is a decision rather than a refetch. */
+  /* When this device last wrote a position, in epoch milliseconds.
+     Read by `arbitrate`: a `position` event stamped at or before this cannot be
+     news, because everything the server knew before that moment is something
+     this device told it. Deliberately not persisted — it is about this page's
+     own writes, and a reload has nothing in flight to disbelieve. */
+  const lastWriteRef = useRef(0);
+
   const openChapterRef = useRef(openChapter);
   openChapterRef.current = openChapter;
 
@@ -967,6 +984,15 @@ export function NarratorProvider({children}: {children: ReactNode}) {
       chunk: idxRef.current,
       playing: playerRef.current?.playing ?? false,
       undelivered: !!b && undeliveredRef.current.has(b.name),
+      device: deviceId(),
+      lastWriteMs: lastWriteRef.current || undefined,
+      /* The high-water mark, which is what stops a device that is *behind* from
+         pulling the page backwards on its own. Chapter-granular because that is
+         what the trim already keeps (`narrator.furthest:`) and it is the
+         conservative side of the rounding: `chunk: 0` means a position earlier
+         in the same chapter still reads as "not behind" and can be followed,
+         while anything in an earlier chapter is offered rather than taken. */
+      furthest: b ? {chapter: readFurthest(b.key), chunk: 0} : undefined,
     });
     if (verdict.t === 'ignore') return;
     if (verdict.t === 'offer') {

@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use utoipa::ToSchema;
 
 use super::{err, ok, round1, round2, ApiError, Ok2};
+use crate::api::device::Device;
 use crate::book::{build_plan, est_chapter_s, extract_chapters};
 use crate::cache;
 use crate::plancache;
@@ -348,10 +349,23 @@ pub struct OpenBody {
 #[utoipa::path(
     post, path = "/api/open", tag = "session",
     request_body = OpenBody,
+    params(
+        ("X-Narrator-Device" = Option<String>, Header,
+         description = "Who is reporting. Additive: omitted, this is the anonymous \
+legacy device and the behaviour is exactly the pre-device one. Supplied, it is \
+echoed on the `position` event so other devices can tell a real move from their \
+own echo."),
+        ("X-Narrator-Device-Name" = Option<String>, Header,
+         description = "A human label for that device, for display only."),
+    ),
     responses((status = 200, body = Ok2),
               (status = 409, body = ApiError, description = "the session holds another book"))
 )]
-pub async fn open_chapter(State(st): State<Arc<AppState>>, Json(body): Json<OpenBody>) -> Response {
+pub async fn open_chapter(
+    State(st): State<Arc<AppState>>,
+    dev: Device,
+    Json(body): Json<OpenBody>,
+) -> Response {
     if let Some(r) = wrong_book(&st, body.book.as_deref()) {
         return r;
     }
@@ -363,7 +377,7 @@ pub async fn open_chapter(State(st): State<Arc<AppState>>, Json(body): Json<Open
         s.status = "starting".into();
         (s.chapter, s.playhead, s.key())
     };
-    save_position(&st, true);
+    save_position(&st, true, &dev);
     st.run.set();
     render::ensure_render_thread(&st);
     st.bus.emit_render(
@@ -417,10 +431,23 @@ pub struct PlayheadBody {
 #[utoipa::path(
     post, path = "/api/playhead", tag = "session",
     request_body = PlayheadBody,
+    params(
+        ("X-Narrator-Device" = Option<String>, Header,
+         description = "Who is reporting. Additive: omitted, this is the anonymous \
+legacy device and the behaviour is exactly the pre-device one. Supplied, it is \
+echoed on the `position` event so other devices can tell a real move from their \
+own echo."),
+        ("X-Narrator-Device-Name" = Option<String>, Header,
+         description = "A human label for that device, for display only."),
+    ),
     responses((status = 200, body = Ok2),
               (status = 409, body = ApiError, description = "the session holds another book"))
 )]
-pub async fn playhead(State(st): State<Arc<AppState>>, Json(body): Json<PlayheadBody>) -> Response {
+pub async fn playhead(
+    State(st): State<Arc<AppState>>,
+    dev: Device,
+    Json(body): Json<PlayheadBody>,
+) -> Response {
     if let Some(r) = wrong_book(&st, body.book.as_deref()) {
         return r;
     }
@@ -441,7 +468,7 @@ pub async fn playhead(State(st): State<Arc<AppState>>, Json(body): Json<Playhead
         st.run.set();
         render::ensure_render_thread(&st);
     }
-    save_position(&st, false);
+    save_position(&st, false, &dev);
     ok().into_response()
 }
 
@@ -464,10 +491,23 @@ pub struct PositionBody {
 #[utoipa::path(
     post, path = "/api/position", tag = "vault",
     request_body = PositionBody,
+    params(
+        ("X-Narrator-Device" = Option<String>, Header,
+         description = "Who is reporting. Additive: omitted, this is the anonymous \
+legacy device and the behaviour is exactly the pre-device one. Supplied, it is \
+echoed on the `position` event so other devices can tell a real move from their \
+own echo."),
+        ("X-Narrator-Device-Name" = Option<String>, Header,
+         description = "A human label for that device, for display only."),
+    ),
     responses((status = 200, body = Ok2), (status = 400, body = ApiError),
               (status = 500, body = ApiError))
 )]
-pub async fn position(State(st): State<Arc<AppState>>, Json(body): Json<PositionBody>) -> Response {
+pub async fn position(
+    State(st): State<Arc<AppState>>,
+    dev: Device,
+    Json(body): Json<PositionBody>,
+) -> Response {
     let name = body.book.trim().to_string();
     if name.is_empty() {
         return err(StatusCode::BAD_REQUEST, "book required");
@@ -509,20 +549,56 @@ pub async fn position(State(st): State<Arc<AppState>>, Json(body): Json<Position
     if let Ok(mut w) = st.pos_written.lock() {
         *w = Some(Instant::now());
     }
-    let mut payload = serde_json::to_value(&record).unwrap_or(Value::Null);
+    emit_position(&st, &name, &record, "api", &dev);
+    ok().into_response()
+}
+
+/// Broadcast a position that has just been written, as `position`.
+///
+/// One place, because the payload is a contract with three readers (this repo's
+/// PWA, the Obsidian plugin, anything else on the tunnel) and it used to be
+/// assembled twice, slightly differently. What it carries beyond the vault
+/// record is the part that was missing and that the reader could not work
+/// without:
+///
+/// * **`updated_ms`** — the same instant as `updated`, in epoch milliseconds.
+///   `updated` is a naive local stamp with no zone because the vault file has to
+///   stay byte-identical to the python server's, and a browser genuinely cannot
+///   order two of those: a container without `/etc/localtime` writes UTC while
+///   the reader's own stamps are local. `StampedPosition` has resolved this at
+///   the API's edge since requirement 3; the *event* never carried it, so every
+///   recency rule in the reader was reasoning from a string it could not trust.
+/// * **`device`** — whose report caused this write. The reader's own-echo test
+///   was a two-chunk distance guess standing in for this question, which swallows
+///   a real one-chunk move and follows a laptop that is three chapters behind.
+/// * **`seq`** — monotonic, the tie-break when two writes share a millisecond or
+///   when the clock steps under them.
+///
+/// All three are additive. A reader that reads none of them sees exactly the
+/// payload it saw before.
+fn emit_position(
+    st: &Arc<AppState>,
+    book: &str,
+    record: &vault::Position,
+    source: &str,
+    dev: &Device,
+) {
+    let stamped = record.clone().stamped();
+    let mut payload = serde_json::to_value(&stamped).unwrap_or(Value::Null);
     if let Some(o) = payload.as_object_mut() {
-        o.insert("book".into(), Value::String(name));
-        o.insert("source".into(), Value::String("api".into()));
+        o.insert("book".into(), Value::String(book.to_string()));
+        o.insert("source".into(), Value::String(source.to_string()));
+        o.insert("device".into(), Value::String(dev.id.clone()));
+        o.insert("seq".into(), Value::from(st.next_seq()));
     }
     st.bus.emit("position", payload);
-    ok().into_response()
 }
 
 /// Persist chapter+chunk of the loaded book.
 ///
 /// Throttled: `/api/playhead` fires on every chunk advance, and rewriting a note
 /// in the vault that often is churn for nothing. `force` (open/pause) writes now.
-pub fn save_position(st: &Arc<AppState>, force: bool) {
+pub fn save_position(st: &Arc<AppState>, force: bool, dev: &Device) {
     let (book, ci, playhead, plan, chapters_total) = {
         let s = st.session();
         match &s.book {
@@ -581,12 +657,7 @@ pub fn save_position(st: &Arc<AppState>, force: bool) {
     // Tell the other devices. This fires exactly when the position is *written*,
     // so the 15 s throttle above is also the rate every open reader follows at —
     // which is the right rate: a position is a place in a book, not a cursor.
-    let mut payload = serde_json::to_value(&record).unwrap_or(Value::Null);
-    if let Some(o) = payload.as_object_mut() {
-        o.insert("book".into(), Value::String(name));
-        o.insert("source".into(), Value::String("session".into()));
-    }
-    st.bus.emit("position", payload);
+    emit_position(st, &name, &record, "session", dev);
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -601,14 +672,23 @@ pub struct PauseResult {
 /// `PREFETCH_WHILE_PAUSED=0`.
 #[utoipa::path(
     post, path = "/api/pause", tag = "session",
+    params(
+        ("X-Narrator-Device" = Option<String>, Header,
+         description = "Who is reporting. Additive: omitted, this is the anonymous \
+legacy device and the behaviour is exactly the pre-device one. Supplied, it is \
+echoed on the `position` event so other devices can tell a real move from their \
+own echo."),
+        ("X-Narrator-Device-Name" = Option<String>, Header,
+         description = "A human label for that device, for display only."),
+    ),
     responses((status = 200, body = PauseResult))
 )]
-pub async fn pause(State(st): State<Arc<AppState>>) -> Json<PauseResult> {
+pub async fn pause(State(st): State<Arc<AppState>>, dev: Device) -> Json<PauseResult> {
     if !st.cfg.prefetch_while_paused {
         st.run.clear();
     }
     st.session().status = "paused".into();
-    save_position(&st, true);
+    save_position(&st, true, &dev);
     Json(PauseResult {
         ok: true,
         still_rendering: st.cfg.prefetch_while_paused,

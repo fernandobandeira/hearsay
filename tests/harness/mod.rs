@@ -158,14 +158,35 @@ impl Harness {
     }
 
     pub async fn post_json(&self, path: &str, payload: Value) -> (StatusCode, Value) {
-        let req = Request::builder()
+        self.post_json_from(path, payload, &[]).await
+    }
+
+    /// A POST with extra request headers — which in practice means "as a named
+    /// device". See [`Self::as_device`].
+    pub async fn post_json_from(
+        &self,
+        path: &str,
+        payload: Value,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
+        let mut req = Request::builder()
             .method("POST")
             .uri(path)
-            .header("content-type", "application/json")
-            .body(Body::from(payload.to_string()))
-            .expect("request");
-        let (code, body) = self.send(req).await;
+            .header("content-type", "application/json");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let (code, body) = self
+            .send(req.body(Body::from(payload.to_string())).expect("request"))
+            .await;
         (code, parse(&body))
+    }
+
+    /// The headers a device sends. Spelled once so a test says *which* device it
+    /// is speaking as rather than repeating a header name, and so the day the
+    /// spelling changes it changes in one place.
+    pub fn as_device(id: &str) -> [(&str, &str); 1] {
+        [("x-narrator-device", id)]
     }
 }
 

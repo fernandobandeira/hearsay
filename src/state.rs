@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -208,6 +208,26 @@ pub struct AppState {
     /// `None` whenever it is doing anything else, the lookahead included. It is
     /// the packer's cue to hold an encode back; see [`crate::render`].
     pub render_stalled: Mutex<Option<Instant>>,
+
+    /// Who is connected right now. Ephemeral by design — see
+    /// [`crate::api::device`]'s presence section for why this is the one piece
+    /// of device state that is deliberately not in the database.
+    pub roster: Arc<crate::api::device::Roster>,
+
+    /// A counter that only ever goes up, stamped on every position write.
+    ///
+    /// The tie-break under `updated_ms`, and it earns its place on a box this
+    /// slow for a reason that is not hypothetical: two devices reporting inside
+    /// the same millisecond is unlikely, but a *clock* that steps — an ntp
+    /// correction on a box that has been up for weeks, a container whose
+    /// `/etc/localtime` changed under it — makes two writes compare equal or
+    /// backwards, and "which of these is the later one" then has no answer at
+    /// all. A monotonic integer always has one.
+    ///
+    /// Seeded from the store at boot so it never repeats across a restart; the
+    /// atomic is what the hot path touches, because a position write happens
+    /// under the session lock and must not also want a database.
+    pub seq: AtomicU64,
 }
 
 impl AppState {
@@ -236,7 +256,25 @@ impl AppState {
             autopack_at: Mutex::new(None),
             wishlist: Mutex::new(crate::wishlist::Wishlist::default()),
             render_stalled: Mutex::new(None),
+            roster: Arc::new(crate::api::device::Roster::default()),
+            seq: AtomicU64::new(1),
         })
+    }
+
+    /// The next position stamp. Monotonic, and never zero — zero is what a
+    /// reader sees when the field is absent, which is a different claim.
+    pub fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::Relaxed).max(1)
+    }
+
+    /// Lift the counter past everything already on record, at boot.
+    ///
+    /// Idempotent and only ever upward: two restores in one process (the test
+    /// harness restarts a server in place) must not walk it backwards, because a
+    /// repeated stamp is exactly the ambiguity the counter exists to remove.
+    pub fn seed_seq(&self, at_least: u64) {
+        self.seq
+            .fetch_max(at_least.saturating_add(1), Ordering::Relaxed);
     }
 
     /// Take the session lock, logging rather than panicking if it was poisoned by

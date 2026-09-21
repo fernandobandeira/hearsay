@@ -23,11 +23,18 @@
  *                   untrusted JSON and validated into a typed event, once, here.
  *   the arbitration what to do when the reading position moves somewhere else.
  *                   Yanking the page out from under someone who is listening is
- *                   the worst thing this feature could do, so it does not: see
- *                   `arbitrate`.
+ *                   the worst thing this feature could do, and dragging it
+ *                   *backwards* is the second worst - a laptop waking up and
+ *                   healing its session broadcasts a position at its own
+ *                   chapter, which is a real write and looks exactly like a real
+ *                   move. So the arbitration is identity and recency first (whose
+ *                   write is this, and is it newer than mine?) and direction
+ *                   second: a position behind this device's high-water mark is
+ *                   offered, never taken. See `arbitrate`.
  */
 import type {QueryClient} from '@tanstack/react-query';
 import {keys} from './api';
+import {deviceId, deviceLabel} from './device';
 
 // ---------------------------------------------------------------- the events
 
@@ -50,6 +57,32 @@ export interface PositionEvent {
   updated?: string;
   /** `session` for the loaded book's own playhead, `api` for a named write. */
   source?: string;
+  /**
+   * The write instant, in epoch milliseconds.
+   *
+   * `updated` stays the naive local string the vault holds, because that is what
+   * goes in the file and it is not this reader's to reinterpret. This is the
+   * same instant with the ambiguity taken out, resolved on the server where the
+   * zone is actually known, and it is what makes "does this event predate my own
+   * last write?" a question with an answer.
+   */
+  updated_ms?: number;
+  /**
+   * The device whose report caused this write (lib/device).
+   *
+   * Absent or empty from a server or a client that does not send one, which is
+   * the only reason the chunk-distance backstop still exists.
+   */
+  device?: string;
+  /**
+   * A monotonic per-server counter, incremented on every position write.
+   *
+   * The tie-break for two writes inside the same millisecond, which the
+   * arbitration does not need — see `arbitrate`, which resolves a tie by
+   * ignoring — but which is on the wire so that the ordering is recoverable
+   * without trusting a clock at all.
+   */
+  seq?: number;
 }
 
 /** The render worker moved. `progress` is throttled to about one a second. */
@@ -88,6 +121,17 @@ export type LiveEvent =
   | {name: 'note'; data: NoteEvent};
 
 const num = (v: unknown, fallback = 0): number => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
+/**
+ * A number that stays absent when it is absent.
+ *
+ * `num` defaults, which is right for a field the contract says is always there
+ * and wrong for one that may not be: an `updated_ms` of 0 is the epoch, an
+ * `updated_ms` of `undefined` is a server that does not send one, and the
+ * arbitration does opposite things with them - the first makes every event older
+ * than this device's last write, the second falls back to the old behaviour.
+ */
+const opt = (v: unknown): number | undefined =>
+  (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
 const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
 
 /**
@@ -127,6 +171,9 @@ export function parseEvent(name: string, raw: string): LiveEvent | null {
         chapters_total: typeof o.chapters_total === 'number' ? o.chapters_total : undefined,
         updated: str(o.updated),
         source: str(o.source),
+        updated_ms: opt(o.updated_ms),
+        device: str(o.device),
+        seq: opt(o.seq),
       }};
     }
     case 'render':
@@ -182,6 +229,48 @@ export interface Here {
    * stopped hearing from the reader some chapters ago.
    */
   undelivered?: boolean;
+  /**
+   * This device's own id (lib/device), to recognise its own echo exactly.
+   *
+   * Absent on a device that has none - storage blocked, or a build older than
+   * the one that mints them - and the arbitration then falls back to the
+   * chunk-distance guess it always used.
+   */
+  device?: string;
+  /**
+   * Epoch ms of this device's own last *successful* position write for this
+   * book. An event stamped at or before it cannot be telling us anything we did
+   * not already know: at best it is our own write coming back.
+   */
+  lastWriteMs?: number;
+  /**
+   * The furthest point this device has reached in this book.
+   *
+   * Not the same thing as where it is now, and the difference is the whole of
+   * rule 6: going back to re-read a scene must not make every later chapter look
+   * like somewhere new to be dragged to.
+   */
+  furthest?: {chapter: number; chunk: number};
+}
+
+/** A point in a book, for the one comparison that matters. */
+export interface Spot {
+  chapter: number;
+  chunk: number;
+}
+
+/**
+ * Is `a` strictly before `b`?
+ *
+ * Chapter first, chunk only as the tie-break - a chunk index is meaningful only
+ * within its chapter, so comparing chunk 600 of chapter 10 against chunk 3 of
+ * chapter 40 by chunk alone would have the reader going backwards by half a
+ * book. Equal is not behind: a position exactly where we already are is handled
+ * further up as an echo, and calling it "behind" would turn it into an offer.
+ */
+export function behind(a: Spot, b: Spot): boolean {
+  if (a.chapter !== b.chapter) return a.chapter < b.chapter;
+  return a.chunk < b.chunk;
 }
 
 export type FollowVerdict =
@@ -195,39 +284,92 @@ export type FollowVerdict =
 /**
  * Chunks of slack before a position counts as "somewhere else".
  *
- * This device's own playhead reports come back as `position` events, and by the
- * time one arrives the playhead has usually moved on a chunk or two. Without
- * slack, every device would spend its life following its own echo.
+ * This used to be the mechanism: a device's own playhead reports come back as
+ * `position` events, by the time one arrives the playhead has moved on a chunk
+ * or two, and without slack every device spent its life following its own echo.
+ * It was always a proxy for "is this mine?", and a bad one in both directions -
+ * it swallows a real two-chunk move made on the laptop, and it lets an echo
+ * through the moment the tunnel is slow enough for three chunks to pass.
+ *
+ * It is now the **backstop**, not the mechanism. `Here.device` against
+ * `PositionEvent.device` answers the question exactly, and this covers the case
+ * where one side cannot: a device with no id (storage blocked), or a server that
+ * does not send one back.
  */
 const SLACK = 2;
 
 /**
  * What to do about a position that moved.
  *
- * The rule that matters is the last one. Following a position while audio is
- * playing means the page jumps mid-sentence and the player restarts somewhere
- * else - the reader is *using* the device, and a sync that overrides a person in
- * the act of listening is not a feature. So while playing, the move becomes an
- * offer: a quiet line saying where the other device went, and a tap to take it.
- * Paused or merely reading, following is the whole point - pick up the phone,
- * put it down, open the laptop, carry on.
+ * Seven rules, in order, and the order is the design. Each one is a way an event
+ * can fail to be news, and the last two are the only ones that move anything:
+ *
+ *  1. another book - real, saved, not about the page in front of us;
+ *  2. our own id on it - our own echo, exactly rather than approximately;
+ *  3. this device has read past what it managed to tell the server;
+ *  4. it predates this device's own last write, so it cannot be news;
+ *  5. it is within `slack` chunks of here - the echo backstop for 2;
+ *  6. it is **behind** the furthest this device has reached - offer, never
+ *     follow;
+ *  7. anything else: follow if idle, offer if something is playing.
+ *
+ * Rule 7 is the original one and still the reason the feature exists: following
+ * while audio plays means the page jumps mid-sentence and the player restarts
+ * somewhere else, so a move becomes a quiet line above the player bar instead.
+ * Paused or merely reading, following is the whole point - put the phone down,
+ * open the laptop, carry on.
+ *
+ * Rule 6 is the one this round added, and it is a reported bug rather than a
+ * refinement: a laptop waking in a background tab calls `/api/open` to heal the
+ * one server-side session, the server writes and broadcasts a position at *its*
+ * chapter, and the phone - forty chapters further on, not playing - followed it
+ * backwards. The event is indistinguishable from a real move, because it is one:
+ * somebody's session really did go there. So the answer is not to detect it but
+ * to refuse to act on it unasked. Going back is still reachable, as an offer,
+ * because sometimes it is deliberate (he did go back to re-read chapter 5 on the
+ * laptop); it is never automatic.
  */
 export function arbitrate(ev: PositionEvent, here: Here, slack = SLACK): FollowVerdict {
-  // Another book entirely. Its position is real and was saved; it is simply not
-  // about the page in front of us.
+  // 1. Another book entirely. Its position is real and was saved; it is simply
+  //    not about the page in front of us.
   if (!here.book || ev.book !== here.book) return {t: 'ignore'};
-  /* This device read while the server could not hear it, and has not caught the
-     server up yet. Every position the server can currently produce for this book
-     predates that reading - including the ones it writes *now*, because
-     `/api/playhead` carries only a chunk and the session's chapter is still
-     wherever it was when the network went. Following one of those is precisely
-     the "came back online and jumped back three chapters" bug, so: ignore the
-     server about this book until it has been told where we are. See
-     `healSession` in state.tsx, which is what clears this. */
+  /* 2. Our own report, coming back. This is the exact test `slack` below was
+        standing in for: an echo is an echo however far the playhead has drifted
+        since, and a move made *here* is not news *here* whatever its distance.
+        Only a non-empty id counts - '' is a legacy or unidentified client, and
+        two of those must not be mistaken for each other. */
+  if (ev.device && ev.device === here.device) return {t: 'ignore'};
+  /* 3. This device read while the server could not hear it, and has not caught
+        the server up yet. Every position the server can currently produce for
+        this book predates that reading - including the ones it writes *now*,
+        because `/api/playhead` carries only a chunk and the session's chapter is
+        still wherever it was when the network went. Following one of those is
+        precisely the "came back online and jumped back three chapters" bug, so:
+        ignore the server about this book until it has been told where we are.
+        See `healSession` in state.tsx, which is what clears this. */
   if (here.undelivered) return {t: 'ignore'};
-  const sameChapter = ev.chapter === here.chapter;
-  if (sameChapter && Math.abs(ev.chunk - here.chunk) <= slack) return {t: 'ignore'};
+  /* 4. The event is older than this device's own last successful write, so
+        whatever it describes, this device has already written over it. Equal
+        stamps ignore too: two writes inside one millisecond are ordered by the
+        server's `seq` and by nothing this reader can see, and of the two wrong
+        answers available at a tie, standing still is the recoverable one. */
+  if (ev.updated_ms !== undefined && here.lastWriteMs !== undefined
+      && ev.updated_ms <= here.lastWriteMs) return {t: 'ignore'};
+  // 5. The backstop for rule 2, for a device or a server with no id to compare.
+  if (ev.chapter === here.chapter && Math.abs(ev.chunk - here.chunk) <= slack) {
+    return {t: 'ignore'};
+  }
   const to = {chapter: ev.chapter, chunk: ev.chunk};
+  /* 6. Behind the high-water mark. `furthest` rather than the current position
+        because a reader who has jumped back to check something has not un-read
+        the chapters after it, and an event pointing at any of them would
+        otherwise read as forward progress. With no high-water mark recorded -
+        an older reader, a book just opened - where we are is the best available
+        answer and errs toward offering. */
+  if (behind(to, here.furthest ?? {chapter: here.chapter, chunk: here.chunk})) {
+    return {t: 'offer', ...to};
+  }
+  // 7. Forward, and genuinely somewhere else.
   return here.playing ? {t: 'offer', ...to} : {t: 'follow', ...to};
 }
 
@@ -295,8 +437,28 @@ const NAMES = ['hello', 'position', 'render', 'books', 'note'] as const;
  * a `hello`, which is where the live queries are refetched - because whatever
  * happened while the connection was down was, by definition, not delivered.
  */
+/**
+ * `/api/events`, with this device named in the query string.
+ *
+ * The one place the device id cannot be a header. `EventSource` is what gives
+ * this reader its reconnection for free — the browser retries on the server's
+ * own `retry:` interval, with no code here to get wrong — and the price of that
+ * is an API with no way to set a request header. None at all. So the endpoint
+ * that most needs to know who is connected is the one endpoint that cannot be
+ * told the ordinary way, and the query string is what is left. The server reads
+ * the header first and falls back to this, so it stays one concept.
+ *
+ * The id is a random uuid rather than a credential: it identifies a browser
+ * profile to itself and grants nothing, which is what makes it safe in a URL
+ * that lands in an access log.
+ */
+export function eventsUrl(): string {
+  const q = new URLSearchParams({device: deviceId(), device_name: deviceLabel()});
+  return `/api/events?${q.toString()}`;
+}
+
 export function connectLive(qc: QueryClient, opts: LiveOptions = {}): () => void {
-  const url = opts.url ?? '/api/events';
+  const url = opts.url ?? eventsUrl();
   const open = opts.open
     ?? ((u: string) => new EventSource(u) as unknown as EventSourceLike);
   let closed = false;

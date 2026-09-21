@@ -17,6 +17,7 @@ pub mod migrate;
 pub mod plancache;
 pub mod render;
 pub mod state;
+pub mod store;
 pub mod stt;
 pub mod text;
 pub mod tts;

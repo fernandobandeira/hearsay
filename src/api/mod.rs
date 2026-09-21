@@ -8,6 +8,7 @@
 //! rather than as a reader that silently stops working.
 
 pub mod chapters;
+pub mod device;
 pub mod health;
 pub mod media;
 pub mod notes;

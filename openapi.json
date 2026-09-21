@@ -872,6 +872,26 @@
           "session"
         ],
         "operationId": "events",
+        "parameters": [
+          {
+            "name": "device",
+            "in": "query",
+            "description": "This device's id. A query parameter rather than the `X-Narrator-Device` header every other endpoint takes, because `EventSource` cannot set request headers — and this is the endpoint that tells the server which devices are connected right now.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "device_name",
+            "in": "query",
+            "description": "A label for that device, display only.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "hello, then position/render/books/note events and heartbeats",
@@ -1119,6 +1139,32 @@
         "summary": "Select a chapter and start rendering from a given chunk.",
         "description": "The opened chunk is *guaranteed* to render: the worker renders whatever is\nunder the playhead before anything else, and this sets the playhead.",
         "operationId": "open_chapter",
+        "parameters": [
+          {
+            "name": "X-Narrator-Device",
+            "in": "header",
+            "description": "Who is reporting. Additive: omitted, this is the anonymous legacy device and the behaviour is exactly the pre-device one. Supplied, it is echoed on the `position` event so other devices can tell a real move from their own echo.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "X-Narrator-Device-Name",
+            "in": "header",
+            "description": "A human label for that device, for display only.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1160,6 +1206,32 @@
         ],
         "summary": "Pause playback. The time you are *not* listening is exactly when the buffer\nshould grow, so this stops audio, not the renderer — unless\n`PREFETCH_WHILE_PAUSED=0`.",
         "operationId": "pause",
+        "parameters": [
+          {
+            "name": "X-Narrator-Device",
+            "in": "header",
+            "description": "Who is reporting. Additive: omitted, this is the anonymous legacy device and the behaviour is exactly the pre-device one. Supplied, it is echoed on the `position` event so other devices can tell a real move from their own echo.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "X-Narrator-Device-Name",
+            "in": "header",
+            "description": "A human label for that device, for display only.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "",
@@ -1181,6 +1253,32 @@
         ],
         "summary": "Report the playhead. Drags `render_idx` forward on a forward jump, never\nbackwards — anything already on disk still plays, and the worker skips files\nthat exist, so nothing is re-rendered.",
         "operationId": "playhead",
+        "parameters": [
+          {
+            "name": "X-Narrator-Device",
+            "in": "header",
+            "description": "Who is reporting. Additive: omitted, this is the anonymous legacy device and the behaviour is exactly the pre-device one. Supplied, it is echoed on the `position` event so other devices can tell a real move from their own echo.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "X-Narrator-Device-Name",
+            "in": "header",
+            "description": "A human label for that device, for display only.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1223,6 +1321,32 @@
         "summary": "Record a position for a *named* book without loading it.",
         "description": "This is what the offline queue pushes on reconnect, possibly for a book the\nserver has since swapped out. Last write wins, which is the right rule for one\nreader on several devices. Fields not supplied are kept from the existing\nrecord.",
         "operationId": "position",
+        "parameters": [
+          {
+            "name": "X-Narrator-Device",
+            "in": "header",
+            "description": "Who is reporting. Additive: omitted, this is the anonymous legacy device and the behaviour is exactly the pre-device one. Supplied, it is echoed on the `position` event so other devices can tell a real move from their own echo.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "X-Narrator-Device-Name",
+            "in": "header",
+            "description": "A human label for that device, for display only.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {

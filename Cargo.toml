@@ -28,6 +28,11 @@ notify = "8"
 num2words = "1.2"
 ort = { version = "=2.0.0-rc.10", features = ["ndarray", "download-binaries"] }
 percent-encoding = "2"
+# The durable-intent store (`src/store.rs`). `bundled` is not a convenience: the
+# runtime image is `debian:bookworm-slim` with no libsqlite3 in it, and the build
+# is multi-arch — linking the system library would make the image's contents a
+# build-host detail on exactly the architecture that is hardest to test.
+rusqlite = { version = "0.32", features = ["bundled"] }
 scraper = "0.23"
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }

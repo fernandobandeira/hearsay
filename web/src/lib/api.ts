@@ -32,11 +32,34 @@ import {
   QueryClient, onlineManager, useQuery, useMutation, useQueryClient,
 } from '@tanstack/react-query';
 import * as sdk from '@/client';
+import {client} from '@/client/client.gen';
 import {delayFor, isRetryable, retryQuery, retryWhileOnline} from './backoff';
+import {DEVICE_HEADER, DEVICE_NAME_HEADER, deviceId, deviceLabel} from './device';
 import type {
   BookIndex, BuildResult, CancelResult, ChaptersResult, ChapterText, LoadResult,
   RenderResult, TextShard,
 } from './types';
+
+/**
+ * Every generated call carries this device's identity.
+ *
+ * Set once, here, rather than passed per call: it is metadata about *who is
+ * asking* and it belongs on every request, not on the handful somebody
+ * remembered. The server reads it off the headers and echoes it on the `position`
+ * event, which is what lets another device tell a real move from its own echo —
+ * see lib/device.ts for the guess this replaced.
+ *
+ * `setConfig` rather than a hand-edit of `client.gen.ts`, which is generated and
+ * must stay that way. `baseUrl` is repeated because setConfig replaces the
+ * config object rather than merging into it.
+ */
+client.setConfig({
+  baseUrl: '/',
+  headers: {
+    [DEVICE_HEADER]: deviceId(),
+    [DEVICE_NAME_HEADER]: deviceLabel(),
+  },
+});
 
 export class ApiError extends Error {
   constructor(readonly status: number, message: string) { super(message); }
