@@ -38,6 +38,30 @@ async fn until(what: &str, timeout_s: f64, mut f: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+/// ffmpeg is not on the CI runner, so anything asserting a packed `.m4a` has to
+/// ask first. The rendering half of these tests is the half that is about the
+/// scheduler and it runs everywhere; the encode is the packer's, and it is
+/// checked where there is something to encode with.
+fn which(bin: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join(bin))
+            .find(|p| p.is_file())
+    })
+}
+
+/// Every chunk of `ci` is on disk.
+fn chapter_rendered(h: &Harness, key: &str, ci: usize, n: usize) -> bool {
+    (0..n).all(|i| cache::chunk_path(&h.work(), key, ci, i).exists())
+}
+
+/// How many chunks chapter `ci` of a book on disk has.
+fn chunks_in(h: &Harness, key: &str, ci: usize) -> usize {
+    narrator::plancache::read_raw(&h.work(), key)
+        .and_then(|p| p.get(ci).map(|c| c.chunks.len()))
+        .unwrap_or(0)
+}
+
 fn key_of(h: &Harness) -> String {
     h.state.session().key_or_x()
 }
@@ -362,22 +386,44 @@ async fn an_order_on_another_book_is_packed_as_well_as_rendered() {
     h.post_json("/api/open", json!({"chapter": 0, "chunk": 0}))
         .await;
 
+    // The renderer's half runs anywhere, and it is the half this suite is about:
+    // the worker following an order onto a book it is not holding.
+    let n = chunks_in(&h, &other_key, 1);
+    assert!(n > 0);
+    until(
+        "the ordered chapter of the other book to render",
+        30.0,
+        || chapter_rendered(&h, &other_key, 1, n),
+    )
+    .await;
+
+    // Then it reaches the packer, and the order ends — which is the assertion
+    // that holds on any machine. It is also the one that matters most: an order
+    // that is never retired is walked again on every pass of the worker loop for
+    // the life of the process, a `read_dir` per chapter and a plan parse, which
+    // on the 1433-chapter book is 0.30 s *per chunk rendered*.
+    //
+    // Deliberately not asserted by catching the job mid-flight in
+    // `pack_elsewhere`: with no ffmpeg the encode fails immediately and the job
+    // is gone before a poll could see it, and a test that races is a test that
+    // will fail on somebody else's machine for no reason.
+    until("the order to be retired by the packer", 30.0, || {
+        narrator::wishlist::all_outstanding(&h.state)
+            .iter()
+            .all(|(k, items)| *k != other_key || items.is_empty())
+    })
+    .await;
+
+    if which("ffmpeg").is_none() {
+        eprintln!("skipping the encode: no ffmpeg");
+        return;
+    }
     let (m4a, _) = narrator::chapters::chapter_files(&h.work(), &other_key, 1);
     until(
         "the ordered chapter of the other book to be packed",
         30.0,
         || m4a.exists(),
     )
-    .await;
-
-    // ...and the order is then gone, which is not tidiness: an order that is
-    // never retired is walked again on every pass of the worker loop for the
-    // life of the process.
-    until("the finished order to be retired", 10.0, || {
-        narrator::wishlist::all_outstanding(&h.state)
-            .iter()
-            .all(|(k, items)| *k != other_key || items.is_empty())
-    })
     .await;
 }
 
@@ -421,13 +467,19 @@ async fn a_book_can_be_downloaded_without_being_opened() {
     assert_eq!(body["ok"], json!(true));
     assert_eq!(body["queue"], json!([2]), "the order is the answer: {body}");
 
-    let (m4a, _) = narrator::chapters::chapter_files(&h.work(), &other_key, 2);
-    until(
-        "a book nobody opened to render and pack on request",
-        30.0,
-        || m4a.exists(),
-    )
+    let n = chunks_in(&h, &other_key, 2);
+    assert!(n > 0);
+    until("a book nobody opened to render on request", 30.0, || {
+        chapter_rendered(&h, &other_key, 2, n)
+    })
     .await;
+
+    if which("ffmpeg").is_none() {
+        eprintln!("skipping the encode: no ffmpeg");
+        return;
+    }
+    let (m4a, _) = narrator::chapters::chapter_files(&h.work(), &other_key, 2);
+    until("...and to be packed", 30.0, || m4a.exists()).await;
 }
 
 #[tokio::test]
