@@ -12,6 +12,11 @@
  *
  * The chapter's own title is not repeated here: the book's text already opens
  * with its heading, and the bottom bar carries it for the chapters that do not.
+ *
+ * The box is the whole page - both bars overlay it - so it carries their
+ * measured heights as its own padding (`--reading-top`, `--bar-bottom`, see the
+ * scaffold comment in index.css). A chapter therefore begins and ends clear of
+ * them, and everything in between scrolls under a bar that is about to fade.
  */
 import {useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState} from 'react';
 import {ArrowDownToLine} from 'lucide-react';
@@ -154,7 +159,8 @@ export function ReadingPage({
         ref={box}
         data-testid="reading"
         onScroll={onScroll}
-        className="absolute inset-0 overflow-y-auto overflow-x-hidden pt-3
+        className="absolute inset-0 overflow-y-auto overflow-x-hidden
+                   pt-[var(--reading-top)] pb-[calc(var(--bar-bottom)+var(--bar-fade))]
                    [-webkit-overflow-scrolling:touch] [overscroll-behavior:contain]"
         style={{fontSize: `${size}px`}}
       >
@@ -204,7 +210,8 @@ export function ReadingPage({
         <button
           data-testid="follow"
           onClick={() => { setFollowing(true); scrollTo(idx, 'smooth'); }}
-          className="absolute bottom-4 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5
+          className="absolute bottom-[calc(var(--bar-bottom)+0.5rem)] left-1/2 z-10 flex
+                     -translate-x-1/2 items-center gap-1.5
                      rounded-full border border-border bg-card/90 px-3 py-1.5 text-[11px]
                      text-muted-foreground shadow-lg backdrop-blur transition-colors
                      hover:text-foreground"
@@ -220,7 +227,8 @@ export function ReadingPage({
 export function ChapterSkeleton() {
   const widths = ['96%', '88%', '92%', '70%', '94%', '86%', '90%', '64%', '93%', '82%', '88%', '48%'];
   return (
-    <div data-testid="chapter-skeleton" className="absolute inset-0 overflow-hidden pt-3">
+    <div data-testid="chapter-skeleton"
+         className="absolute inset-0 overflow-hidden pt-[var(--reading-top)]">
       <div className="mx-auto max-w-[min(40em,92vw)] space-y-3 px-[max(18px,3vw)]">
         {widths.map((w, i) => (
           <Skeleton key={i} className="h-4 bg-white/[0.045]" style={{width: w}} />

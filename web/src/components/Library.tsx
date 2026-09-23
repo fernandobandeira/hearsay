@@ -36,6 +36,7 @@ import {
   type LibraryCost, type Tone,
 } from '@/lib/library';
 import {cn} from '@/lib/utils';
+import {readInsets} from '@/lib/viewport';
 import {useNarrator} from '@/state';
 import {ChapterManager} from './ChapterManager';
 import type {BookFile} from '@/lib/types';
@@ -428,24 +429,22 @@ function Diagnostics() {
 }
 
 /**
- * "viewport 430x869 of 430x932 · insets 59/34"
+ * "viewport 430x869 of 430x932 · insets 59/34 · fill +63"
  *
- * The insets are measured off a throwaway element rather than read from
- * `--sat`/`--sab`: an unregistered custom property computes to the *text*
- * `env(safe-area-inset-top, 0px)`, so asking the root for it gives a string and
- * not a number. Spending it as padding is what resolves it.
+ * The one line that can settle an iOS layout question from the phone itself:
+ * how tall the page thinks it is, how tall the screen actually is, which strips
+ * of it are unsafe, and how much of the difference `--vh-extra` is giving back
+ * (see the scaffold comment in index.css). A `fill +0` with the viewport short
+ * of the screen is the interesting reading - it means the shortfall was
+ * measured and deliberately not believed.
  */
 function viewportLine(): string {
-  const probe = document.createElement('div');
-  probe.style.cssText = 'position:absolute;visibility:hidden;top:0;left:0;'
-    + 'padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)';
-  document.body.appendChild(probe);
-  const cs = getComputedStyle(probe);
-  const top = Math.round(parseFloat(cs.paddingTop) || 0);
-  const bottom = Math.round(parseFloat(cs.paddingBottom) || 0);
-  probe.remove();
+  const {top, bottom} = readInsets();
+  const fill = Math.round(
+    parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--vh-extra')) || 0);
   const {innerWidth: w, innerHeight: h, screen} = window;
   return `viewport ${Math.round(w)}x${Math.round(h)}`
     + ` of ${Math.round(screen.width)}x${Math.round(screen.height)}`
-    + ` · insets ${top}/${bottom}`;
+    + ` · insets ${top}/${bottom}`
+    + ` · fill +${fill}`;
 }

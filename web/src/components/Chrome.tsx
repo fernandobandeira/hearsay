@@ -1,10 +1,14 @@
 /**
  * The chrome: the top bar and the player bar.
  *
- * Both are rows of `#root`'s flex column now, not `position: fixed` overlays -
- * see the scaffold comment in index.css for why. Each spends one safe-area
- * inset, the one on the edge it touches, and neither states a height: the
- * reading area is whatever is left over, so there is no number to drift.
+ * Both overlay the words - `position: absolute` on the two edges of `#root`,
+ * over a reading column that is the whole box. See the scaffold comment in
+ * index.css for why they are not rows any more: a row that is merely
+ * transparent still owns its strip of the screen, so a reader that had gone
+ * quiet showed black where its page should have been. Each spends one
+ * safe-area inset, the one on the edge it touches, and neither states a
+ * height - App.tsx measures them and the reading column pads itself by what it
+ * finds, so there is still no number to drift.
  *
  * They hide themselves when nothing has moved for two seconds, because a reader
  * should be the words and nothing else - and come back on any input. Hiding is
@@ -65,12 +69,29 @@ export function TopBar({visible, onMenu}: {visible: boolean; onMenu: () => void}
       className={cn(
         // The top inset, spent once. max() because a device without a notch
         // still wants the row off the very edge of the glass.
-        'z-20 shrink-0 bg-background pt-[max(0.25rem,var(--sat))]',
+        // `touch-none`: #root is a little taller than the layout viewport where
+        // --vh-extra is doing its work (see index.css), so the document itself
+        // can be dragged by that much. The reading area cannot chain a scroll
+        // out of itself, which leaves the bars as the only place a drag could
+        // start; taking touch scrolling off them closes it. The controls on
+        // them handle their own pointers - Radix's slider is already
+        // `touch-none` - so nothing here loses a gesture it was using.
+        'absolute inset-x-0 top-0 z-20 touch-none bg-background pt-[max(0.25rem,var(--sat))]',
         'transition-opacity duration-300',
-        visible ? 'opacity-100' : 'pointer-events-none opacity-0',
+        visible ? 'opacity-100' : 'opacity-0',
       )}
     >
-      <div className="flex h-11 items-center gap-1 px-2">
+      {/* The bar keeps its own taps even while it is invisible, and only its
+          controls stop taking them. Now that the words run underneath, a
+          `pointer-events-none` bar would hand the strip to whatever chunk
+          happens to be behind it - so reaching for the controls that are not
+          there yet would seek the audio. The strip absorbs the tap, the
+          window-level poke brings the bar back, and nothing moves. */}
+      {/* The words dissolve into the bar rather than stopping at it; see
+          `.bar-fade` in index.css. */}
+      <div aria-hidden className="bar-fade bar-fade-below" />
+      <div className={cn('flex h-11 items-center gap-1 px-2',
+                         !visible && 'pointer-events-none')}>
         {sizing ? (
           <TextSize onClose={() => setSizing(false)} />
         ) : (
@@ -179,7 +200,8 @@ export function FollowOffer() {
   if (!n.moved) return null;
   const title = n.chapters.find((c) => c.i === n.moved?.chapter)?.title;
   return (
-    <div className="pointer-events-none absolute inset-x-0 bottom-2 z-10 flex justify-center px-4">
+    <div className="pointer-events-none absolute inset-x-0 bottom-[calc(var(--bar-bottom)+0.5rem)]
+                    z-10 flex justify-center px-4">
       <div data-testid="follow-offer"
            className="pointer-events-auto flex max-w-full items-center gap-2 rounded-full
                       border border-border bg-card/95 py-1 pl-3 pr-1 text-[11px]
@@ -213,34 +235,41 @@ export function PlayerBar({visible}: {visible: boolean}) {
         // The bottom inset, spent once, as max() - the ~34 px home-indicator
         // strip already is the breathing room, and 0.5rem is the floor for a
         // device that has none. Adding the two is how the band appears.
-        'z-20 shrink-0 bg-background px-4 pb-[max(0.5rem,var(--sab))] pt-1',
+        // touch-none: see the top bar.
+        'absolute inset-x-0 bottom-0 z-20 touch-none bg-background px-4',
+        'pb-[max(0.5rem,var(--sab))] pt-1',
         'transition-opacity duration-300',
-        visible ? 'opacity-100' : 'pointer-events-none opacity-0',
+        visible ? 'opacity-100' : 'opacity-0',
       )}
     >
-      <Slider
-        className="mb-2" min={0} max={Math.max(0, n.chunks.length - 1)} step={1}
-        value={[n.idx]}
-        onValueChange={([v]) => n.setIdx(v)}
-        disabled={!n.chunks.length}
-        aria-label="Position in the chapter"
-      />
-      <div data-testid="chapter-nav" className="flex items-center gap-2">
-        <Button variant="ghost" size="icon" disabled={n.ci <= 0} onClick={() => n.goChapter(-1)}
-                title="Previous chapter (←)"
-                className="size-8 rounded-full text-muted-foreground hover:text-foreground">
-          <ChevronLeft className="size-4" />
-        </Button>
-        <div className="min-w-0 flex-1 truncate text-center text-xs text-muted-foreground">
-          {n.chapterTitle || 'no chapter'}
-          <span className="ml-2 opacity-60">{pct.toFixed(0)}%</span>
+      <div aria-hidden className="bar-fade bar-fade-above" />
+      {/* Invisible controls that still work would be worse than none; see the
+          top bar. The strip takes the tap, its contents do not. */}
+      <div className={cn(!visible && 'pointer-events-none')}>
+        <Slider
+          className="mb-2" min={0} max={Math.max(0, n.chunks.length - 1)} step={1}
+          value={[n.idx]}
+          onValueChange={([v]) => n.setIdx(v)}
+          disabled={!n.chunks.length}
+          aria-label="Position in the chapter"
+        />
+        <div data-testid="chapter-nav" className="flex items-center gap-2">
+          <Button variant="ghost" size="icon" disabled={n.ci <= 0} onClick={() => n.goChapter(-1)}
+                  title="Previous chapter (←)"
+                  className="size-8 rounded-full text-muted-foreground hover:text-foreground">
+            <ChevronLeft className="size-4" />
+          </Button>
+          <div className="min-w-0 flex-1 truncate text-center text-xs text-muted-foreground">
+            {n.chapterTitle || 'no chapter'}
+            <span className="ml-2 opacity-60">{pct.toFixed(0)}%</span>
+          </div>
+          <Button variant="ghost" size="icon"
+                  disabled={n.ci >= n.chapters.length - 1} onClick={() => n.goChapter(1)}
+                  title="Next chapter (→)"
+                  className="size-8 rounded-full text-muted-foreground hover:text-foreground">
+            <ChevronRight className="size-4" />
+          </Button>
         </div>
-        <Button variant="ghost" size="icon"
-                disabled={n.ci >= n.chapters.length - 1} onClick={() => n.goChapter(1)}
-                title="Next chapter (→)"
-                className="size-8 rounded-full text-muted-foreground hover:text-foreground">
-          <ChevronRight className="size-4" />
-        </Button>
       </div>
     </footer>
   );

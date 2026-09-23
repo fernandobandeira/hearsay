@@ -1,5 +1,5 @@
 import {describe, expect, test} from 'vitest';
-import {isRotation, shouldHeal, trackBaseline} from './viewport';
+import {isRotation, shouldHeal, trackBaseline, viewportShortfall} from './viewport';
 
 describe('trackBaseline - the largest the viewport has been', () => {
   test('the first reading is the baseline', () => {
@@ -65,5 +65,60 @@ describe('isRotation - when the baseline stops meaning anything', () => {
 
   test('a desktop window widening without turning over is not one either', () => {
     expect(isRotation({w: 1200, h: 800}, {w: 1400, h: 800})).toBe(true);
+  });
+});
+
+describe('viewportShortfall - what iOS took off the bottom', () => {
+  // The reported case: an installed PWA on an iPhone 15 Pro, laid out from the
+  // top of the screen and handed a viewport one status bar shorter than it.
+  const phone = {innerWidth: 393, innerHeight: 793, screenWidth: 393, screenHeight: 852};
+
+  test('the black band: the page is short by exactly a status bar', () => {
+    expect(viewportShortfall({...phone, insetTop: 59})).toBe(59);
+  });
+
+  test('a shortfall a few px past the inset is still the same fault', () => {
+    expect(viewportShortfall({...phone, innerHeight: 789, insetTop: 59})).toBe(63);
+  });
+
+  test('no top inset means the web view was inset instead: nothing is missing', () => {
+    // A browser tab, or a status bar style that starts the page below the bar.
+    expect(viewportShortfall({...phone, insetTop: 0})).toBe(0);
+  });
+
+  test('a viewport that already reaches the bottom gets nothing', () => {
+    expect(viewportShortfall({...phone, innerHeight: 852, insetTop: 59})).toBe(0);
+    expect(viewportShortfall({...phone, innerHeight: 900, insetTop: 59})).toBe(0);
+  });
+
+  test('the keyboard shrink is the other bug, and not this one to fix', () => {
+    // 852 -> 734 is two status bars: shouldHeal owns that one.
+    expect(viewportShortfall({...phone, innerHeight: 734, insetTop: 59})).toBe(0);
+  });
+
+  test('a window narrower than the screen is short because it is a window', () => {
+    // An iPad split view, or any desktop browser.
+    expect(viewportShortfall({
+      innerWidth: 500, innerHeight: 700, screenWidth: 1024, screenHeight: 1366, insetTop: 24,
+    })).toBe(0);
+  });
+
+  test('landscape: which way the screen is is read off the viewport', () => {
+    // screen.width/height do not agree across iOS versions about turning over,
+    // so 393x852 has to mean 852x393 when the viewport is the wide way round.
+    expect(viewportShortfall({
+      innerWidth: 852, innerHeight: 334, screenWidth: 393, screenHeight: 852, insetTop: 59,
+    })).toBe(59);
+    // ...and the honest landscape reading, where iOS hides the status bar and
+    // there is nothing missing to give back.
+    expect(viewportShortfall({
+      innerWidth: 852, innerHeight: 393, screenWidth: 393, screenHeight: 852, insetTop: 0,
+    })).toBe(0);
+  });
+
+  test('nonsense is never believed', () => {
+    expect(viewportShortfall({...phone, innerHeight: 0, insetTop: 59})).toBe(0);
+    expect(viewportShortfall({...phone, innerHeight: Number.NaN, insetTop: 59})).toBe(0);
+    expect(viewportShortfall({...phone, screenHeight: 0, screenWidth: 0, insetTop: 59})).toBe(0);
   });
 });

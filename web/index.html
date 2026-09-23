@@ -11,20 +11,30 @@
      no network at all. -->
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<!-- `black`, not `black-translucent`, and the bottom of the screen is why.
-     With black-translucent an installed iOS app is laid out from the top of the
-     screen but handed a viewport one status bar *shorter* than the screen, so
-     the page ends ~59pt above the bottom edge and everything fixed to that edge
-     - the player bar, the drawer, the overlay - stops there, with the strip
-     below painted by the system in the background colour. `black` lets iOS
-     inset the web view itself: it starts under the status bar and reaches the
-     true bottom. The status bar strip is then the system's to paint, which on a
-     #0a0a0a app is the same colour it was.
+<!-- `black`, not `black-translucent`. Apple's documented difference is where
+     the page starts: `black-translucent` lays it out from the top of the
+     *screen*, behind the status bar, and `black` is supposed to inset the web
+     view itself so it starts under the bar and reaches the true bottom.
 
-     viewport-fit=cover stays: in this mode the insets read 0 and every
-     `max(0.5rem, var(--sab))` floor in index.css simply stands on the rem.
-     NOTE: iOS caches this at *install* time - an icon already on the home
-     screen has to be removed and re-added before the change is visible. -->
+     What an installed iPhone was doing instead, read off a screenshot of it
+     (the top bar sat one status bar down, and the player bar one status bar
+     up): it laid the page out edge to edge and then handed it a layout
+     viewport one status bar SHORTER than the screen. So `100dvh` ended
+     ~59px above the bottom edge and everything anchored there - the player bar,
+     the drawer - stopped with a dead black band under it. That is not a thing
+     this file can fix, and both spellings of the meta tag walk into it; it is
+     fixed in index.css with `--vh-extra`, which measures the shortfall rather
+     than assuming it, and is 0 on a device or a browser that does not have it.
+     Read the scaffold comment there before touching this tag.
+
+     viewport-fit=cover stays: it is what makes env() nonzero at all, and every
+     `max(0.5rem, var(--sab))` floor in index.css simply stands on the rem where
+     the insets read 0.
+     NOTE: iOS caches this tag at *install* time - an icon already on the home
+     screen has to be removed and re-added before a change to it is visible,
+     which is also why the value here is not evidence of how the phone in your
+     hand is laid out. The drawer's diagnostics line is: it prints the viewport,
+     the screen, the insets and the fill actually being applied. -->
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="apple-mobile-web-app-title" content="HearSay">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">

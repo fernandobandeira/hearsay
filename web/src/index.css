@@ -76,22 +76,24 @@
 /* ---------------------------------------------------------------- the scaffold
  *
  * The installed PWA is the only place this reader really lives, so the page is
- * laid out for it: ONE full-screen box, `#root`, sized with `100dvh`, as a flex
- * column whose three children are the top bar, the words and the player. That
- * is the whole scaffold. App.tsx renders exactly those three.
+ * laid out for it: ONE full-screen box, `#root`, and inside it the words, edge
+ * to edge, with the top bar and the player bar **overlaying** them. That is the
+ * whole scaffold. App.tsx renders exactly those three.
  *
- * What it replaces, and why: the header, the reading area and the player bar
- * used to be four coordinated `position: fixed` elements, each carrying its own
- * copy of the safe-area insets, with the reading area's `top`/`bottom` written
- * as `calc(3.5rem + env(safe-area-inset-top))` and
- * `calc(76px + max(1rem, env(safe-area-inset-bottom)))` - magic numbers
- * restating heights the bars only *roughly* had. `76px` against a bar that
- * measured ~60 was 16 px of nothing; `env(safe-area-inset-bottom)` appearing in
- * both the bar's padding and the reading area's offset is the classic
- * double-application, and on top of it `body` carried a fourth copy as padding
- * that no `fixed` child ever saw. In a flex column none of those numbers exist:
- * the bars are `flex: 0 0 auto` and size themselves, the words are
- * `flex: 1; min-height: 0` and take exactly what is left.
+ * It used to be a flex column - three rows, the words taking what was left -
+ * which was correct and looked wrong: the bars hide themselves after a couple
+ * of seconds of stillness, and a row that is merely transparent still owns its
+ * strip of the screen. So a reader that had gone quiet showed a page of text
+ * with a hundred points of black above and below it and nothing in them. Rows
+ * cannot do that; only an overlay can. The bars are `position: absolute` on the
+ * two edges now, and the words are the whole box.
+ *
+ * Nothing is *hidden* by that, because the reading column carries the bars'
+ * heights as its own padding - `--bar-top` / `--bar-bottom`, measured off the
+ * bars themselves by App.tsx and written here, so there is still no number in
+ * this file restating how tall a bar is. The first and last words of a chapter
+ * sit clear of both bars; everything between them scrolls under a bar that is
+ * about to fade out of the way.
  *
  * The rules that make it correct on iOS, each one load-bearing:
  *
@@ -104,25 +106,55 @@
  *     - https://webkit.org/blog/12445/new-webkit-features-in-safari-15-4/
  *     - https://web.dev/blog/viewport-units
  *
+ *   ...plus --vh-extra, because 100dvh is a status bar short of the screen.
+ *   In an installed iOS web app laid out edge to edge, iOS starts the page at
+ *   the top of the *screen* and then hands it a viewport one status bar
+ *   shorter, so `100dvh` ends ~59 px above the bottom edge and everything
+ *   anchored there - the player bar, the drawer - stops with a dead band under
+ *   it painted in the background colour. That band is the bug in the
+ *   screenshots. `--vh-extra` is the difference, *measured* (screen.height
+ *   against innerHeight, in lib/viewport.ts) rather than assumed to be the top
+ *   inset, written by App.tsx and 0 everywhere the shortfall does not exist -
+ *   in a browser tab, on a device with no notch, and on the day WebKit stops
+ *   doing it. It is clamped to a status bar's worth so a split view or a
+ *   keyboard can never inflate it.
+ *     - https://developer.apple.com/forums/thread/110854
+ *
  *   viewport-fit=cover (index.html) is what makes env() nonzero at all.
  *   Without it iOS insets the viewport itself and every
- *   env(safe-area-inset-*) reads 0px. With it, 100dvh spans the whole screen -
- *   behind the Dynamic Island and behind the home indicator - and the insets
- *   describe which strips of that box are unsafe. iPhone 15 portrait: 59px top,
- *   34px bottom, 0 sides; landscape: 0/21/59/59.
+ *   env(safe-area-inset-*) reads 0px. With it, the page spans the whole screen
+ *   - behind the Dynamic Island and behind the home indicator - and the insets
+ *   describe which strips of that box are unsafe. iPhone 15 portrait: 59px
+ *   top, 34px bottom, 0 sides; landscape: 0/21/59/59.
  *     - https://webkit.org/blog/7929/designing-websites-for-iphone-x/
  *     - https://useyourloaf.com/blog/iphone-15-screen-sizes/
  *
- *   Each inset is spent exactly once, as padding, on the child that touches
- *   that edge: --sat on the top bar, --sab on the player, --sal/--sar here.
- *   Never `height: calc(100dvh - env(...))` as well - that is the double count.
+ *   Each inset is spent exactly once, on the thing that touches that edge:
+ *   --sat on the top bar and on where the words start, --sab inside the
+ *   player bar, --sal/--sar on #root. Never `height: calc(100dvh - env(...))`
+ *   as well - that is the double count.
  *
  *   max(), not addition. `max(0.5rem, var(--sab))` is WebKit's own idiom: the
  *   inset already is the breathing room, and the rem is only the floor for a
  *   device that has no inset. Adding them is where an empty band comes from.
  *
+ *   The words stop at --sat and no higher. The system paints the clock and the
+ *   battery over that strip, and text sliding under them is not reading space,
+ *   it is noise. Everything below it is the reader's, including the home
+ *   indicator's strip, which is a line over the page rather than a control.
+ *
  *   overscroll-behavior: none on the document rather than overflow: hidden on
- *   body, which is unreliable on iOS Safari. #root cannot overflow anyway.
+ *   body, which is unreliable on iOS Safari.
+ *
+ *   --vh-extra makes #root taller than the layout viewport, which is the one
+ *   thing it costs: the document can be dragged by that much, and unlike a
+ *   rubber band a drag stays where it is left, showing the same black band at
+ *   the *top* instead. The reading area does not chain its scroll out
+ *   (`overscroll-behavior: contain`), so the only places a drag could start
+ *   are the two bars, and both are `touch-none`. It is deliberately not fixed
+ *   by clipping the document: the strip below the layout viewport is a strip
+ *   this page is painting into, and `overflow: hidden` on html is how it would
+ *   go black again.
  */
 @layer base {
   * { @apply border-border outline-ring/50; }
@@ -134,6 +166,28 @@
     --sar: env(safe-area-inset-right, 0px);
     --sab: env(safe-area-inset-bottom, 0px);
     --sal: env(safe-area-inset-left, 0px);
+
+    /* Measured off the real bars by App.tsx; these are only what the first
+       paint uses, and what a browser with no ResizeObserver keeps. They are
+       the bars' own class lists added up - the one place a number is allowed
+       to restate a height, because it is replaced by the measurement a frame
+       later rather than trusted. */
+    --bar-top: calc(max(0.25rem, var(--sat)) + 2.75rem);
+    --bar-bottom: calc(max(0.5rem, var(--sab)) + 3.75rem);
+
+    /* How far past each bar the words dissolve rather than stop. See
+       `.bar-fade` below; the reading column's padding is the bar plus this, so
+       a chapter's first and last words are clear of the fade as well as of the
+       bar. */
+    --bar-fade: 2rem;
+
+    /* The reading column starts below the top bar. It is already inset by
+       --sat (the words begin there), so the bar's own copy comes back off. */
+    --reading-top: calc(var(--bar-top) - var(--sat) + var(--bar-fade));
+
+    /* What iOS took off the bottom of the viewport. See above; App.tsx writes
+       the measurement over this. */
+    --vh-extra: 0px;
   }
 
   html, body {
@@ -147,13 +201,62 @@
     text-rendering: optimizeLegibility;
   }
 
-  /* The one full-screen box. Its children are the reader's three rows. */
+  /* The one full-screen box: the words, with the two bars over them. */
   #root {
-    height: 100dvh;
-    display: flex;
-    flex-direction: column;
+    position: relative;
+    height: calc(100dvh + var(--vh-extra));
     overflow: hidden;
     padding-left: var(--sal);
     padding-right: var(--sar);
   }
+}
+
+/* The edge of a bar, softened.
+ *
+ * The bars are opaque, and the words now run underneath them, so where a bar
+ * ends a line of text was being guillotined mid-stroke - the page looked cut
+ * rather than covered. This is the strip that fixes it: it hangs off the inner
+ * edge of each bar, carries the same background colour and the same blur over
+ * whatever is behind it, and is faded out by a mask so both the colour and the
+ * blur reach zero together. Text approaching a bar therefore softens and
+ * dissolves into it instead of meeting a line.
+ *
+ * The fade is a mask on a solid fill rather than a gradient to `transparent`,
+ * because a gradient has to interpolate towards rgba(0,0,0,0) and can pick up a
+ * band on the way; a mask fades the exact background colour by alpha alone.
+ * -webkit- prefixes for both, which is what iOS still wants.
+ *
+ * `pointer-events: none`: the strip covers the words, and a tap that lands on
+ * it belongs to them. The bars themselves keep their taps (see Chrome.tsx).
+ */
+.bar-fade {
+  position: absolute;
+  inset-inline: 0;
+  height: var(--bar-fade);
+  pointer-events: none;
+  background: var(--background);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+}
+
+.bar-fade-below {
+  top: 100%;
+  -webkit-mask-image: linear-gradient(to bottom, #000, transparent);
+  mask-image: linear-gradient(to bottom, #000, transparent);
+}
+
+.bar-fade-above {
+  bottom: 100%;
+  -webkit-mask-image: linear-gradient(to top, #000, transparent);
+  mask-image: linear-gradient(to top, #000, transparent);
+}
+
+/* The drawer is `position: fixed`, so it measures itself against the viewport
+   and not against #root - which means it walks into the shortfall on its own
+   account and needs the same height given back, or it ends in mid-air with the
+   same black band under it. The overlay too, or the strip below it is unshaded
+   glass over the page. */
+[data-slot='sheet-content'],
+[data-slot='sheet-overlay'] {
+  height: calc(100dvh + var(--vh-extra));
 }
