@@ -7,9 +7,25 @@
  * timeout, a proxy's own 200 - leaves it exactly where it was.
  */
 import * as db from './db';
+import {DEVICE_HEADER, DEVICE_NAME_HEADER, deviceId, deviceLabel} from './device';
 import {bookKey} from './offline';
 import {afterFailure, classify, nextAction, type Memo, type OutboxCtx} from './outbox';
 import type {NoteResult} from './types';
+
+/**
+ * The headers on every post from here.
+ *
+ * These two calls are plain `fetch` rather than the generated client (see the
+ * note at the bottom of api.ts), so they missed the identity `setConfig` puts on
+ * everything else - and `/api/position` is a position *write*. Unnamed, the
+ * `position` event it causes came back with no device on it, and this device's
+ * own delivered position went through the arbitration as somebody else's move.
+ */
+export const postHeaders = (): Record<string, string> => ({
+  'Content-Type': 'application/json',
+  [DEVICE_HEADER]: deviceId(),
+  [DEVICE_NAME_HEADER]: deviceLabel(),
+});
 
 const toBase64 = (blob: Blob) => new Promise<string>((resolve) => {
   const r = new FileReader();
@@ -77,7 +93,7 @@ async function collect(memo: Memo): Promise<boolean> {
   try {
     const res = await fetch('/api/note', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: postHeaders(),
       body: JSON.stringify({audio: '', id: memo.uid}),
     });
     const body = await res.json().catch(() => null);
@@ -102,7 +118,7 @@ async function sendQueued(ctx: OutboxCtx): Promise<void> {
     try {
       const res = await fetch('/api/note', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        headers: postHeaders(),
         body: JSON.stringify({
           audio: await toBase64(memo.blob), mime: memo.mime,
           chapter: memo.chapter, chunk: memo.chunk,
@@ -146,17 +162,35 @@ async function sendQueued(ctx: OutboxCtx): Promise<void> {
 export async function flushPositions(): Promise<string[]> {
   const delivered: string[] = [];
   for (const p of await db.allPositions()) {
-    try {
-      const res = await fetch('/api/position', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(p),
-      });
-      if (res.ok) {
-        await db.deletePosition(p.book);
-        delivered.push(p.book);
-      }
-    } catch { /* still offline; it keeps */ }
+    if (await deliverPosition(p)) {
+      await db.deletePosition(p.book);
+      delivered.push(p.book);
+    }
   }
   return delivered;
+}
+
+/**
+ * One position, to `/api/position`, now. True when the server took it.
+ *
+ * Also the direct route for a report the session will not take. `/api/playhead`
+ * answers 409 when the one server-side session holds another book - another
+ * device loaded one, which is its business - and that is not a network failure:
+ * the server is right there and will file a *named* position whatever it has
+ * loaded. Queueing it instead is what left "position queued" on screen, online,
+ * for as long as the other book stayed loaded, because every later report hit
+ * the same 409 and the queue was only ever drained on a reconnect that never
+ * came.
+ */
+export async function deliverPosition(p: db.QueuedPosition): Promise<boolean> {
+  try {
+    const res = await fetch('/api/position', {
+      method: 'POST', headers: postHeaders(), body: JSON.stringify(p),
+    });
+    return res.ok;
+  } catch {
+    return false;                          // still offline; it keeps
+  }
 }
 
 export type {NoteResult};
