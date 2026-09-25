@@ -32,22 +32,17 @@ import {bookKey, heldBooks, storageEstimate} from '@/lib/offline';
 import {bytes as fmtBytes} from '@/lib/format';
 import {initialView, type DrawerView} from '@/lib/drawernav';
 import {
-  downloadCost, indexBooks, libraryState, orderBooks, positionLine, scanAge, scanStale,
-  type LibraryCost, type Tone,
+  downloadCost, indexBooks, libraryState, orderBooks, positionLine, renderedPct, scanAge,
+  scanStale, type LibraryCost, type LibraryPhase,
 } from '@/lib/library';
 import {cn} from '@/lib/utils';
 import {readInsets} from '@/lib/viewport';
 import {useNarrator} from '@/state';
 import {ChapterManager} from './ChapterManager';
-import type {BookFile} from '@/lib/types';
+import type {BookFile, LibraryRow} from '@/lib/types';
+import {Hairline, StatusIcon, type Mark, type Tone} from './StatusIcon';
 
 const LIB_KEY = 'narrator.lib';
-
-/** The chapter list's tones, on the level above it — see lib/library.ts. */
-const TONE: Record<Tone, string> = {
-  ok: 'text-ok', work: 'text-work', part: 'text-part',
-  done: 'text-foreground/50', none: 'text-muted-foreground/80',
-};
 
 function knownBooks(): BookFile[] {
   try {
@@ -132,6 +127,10 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
       <SheetContent
         side="left"
         showCloseButton={false}
+        /* Escape in the chapter filter clears the filter, not the drawer. */
+        onEscapeKeyDown={(e) => {
+          if ((document.activeElement as HTMLElement | null)?.dataset.testid === 'chapter-filter') e.preventDefault();
+        }}
         className="flex w-[min(400px,88vw)] flex-col gap-0 p-0
                    pt-[var(--sat)] pb-[var(--sab)] pl-[var(--sal)]"
       >
@@ -199,6 +198,20 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
                 const ready = info && libraryState(info);
                 const cost = info && downloadCost(info, perMin);
                 const where = info && positionLine(info);
+                const mark = ready && info ? bookMark(ready.key, info) : null;
+                /* How far in, 0..1: the stored position when the library has
+                   one, and for the book open here, where this device is. */
+                const read = here && n.chapters.length
+                  ? (n.ci + 1) / n.chapters.length
+                  : info?.position
+                    ? (info.position.chapter + 1)
+                      / Math.max(1, info.chapters > 0 ? info.chapters : info.position.chapters_total)
+                    : null;
+                const tip = bookTip({
+                  title, ready: ready?.tip, cost, where: here && n.chapters.length
+                    ? `ch ${n.ci + 1} / ${n.chapters.length}` : where,
+                  loaded: !!info?.loaded, mb: b.mb,
+                });
                 return (
                   <div
                     key={b.path}
@@ -212,6 +225,8 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
                     <button
                       data-testid="book"
                       data-key={key}
+                      title={tip}
+                      aria-current={here ? 'true' : undefined}
                       onClick={() => {
                         setArmed(null);
                         setOpening(b.path);
@@ -221,50 +236,31 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
                         void n.openBook(b).finally(() => setOpening(null));
                       }}
                       className={cn(
-                        'flex min-w-0 flex-1 flex-col gap-0.5 py-2 pl-4 pr-2 text-left text-[13px]',
-                        'font-light text-muted-foreground transition-colors hover:text-foreground',
+                        'flex min-w-0 flex-1 flex-col gap-1.5 py-2.5 pl-4 pr-2 text-left text-[13px]',
+                        'font-light text-foreground/75 transition-colors hover:text-foreground',
                         here && 'text-foreground',
                       )}
                     >
-                      <span className="flex w-full min-w-0 items-baseline gap-2">
+                      <span className="flex w-full min-w-0 items-center gap-2">
                         <span className="min-w-0 flex-1 truncate">{title}</span>
                         {opening === b.path
-                          ? <Spinner className="size-3 shrink-0 self-center text-muted-foreground" />
-                          : b.mb ? <span className="shrink-0 text-[10px] text-muted-foreground">{b.mb}MB</span> : null}
+                          ? <Spinner className="size-3 shrink-0 text-muted-foreground" />
+                          : mark && (
+                            /* The readiness mark: what the box has made of this
+                               book, answered without loading it. The same
+                               vocabulary as the chapter rows below it. */
+                            <StatusIcon testId="book-ready" phase={ready?.key}
+                                        mark={mark.mark} tone={mark.tone} frac={mark.frac}
+                                        label={ready?.tip ?? ''} />
+                          )}
                       </span>
-
-                      {/* The readiness line: what the box has made of this book,
-                          answered without loading it. Everything on it is
-                          `shrink-0` but the position, which truncates - the row
-                          has a name and a delete button to keep, and this line
-                          may not push either off a phone. */}
-                      {ready && (
-                        <span
-                          data-testid="book-ready"
-                          data-phase={ready.key}
-                          title={readyTip(ready.tip, cost)}
-                          className="flex w-full min-w-0 items-center gap-1.5 text-[10px] tracking-wide tabular-nums"
-                        >
-                          <span className={cn('shrink-0', TONE[ready.tone])}>{ready.text}</span>
-                          {where && (
-                            <span data-testid="book-position" className="min-w-0 truncate text-muted-foreground/80">
-                              {where}
-                            </span>
-                          )}
-                          {/* The *server's* session, not this device's - which
-                              is the interesting case when they differ. The row
-                              highlight still means "what you are reading". */}
-                          {info?.loaded && (
-                            <span data-testid="book-loaded" className="shrink-0 text-muted-foreground/60">
-                              open
-                            </span>
-                          )}
-                          {sizeOf(cost) && (
-                            <span data-testid="book-size" className="ml-auto shrink-0 text-muted-foreground/80">
-                              {sizeOf(cost)}
-                            </span>
-                          )}
-                        </span>
+                      {/* How far into it the stored position is. Absent for a
+                          book that has never been opened anywhere, which is
+                          itself the answer. */}
+                      {read != null && (
+                        <Hairline testId="book-position" value={read}
+                                  className="mr-1"
+                                  barClassName={here ? 'bg-foreground/55' : 'bg-foreground/30'} />
                       )}
                     </button>
 
@@ -343,31 +339,45 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
   );
 }
 
-/**
- * The one number on the readiness line, and it is deliberately the *measured*
- * one when there is one: "12 MB" is what could come down this second, which is
- * the question being asked. Only a book with nothing packed falls back to the
- * estimate, because then the estimate is the only answer there is - and it
- * carries the `~` that says so. A book with nothing packed and no bitrate from
- * the server says nothing at all rather than a number computed from a guess.
- */
-function sizeOf(cost: LibraryCost | undefined): string {
-  if (!cost) return '';
-  if (cost.packed > 0) return fmtBytes(cost.packed);
-  return cost.rest ? `~${fmtBytes(cost.rest)}` : '';
+/** A book's readiness in the chapter rows' icon vocabulary - see StatusIcon.tsx. */
+function bookMark(key: LibraryPhase, b: LibraryRow): {mark: Mark; tone: Tone; frac: number} | null {
+  switch (key) {
+    case 'complete': return {mark: 'cloud', tone: 'ok', frac: 1};
+    case 'ready': return {mark: 'cloud', tone: 'done', frac: 0};
+    case 'rendered': return {mark: 'check', tone: 'none', frac: 1};
+    case 'partial': return {mark: 'ring', tone: 'part', frac: renderedPct(b) / 100};
+    case 'none': return null;
+  }
 }
 
-/** The readiness sentence, with what the whole book would weigh under it. */
-function readyTip(tip: string, cost: LibraryCost | undefined): string {
-  if (!cost) return tip;
-  if (cost.packed > 0) {
-    return cost.rest
-      ? `${tip}\n${fmtBytes(cost.packed)} can be downloaded now; the whole book about ${fmtBytes(cost.total)}`
-      : `${tip}\n${fmtBytes(cost.packed)} on this book — all of it downloadable`;
+/**
+ * Everything the row used to print, as the row's tooltip: the readiness
+ * sentence, where the reader is, what it weighs, and whether the server has it
+ * open. Sizes are the *measured* packed bytes when there are any - "12 MB" is
+ * what could come down this second - and the estimate for the rest carries its
+ * "about". A book with nothing packed and no bitrate from the server says
+ * nothing about size rather than a number computed from a guess.
+ */
+function bookTip(t: {
+  title: string; ready?: string; cost?: LibraryCost | null; where?: string | null;
+  loaded: boolean; mb?: number;
+}): string {
+  const lines = [t.title];
+  if (t.where) lines.push(t.where);
+  if (t.ready) lines.push(t.ready);
+  const c = t.cost;
+  if (c) {
+    if (c.packed > 0) {
+      lines.push(c.rest
+        ? `${fmtBytes(c.packed)} can be downloaded now; the whole book about ${fmtBytes(c.total)}`
+        : `${fmtBytes(c.packed)} — all of it downloadable`);
+    } else if (c.rest) {
+      lines.push(`nothing packed yet; the whole book would be about ${fmtBytes(c.rest)}`);
+    }
   }
-  return cost.rest
-    ? `${tip}\nnothing packed yet; the whole book would be about ${fmtBytes(cost.rest)}`
-    : tip;
+  if (t.loaded) lines.push('open on the server');
+  if (t.mb) lines.push(`epub ${t.mb} MB`);
+  return lines.join('\n');
 }
 
 /**
