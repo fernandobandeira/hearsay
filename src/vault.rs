@@ -223,12 +223,74 @@ pub fn reading_log(pos: &Positions) -> String {
 /// Write both files. Every failure is a log line, never a panic: a vault on a
 /// disconnected mount must not be able to stop playback.
 pub fn write_positions(dir: &Path, pos: &Positions) -> io::Result<()> {
+    write_positions_from(dir, || pos.clone())
+}
+
+/// [`write_positions`], with the snapshot taken *inside* the writer lock.
+///
+/// Two things went wrong with a plain `fs::write` from every handler that saves
+/// a position. It truncates and then writes, so a reader — the Obsidian plugin,
+/// the vault's git backup, this server after a crash — could find the file empty
+/// or half-written, and `load_positions` reads a file it cannot parse as `{}`:
+/// every book back to chapter one. And two writers ran at once, each with its
+/// own snapshot, so the *older* snapshot could land last and quietly undo the
+/// newer position. So every write here is `.part` → fsync → rename, one writer
+/// at a time, and the caller hands over a closure rather than a map: the
+/// snapshot it takes is then ordered by the same lock as the write, so the file
+/// on disk is always the newest state anybody has written. The bytes of the
+/// final files are exactly what they always were.
+pub fn write_positions_from(dir: &Path, snapshot: impl FnOnce() -> Positions) -> io::Result<()> {
+    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A writer that panicked left nothing half-done that matters — the rename is
+    // the commit — so poison is recovered rather than passed on.
+    let _one = WRITER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pos = snapshot();
     std::fs::create_dir_all(dir)?;
-    std::fs::write(
-        positions_file(dir),
-        dumps_indent1(&Value::Object(pos.clone())),
+    write_atomic(
+        &positions_file(dir),
+        dumps_indent1(&Value::Object(pos.clone())).as_bytes(),
     )?;
-    std::fs::write(log_file(dir), reading_log(pos))?;
+    write_atomic(&log_file(dir), reading_log(&pos).as_bytes())?;
+    Ok(())
+}
+
+/// Replace `path` with `bytes` so that a reader sees the old file or the new
+/// one and never anything in between.
+///
+/// The temporary is a dot-file beside the target — the same directory, so the
+/// rename is atomic, and hidden, so neither Obsidian nor a `vault backup:`
+/// commit that catches it mid-write picks it up as a note. The target's
+/// permissions are carried over, because `fs::write` kept them and a vault
+/// shared with another user should not change mode on the first save.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "narrator".into());
+    let part = parent.join(format!(".{name}.part"));
+    let written = (|| {
+        let mut f = std::fs::File::create(&part)?;
+        f.write_all(bytes)?;
+        if let Ok(md) = std::fs::metadata(path) {
+            // Best effort: a filesystem that refuses a chmod still gets the data.
+            let _ = f.set_permissions(md.permissions());
+        }
+        f.sync_all()?;
+        std::fs::rename(&part, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    written?;
+    // Best effort, like the chunk cache: a directory that cannot be opened for
+    // an fsync is not a reason to fail a write that has already landed.
+    if let Ok(d) = std::fs::File::open(parent) {
+        let _ = d.sync_all();
+    }
     Ok(())
 }
 

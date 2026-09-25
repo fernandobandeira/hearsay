@@ -577,8 +577,7 @@ pub async fn position(
         );
         p
     };
-    let snapshot = st.positions().clone();
-    if let Err(e) = vault::write_positions(&st.cfg.positions_dir, &snapshot) {
+    if let Err(e) = vault::write_positions_from(&st.cfg.positions_dir, || st.positions().clone()) {
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not save: {e}"),
@@ -741,15 +740,13 @@ pub fn save_position(st: &Arc<AppState>, force: bool, dev: &Device) {
         chapters_total: chapters_total as i64,
         updated: vault::now_iso_seconds(),
     };
-    let snapshot = {
-        let mut pos = st.positions();
-        pos.insert(
-            name.clone(),
-            serde_json::to_value(&record).unwrap_or(Value::Null),
-        );
-        pos.clone()
-    };
-    match vault::write_positions(&st.cfg.positions_dir, &snapshot) {
+    st.positions().insert(
+        name.clone(),
+        serde_json::to_value(&record).unwrap_or(Value::Null),
+    );
+    // The snapshot is taken under the vault's writer lock, not here, so a slower
+    // writer holding an older map can never land after this one.
+    match vault::write_positions_from(&st.cfg.positions_dir, || st.positions().clone()) {
         Ok(()) => {
             if let Ok(mut w) = st.pos_written.lock() {
                 *w = Some(Instant::now());
