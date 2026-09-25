@@ -7,10 +7,10 @@
 //! durations plus the same inter-chunk (0.30 s) and paragraph (0.60 s) gaps the
 //! `.m4b` export uses.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +54,49 @@ fn building_remove(key: &str, ci: usize) {
         if let Some(s) = g.as_mut() {
             s.remove(&(key.into(), ci));
         }
+    }
+}
+
+/// One lock per chapter's HLS directory.
+///
+/// `build_hls` is reached from `/api/hls`, on a blocking thread per request, and
+/// a player asks for the playlist of a chapter that has not been segmented yet
+/// from more than one place at once — the reader's `<audio>`, the service
+/// worker, a second device. Unserialized, two segmenters shared one
+/// `chNNN.part`: the second's `remove_dir_all` pulled the first one's segments
+/// out from under ffmpeg, and whichever renamed last won with a directory the
+/// other had half-deleted. The playlist then names segments that are not there,
+/// which a player reports as a network error on a file that 404s for good.
+///
+/// Per chapter rather than one global lock, because segmenting is a stream copy
+/// of seconds and a different chapter has no business waiting on it. The packer
+/// takes the same lock to throw a stale directory away (see [`build`]), so a
+/// segmenter that is reading the *old* m4a finishes before its output is removed
+/// rather than after.
+type HlsLocks = HashMap<(String, usize), Arc<Mutex<()>>>;
+static HLS_LOCKS: Mutex<Option<HlsLocks>> = Mutex::new(None);
+
+fn hls_lock(key: &str, ci: usize) -> Arc<Mutex<()>> {
+    let mut g = match HLS_LOCKS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let map = g.get_or_insert_with(HashMap::new);
+    // Entries nobody holds are dropped as we go, so the map stays the size of
+    // what is being segmented right now rather than of every chapter ever played.
+    map.retain(|_, l| Arc::strong_count(l) > 1);
+    map.entry((key.to_string(), ci))
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Take a chapter's HLS lock. Poisoning is recovered from: the lock guards a
+/// directory on disk, not memory, and whatever a panicking holder left there is
+/// cleaned up by the next `.part` removal.
+fn hold(l: &Mutex<()>) -> MutexGuard<'_, ()> {
+    match l.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
     }
 }
 
@@ -334,6 +377,22 @@ pub fn build(
             ));
         }
         std::fs::rename(&part, &m4a)?;
+        // The HLS directory is segments cut from the m4a that was just replaced,
+        // and `build_hls` answers from it for as long as it has a playlist — so
+        // a re-pack (a chapter re-rendered after `narrator migrate`, a trim, a
+        // pronunciation fix) would otherwise go on streaming the old audio
+        // against the new manifest's start times. Removed under the segmenter's
+        // own lock, so one that is mid-copy of the old file lands first and is
+        // thrown away here, rather than landing after and surviving.
+        {
+            let l = hls_lock(key, ci);
+            let _g = hold(&l);
+            match std::fs::remove_dir_all(hls_dir(&cfg.work, key, ci)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!("could not drop the stale HLS of {key} ch{ci}: {e}"),
+            }
+        }
 
         let manifest = Manifest {
             book: key.to_string(),
@@ -466,6 +525,13 @@ pub fn build_hls(cfg: &Config, key: &str, ci: usize, base_url: &str) -> Result<P
     }
     let d = hls_dir(&cfg.work, key, ci);
     let playlist = d.join("index.m3u8");
+    if playlist.exists() {
+        return Ok(playlist);
+    }
+    let l = hls_lock(key, ci);
+    let _g = hold(&l);
+    // Asked again under the lock: the caller that was holding it has usually
+    // just finished this exact job, and the answer is the directory it made.
     if playlist.exists() {
         return Ok(playlist);
     }
