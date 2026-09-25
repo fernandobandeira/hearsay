@@ -335,9 +335,20 @@ export async function reconcile(deps: SweepDeps): Promise<SweepBook[]> {
     const after = fetched.length
       ? await deps.stored(p.key).catch(() => new Set([...stored, ...fetched]))
       : stored;
-    const left = remaining(p, after);
-    if (left.length) await deps.save({...p, chapters: left});
-    else await deps.drop(p.key);
+    /* Written back against the record as it stands *now*, not as it stood when
+       this pass read it. A pass over a big order is minutes of downloading, and
+       the drawer is usable the whole time: a selection added meanwhile would be
+       lost by writing back the old list, and one taken out would be put back.
+       So the only edit a sweep makes is its own - striking what is stored - and
+       a record that has gone (the whole order cancelled) stays gone. A record
+       that cannot be re-read is the one this pass started from: better a stale
+       write than none, which would leave stored chapters pending forever. */
+    const now = await deps.pending()
+      .then((all) => all.find((x) => x.key === p.key) ?? null, () => p);
+    const left = now ? remaining(now, after) : [];
+    if (now && left.length) {
+      if (left.length !== now.chapters.length) await deps.save({...now, chapters: left});
+    } else if (now) await deps.drop(p.key);
     out.push({key: p.key, fetched, failed, left, ordered});
   }
   return out;

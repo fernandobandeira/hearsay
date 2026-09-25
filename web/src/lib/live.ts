@@ -34,6 +34,7 @@
  */
 import type {QueryClient} from '@tanstack/react-query';
 import {keys} from './api';
+import {delayFor} from './backoff';
 import {deviceId, deviceLabel} from './device';
 
 // ---------------------------------------------------------------- the events
@@ -426,12 +427,16 @@ export interface LiveOptions {
    * with no code here to get wrong.
    */
   open?: (url: string) => EventSourceLike;
+  /** The wait before reopening a stream the browser gave up on. For tests. */
+  delay?: (attempt: number) => number;
 }
 
 /** The slice of `EventSource` this module uses. */
 export interface EventSourceLike {
   addEventListener(type: string, fn: (ev: {data?: string}) => void): void;
   close(): void;
+  /** 2 (CLOSED) once the browser has stopped reconnecting on its own. */
+  readyState?: number;
   onopen?: ((ev?: unknown) => void) | null;
   onerror?: ((ev?: unknown) => void) | null;
 }
@@ -443,7 +448,8 @@ const NAMES = ['hello', 'position', 'render', 'books', 'note'] as const;
  * Open the live stream and keep the query cache honest from it.
  *
  * Returns the teardown. Reconnection is the browser's: `EventSource` retries on
- * its own (the server sends a `retry:` line), and every reconnect re-opens with
+ * its own (the server sends a `retry:` line) - except after an HTTP error, which
+ * is the one case this reopens itself (see `onerror`) - and every reconnect re-opens with
  * a `hello`, which is where the live queries are refetched - because whatever
  * happened while the connection was down was, by definition, not delivered.
  */
@@ -471,8 +477,11 @@ export function connectLive(qc: QueryClient, opts: LiveOptions = {}): () => void
   const url = opts.url ?? eventsUrl();
   const open = opts.open
     ?? ((u: string) => new EventSource(u) as unknown as EventSourceLike);
+  const wait = opts.delay ?? ((attempt: number) => delayFor(attempt));
   let closed = false;
-  const es = open(url);
+  let es: EventSourceLike;
+  let attempt = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
 
   const state = (s: LiveState) => { if (!closed) opts.onState?.(s); };
   state('connecting');
@@ -518,22 +527,52 @@ export function connectLive(qc: QueryClient, opts: LiveOptions = {}): () => void
     }
   };
 
-  for (const name of NAMES) {
-    es.addEventListener(name, (e) => {
-      if (closed) return;
-      const parsed = parseEvent(name, typeof e?.data === 'string' ? e.data : '');
-      if (parsed) handle(parsed);
-    });
-  }
-  es.onopen = () => state('live');
-  // A stream that drops is not an error anyone should see: EventSource is
-  // already reconnecting, and the reader says "reconnecting…" until it does.
-  es.onerror = () => state('down');
+  const connect = () => {
+    const src = open(url);
+    es = src;
+    for (const name of NAMES) {
+      src.addEventListener(name, (e) => {
+        if (closed || src !== es) return;
+        const parsed = parseEvent(name, typeof e?.data === 'string' ? e.data : '');
+        if (!parsed) return;
+        if (parsed.name === 'hello') attempt = 0;
+        handle(parsed);
+      });
+    }
+    src.onopen = () => { attempt = 0; state('live'); };
+    /* A stream that drops is not an error anyone should see: EventSource is
+       already reconnecting, and the reader says "reconnecting…" until it does.
+
+       Except when it is not. EventSource only retries a *network* failure; an
+       HTTP error - a 502 from the proxy while the container restarts, a 503 -
+       makes it give up for good (`readyState` CLOSED) with no event to say so.
+       Nothing here would ever open another one, so the reader sat on
+       "reconnecting" for the life of the page. That one is reopened by hand, on
+       the shared backoff curve, so a server that is down for a minute is asked
+       a handful of times rather than once or a thousand. */
+    src.onerror = () => {
+      if (closed || src !== es) return;
+      state('down');
+      if (src.readyState !== CLOSED || timer) return;
+      src.onopen = null;
+      src.onerror = null;
+      src.close();
+      timer = setTimeout(() => {
+        timer = null;
+        if (!closed) connect();
+      }, wait(attempt++));
+    };
+  };
+  connect();
 
   return () => {
     closed = true;
+    if (timer) { clearTimeout(timer); timer = null; }
     es.onopen = null;
     es.onerror = null;
     es.close();
   };
 }
+
+/** `EventSource.CLOSED`: the browser has stopped reconnecting. */
+const CLOSED = 2;

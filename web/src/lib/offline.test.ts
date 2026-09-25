@@ -200,6 +200,30 @@ describe('what actually goes into the cache', () => {
     expect(await cachedChapters('lom')).toEqual(new Set([9]));
   });
 
+  test('the manifest lands before the audio, which is what counts as downloaded', async () => {
+    // Killed between the two puts, the other order left a chapter that reads as
+    // downloaded and has no timeline to play it by.
+    serve('/api/chapters/2.m4a?book=lom', 'audio');
+    serve('/api/chapters/2.json?book=lom', '{}');
+    serve('/api/chapter/2?book=lom', '{}');
+    await downloadChapter('lom', 2);
+    const order = asked.map(([u]) => u).filter((u) => u.startsWith('/api/chapters/2'));
+    expect(order).toEqual(['/api/chapters/2.json?book=lom', '/api/chapters/2.m4a?book=lom']);
+  });
+
+  test('audio that never came takes its manifest back out', async () => {
+    serve('/api/chapters/3.json?book=lom', '{}');
+    fail('/api/chapters/3.m4a?book=lom', 404);
+    await expect(downloadChapter('lom', 3, {wait: async () => {}})).rejects.toThrow();
+    expect(paths(AUDIO_CACHE)).toEqual([]);
+
+    // ...but a chapter an earlier run stored keeps its own.
+    await held(AUDIO_CACHE, '/api/chapters/3.m4a?book=lom');
+    await expect(downloadChapter('lom', 3, {wait: async () => {}})).rejects.toThrow();
+    expect(paths(AUDIO_CACHE))
+      .toEqual(['/api/chapters/3.json?book=lom', '/api/chapters/3.m4a?book=lom']);
+  });
+
   test('a blip is retried; an answer is not', async () => {
     serve('/api/chapters/6.m4a?book=lom', 'audio');
     serve('/api/chapters/6.json?book=lom', '{}');
@@ -209,6 +233,7 @@ describe('what actually goes into the cache', () => {
     expect(hits.get('/api/chapters/6.m4a?book=lom')).toBe(3);
 
     // A 404 means the server has no such file. Five more asks will say so.
+    serve('/api/chapters/7.json?book=lom', '{}');
     fail('/api/chapters/7.m4a?book=lom', 404);
     await expect(downloadChapter('lom', 7, {wait: async () => {}})).rejects.toThrow();
     expect(hits.get('/api/chapters/7.m4a?book=lom')).toBe(1);

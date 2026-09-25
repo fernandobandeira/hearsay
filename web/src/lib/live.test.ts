@@ -311,6 +311,7 @@ describe('parseEvent - the one part of the API that is not generated', () => {
 class FakeSource implements EventSourceLike {
   handlers = new Map<string, (ev: {data?: string}) => void>();
   closed = false;
+  readyState = 1;
   onopen: ((ev?: unknown) => void) | null = null;
   onerror: ((ev?: unknown) => void) | null = null;
   addEventListener(type: string, fn: (ev: {data?: string}) => void) {
@@ -385,6 +386,58 @@ describe('connectLive - events become refetches', () => {
     w.src.onopen?.();
     expect(w.states).toEqual(['connecting', 'down', 'live']);
     w.stop();
+  });
+
+  test('a stream the browser gave up on is reopened, on the backoff curve', () => {
+    vi.useFakeTimers();
+    try {
+      const srcs: FakeSource[] = [];
+      const waits: number[] = [];
+      const states: LiveState[] = [];
+      const stop = connectLive(new QueryClient(), {
+        open: () => { const s = new FakeSource(); srcs.push(s); return s; },
+        onState: (s) => states.push(s),
+        delay: (attempt) => { waits.push(attempt); return 1000 * (attempt + 1); },
+      });
+      // An ordinary drop: EventSource is still reconnecting, nothing to do.
+      srcs[0].onerror?.();
+      vi.advanceTimersByTime(60_000);
+      expect(srcs).toHaveLength(1);
+
+      // A 502 while the container restarts: CLOSED, and nothing would ever
+      // open another one.
+      srcs[0].readyState = 2;
+      srcs[0].onerror?.();
+      expect(srcs[0].closed).toBe(true);
+      vi.advanceTimersByTime(999);
+      expect(srcs).toHaveLength(1);
+      vi.advanceTimersByTime(1);
+      expect(srcs).toHaveLength(2);
+
+      // Still down: the second wait is longer.
+      srcs[1].readyState = 2;
+      srcs[1].onerror?.();
+      vi.advanceTimersByTime(2000);
+      expect(srcs).toHaveLength(3);
+      expect(waits).toEqual([0, 1]);
+
+      // Back: the curve starts over, and the old source cannot speak for it.
+      srcs[2].onopen?.();
+      srcs[2].readyState = 2;
+      srcs[2].onerror?.();
+      vi.advanceTimersByTime(1000);
+      expect(waits).toEqual([0, 1, 0]);
+      expect(states.at(-1)).toBe('down');
+
+      // Teardown cancels a pending reopen.
+      srcs[3].readyState = 2;
+      srcs[3].onerror?.();
+      stop();
+      vi.advanceTimersByTime(60_000);
+      expect(srcs).toHaveLength(4);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test('teardown closes the stream and stops delivering', () => {

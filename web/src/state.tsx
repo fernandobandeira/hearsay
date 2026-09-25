@@ -22,11 +22,11 @@ import {
 } from 'react';
 import {onlineManager, useQueryClient} from '@tanstack/react-query';
 import {
-  awaitedRetry, bookIndexUrl, chapterManifestUrl, chapterTextUrl, fetchChapters, keys, get,
-  loadBook, openChapter as tellOpen, reportPlayhead, tellPause, tellResume, textShardUrl,
+  ApiError, awaitedRetry, bookIndexUrl, chapterManifestUrl, chapterTextUrl, fetchChapters, keys,
+  get, loadBook, openChapter as tellOpen, reportPlayhead, tellPause, tellResume, textShardUrl,
   useBookIndex, useStatus,
 } from './lib/api';
-import {loadChapterText, shardOf, type TextSources} from './lib/chaptertext';
+import {loadChapterText, shardOf, type ChapterWords, type TextSources} from './lib/chaptertext';
 import {
   arbitrate, connectLive, lostSession, type HelloEvent, type LiveState, type PositionEvent,
 
@@ -43,7 +43,7 @@ import {reconcile, SWEEP_EVERY_MS, type PendingDownload} from './lib/reconcile';
 import {buildChapters, cancelChapters, renderChapters} from './lib/api';
 import {chaptersToTrim, furthestReached, KEEP_BEHIND} from './lib/autotrim';
 import {deviceId} from './lib/device';
-import {clampResume, resolveResume, type Resume} from './lib/resume';
+import {afterFastOpen, clampResume, resolveResume, type Resume} from './lib/resume';
 import * as db from './lib/db';
 import type {
   BookFile, BookIndex, ChapMeta, ChapterText, LoadResult, TextShard,
@@ -118,7 +118,13 @@ interface Ctx {
   dismissMoved: () => void;
 
   openBook: (b: BookFile & {key?: string}) => Promise<void>;
-  openChapter: (ci: number, chunk?: number, opts?: {cacheOnly?: boolean}) => Promise<boolean>;
+  /**
+   * Open a chapter. Called from outside (the drawer, the chapter list) it is the
+   * reader choosing, so it takes the server's session for this book if another
+   * book holds it (`claim`, on by default) - see `claimOpen`.
+   */
+  openChapter: (ci: number, chunk?: number,
+                opts?: {cacheOnly?: boolean; claim?: boolean}) => Promise<boolean>;
   goChapter: (d: number) => void;
   setIdx: (i: number, report?: boolean) => void;
   toggle: () => void;
@@ -261,8 +267,13 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const [moved, setMoved] =
     useState<{chapter: number; chunk: number; device?: string} | null>(null);
   const [live, setLive] = useState<LiveState>('connecting');
-  const [fontScale, setFontScaleState] = useState(
-    () => Math.min(1.8, Math.max(0.7, Number(localStorage.getItem('narrator.font')) || 1)));
+  /* Wrapped like every other storage read here: with site data blocked, iOS
+     throws on the *access*, and an initializer that throws is a blank app. */
+  const [fontScale, setFontScaleState] = useState(() => {
+    let saved = 1;
+    try { saved = Number(localStorage.getItem('narrator.font')) || 1; } catch { /* blocked */ }
+    return Math.min(1.8, Math.max(0.7, saved));
+  });
 
   const status = useStatus();
   const index = useBookIndex(book?.key ?? null).data;
@@ -278,6 +289,8 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const openSeqRef = useRef<ReturnType<typeof openSequence> | null>(null);
   if (!openSeqRef.current) openSeqRef.current = openSequence(setChapterLoading);
   const openSeq = openSeqRef.current;
+  /** Which `openBook` is the latest - see there. */
+  const bookSeqRef = useRef(0);
   ciRef.current = ci;
   idxRef.current = idx;
   bookRef.current = book;
@@ -322,18 +335,38 @@ export function NarratorProvider({children}: {children: ReactNode}) {
         : 'reconnecting';
 
   // ---------------------------------------------------------------- the player
-  const goChapterRef = useRef<(d: number) => void>(() => {});
+  /* The player is built once, for the life of the provider, so everything it
+     calls back into goes through a ref. Calling `report` directly was the bug:
+     the closure it kept was the first render's, where the chapter title was ''
+     and the book had no chapters, and every position it queued carried that into
+     the vault - an empty title and zero totals in `Reading Log.md`. */
+  const reportRef = useRef<(i: number) => Promise<void>>(async () => {});
+  const chapterEndRef = useRef<() => void>(() => {});
+  const advanceRef = useRef<(ci: number) => void>(() => {});
   if (!playerRef.current && typeof window !== 'undefined') {
     playerRef.current = new Player({
-      onChunk: (i) => { setIdxState(i); void report(i); },
+      onChunk: (i) => { setIdxState(i); idxRef.current = i; void reportRef.current(i); },
       onMode: setMode,
       onPlaying: setPlaying,
       onWaiting: setWaiting,
       onMessage: setMessage,
-      onChapterEnd: () => goChapterRef.current(1),
+      onChapterEnd: () => chapterEndRef.current(),
+      onAdvance: (ci) => advanceRef.current(ci),
     });
   }
   const player = playerRef.current;
+
+  /* What a queued position says about the chapter, read at the moment it is
+     written rather than at the last render: a chapter the player carried on
+     into has a new index long before React has painted its title. */
+  const chapterMetaRef = useRef({title: '', chunks: 0});
+  const chaptersRef = useRef<ChapMeta[]>([]);
+  chaptersRef.current = chapters;
+  /* This device painted a position it has not told the server, because the
+     server's record was being offered instead (see `openBook`). Until it says
+     something, `/api/playhead` would file the next chunk under the server
+     session's chapter - so the first report goes as an `/api/open`. */
+  const untoldRef = useRef<string | null>(null);
 
   // ------------------------------------------------------- positions, outbox
   /* The books this device has read past what it managed to tell the server.
@@ -357,13 +390,23 @@ export function NarratorProvider({children}: {children: ReactNode}) {
      say the server holds my book?" - because a report aimed at the wrong book
      moved that book's render frontier. It does not have to guess any more: the
      call names its book and the server answers 409 if it holds another, which is
-     both safer than the guess and one fewer thing to be stale. A 409 is just
-     another reason to use the outbox, which is where a position belongs when the
-     server cannot take it. */
+     both safer than the guess and one fewer thing to be stale. A 409 is a
+     reason to take the position somewhere else - but not to the outbox, which
+     only drains on a reconnect. A 409 comes from a server that is right there
+     and holding another book, and queueing on it is what left "position queued"
+     on screen, online, for as long as that book stayed loaded. `/api/position`
+     names its book and takes it whatever the session holds, so that is where it
+     goes, now. The outbox is for a server that did not answer.
+
+     Passive on purpose: this never loads the book back. A report is not the
+     reader choosing anything, and two devices that each re-took the session on
+     their own reports would take turns kicking each other's book out. Pressing
+     play and opening a chapter are choices, and those do (`claimOpen`). */
   const report = useCallback(async (i: number) => {
     const b = bookRef.current;
     if (!b) return;
-    rememberDevicePos(b.path, ciRef.current, i);
+    const ci = ciRef.current;
+    rememberDevicePos(b.path, ci, i);
     /* Stamped before the call, not after it. `lastWriteMs` exists to answer
        "could this event predate what I just told the server?", and the honest
        answer has to cover the write that is in flight right now: on a tunnel to
@@ -377,25 +420,68 @@ export function NarratorProvider({children}: {children: ReactNode}) {
        the network went - and then broadcast that as a position, which is the
        reader watching itself get dragged back three chapters. `/api/open` names
        the chapter too, which is the whole of what is out of date. */
-    const healing = undeliveredRef.current.has(b.name);
+    const healing = undeliveredRef.current.has(b.name) || untoldRef.current === b.key;
+    const pos = {
+      book: b.name, chapter: ci, chunk: i, ts: Date.now(),
+      chapter_title: chapterMetaRef.current.title, chunks_total: chapterMetaRef.current.chunks,
+      chapters_total: chaptersRef.current.length,
+    };
+    const delivered = async () => {
+      if (untoldRef.current === b.key) untoldRef.current = null;
+      if (!undeliveredRef.current.has(b.name)) return;
+      undeliveredRef.current.delete(b.name);
+      // Superseded by construction: same device, same book, newer position.
+      await db.deletePosition(b.name).catch(() => {});
+      void refreshQueued();
+    };
+    let answered = false;
     try {
-      if (healing) await tellOpen(b.key, ciRef.current, i);
+      if (healing) await tellOpen(b.key, ci, i);
       else await reportPlayhead(b.key, i);
-      if (healing) {
-        undeliveredRef.current.delete(b.name);
-        // Superseded by construction: same device, same book, newer position.
-        await db.deletePosition(b.name).catch(() => {});
-        void refreshQueued();
-      }
+      await delivered();
       return;
-    } catch { /* refused or unreachable: it goes in the queue */ }
+    } catch (e) {
+      // Any status at all is a server that answered; only a transport failure
+      // (status 0) is one that did not.
+      answered = e instanceof ApiError && e.status !== 0;
+    }
+    if (answered) {
+      const {deliverPosition} = await import('./lib/flush');
+      if (await deliverPosition(pos)) { await delivered(); return; }
+    }
     undeliveredRef.current.add(b.name);
-    await db.putPosition({
-      book: b.name, chapter: ciRef.current, chunk: i, ts: Date.now(),
-      chapter_title: chapterTitle, chunks_total: chunks.length, chapters_total: chapters.length,
-    });
+    await db.putPosition(pos);
     void refreshQueued();
-  }, [chapterTitle, chunks.length, chapters.length, refreshQueued]);
+  }, [refreshQueued]);
+  reportRef.current = report;
+
+  /**
+   * `/api/open`, taking the server's session for this book if another holds it.
+   *
+   * Only for what the reader does on purpose - pressing play, opening a
+   * chapter. The one server-side session answers 409 when another device has
+   * loaded another book, and for a passive report that is the right answer to
+   * leave alone (see `report`). For a tap on play it is not: the reader has just
+   * chosen this book, here, and a renderer left working on the other one means
+   * the chapter they are waiting for is never made. So the book is loaded again
+   * - which is exactly what picking it from the library would do - and the open
+   * repeated. Anything but a 409 is left to the usual paths.
+   */
+  const claimOpen = useCallback(async (b: OpenBook, ci: number, chunk: number) => {
+    lastWriteRef.current = Date.now();   // /api/open force-writes a position
+    try {
+      await tellOpen(b.key, ci, chunk);
+    } catch (e) {
+      if (!(e instanceof ApiError) || e.status !== 409) throw e;
+      await loadBook(b.path);
+      void qc.invalidateQueries({queryKey: keys.chapters});
+      void qc.invalidateQueries({queryKey: keys.status});
+      if (bookRef.current?.key !== b.key) return;       // moved on meanwhile
+      lastWriteRef.current = Date.now();
+      await tellOpen(b.key, ciRef.current, idxRef.current);
+    }
+    if (untoldRef.current === b.key) untoldRef.current = null;
+  }, [qc]);
 
 
   /**
@@ -523,6 +609,20 @@ export function NarratorProvider({children}: {children: ReactNode}) {
    */
   const sweeping = useRef(false);
   const again = useRef(false);
+  /* A chapter just landed in Cache Storage. If it is the one playing, the
+     player moves onto the stored copy where it stands (`Player.useDownloaded`)
+     instead of streaming on until somebody re-opens it; if it is the next one,
+     the hand-off at the end of this chapter is worked out again, from the file. */
+  const adoptStoredRef = useRef(async (_key: string, _ci: number) => {});
+  adoptStoredRef.current = async (key: string, ci: number) => {
+    const b = bookRef.current;
+    if (!b || b.key !== key) return;
+    if (ci === ciRef.current + 1) { void prepareNextRef.current(b, ciRef.current); return; }
+    if (ci !== ciRef.current || !chapterMetaRef.current.chunks) return;
+    const manifest = await loadManifest(qc, key, ci, chapterMetaRef.current.chunks);
+    if (bookRef.current?.key === key && ciRef.current === ci)
+      playerRef.current?.useDownloaded(key, ci, manifest);
+  };
   /* What was last ordered per book, and when. In a ref because it is neither
      render state nor worth persisting: the order itself is on disk at both ends,
      and forgetting this only costs one extra POST after a reload. */
@@ -568,7 +668,11 @@ export function NarratorProvider({children}: {children: ReactNode}) {
              twenty-chapter order is an hour of sweeping, and a list that says
              nothing for an hour and then everything at once is indistinguishable
              from one that is stuck. One Cache Storage scan per chapter. */
-          onStored: (key, ci) => { touchChapter(key, ci); void refreshOffline(); },
+          onStored: (key, ci) => {
+            touchChapter(key, ci);
+            void refreshOffline();
+            void adoptStoredRef.current(key, ci);
+          },
         });
         await readPending();
         if (out.some((b) => b.fetched.length)) {
@@ -689,14 +793,26 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   }, [refreshOffline]);
 
   // ---------------------------------------------------------------- opening
+  /** Put a chapter's words on the page. */
+  const showWords = useCallback((text: ChapterWords) => {
+    setChunks(text.chunks);
+    setParas(text.paras ?? null);
+    setChapterTitle(text.title);
+    setMessage(null);
+    chapterMetaRef.current = {title: text.title, chunks: text.chunks.length};
+  }, []);
+
   /**
    * Open a chapter. `cacheOnly` is the optimistic first paint: it may use only
    * what this device already holds, because the server is still parsing the EPUB
    * and `/api/chapter/{ci}` would answer for whichever book it has open.
-   * Resolves to whether the words made it onto the screen.
+   * Resolves to whether this open is the one on the screen *and* in the player:
+   * false for a miss, and false for an open another one overtook, because a
+   * caller that then presses play would be playing the other open's audio - or,
+   * worse, the chapter that just ended, from its first word.
    */
   const openChapter = useCallback(async (
-    target: number, chunk = 0, opts: {cacheOnly?: boolean} = {},
+    target: number, chunk = 0, opts: {cacheOnly?: boolean; claim?: boolean} = {},
   ): Promise<boolean> => {
     const b = bookRef.current;
     if (!b) return false;
@@ -728,24 +844,33 @@ export function NarratorProvider({children}: {children: ReactNode}) {
       return false;
     }
     attempt.settle();
-    setChunks(text.chunks);
-    setParas(text.paras ?? null);
-    setChapterTitle(text.title);
-    setMessage(null);
+    showWords(text);
     /* Remember it here, not only when the playhead reports: a position resolved
        from the server is the one this device must open at when the server is
        gone next time. Without this an offline open falls back to page one. */
     rememberDevicePos(b.path, target, chunk);
 
-    // Start the renderer here. Named, so the server refuses it outright if it
-    // holds another book rather than dragging that book's frontier along - which
-    // is why this no longer waits to be sure.
-    lastWriteRef.current = Date.now();   // /api/open force-writes a position
-    void tellOpen(b.key, target, chunk).catch(() => {});
+    /* Start the renderer here. Named, so the server refuses it outright if it
+       holds another book rather than dragging that book's frontier along - which
+       is why this no longer waits to be sure. Not for the optimistic first paint
+       of a book, though: that position is only this device's localStorage, and
+       telling the server it before `/api/load` has said what the server knows
+       wrote it straight over a newer one from another device. `openBook` tells
+       the server once it knows which of the two to believe. */
+    if (!opts.cacheOnly) {
+      if (opts.claim ?? true) void claimOpen(b, target, chunk).catch(() => {});
+      else {
+        lastWriteRef.current = Date.now();   // /api/open force-writes a position
+        void tellOpen(b.key, target, chunk).catch(() => {});
+      }
+    }
 
     const manifest = await loadManifest(qc, b.key, target, text.chunks.length);
-    if (!attempt.current()) return true;
+    if (!attempt.current()) return false;
     const downloaded = (await cachedChapters(b.key)).has(target);
+    // The await above is a gap another open can land in; the words it painted
+    // are the ones the audio has to match.
+    if (!attempt.current()) return false;
     await player?.open({
       key: b.key, ci: target, chunkCount: text.chunks.length, manifest,
       packed: !!manifest, downloaded, startChunk: Math.min(chunk, text.chunks.length - 1),
@@ -756,16 +881,100 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     // that follows could give back the chapter just opened.
     touchChapter(b.key, target);
     void refreshOffline().then(() => trimBehind(b.key, target));
+    void prepareNextRef.current(b, target);
     return true;
-  }, [qc, player, refreshOffline, trimBehind, openSeq]);
+  }, [qc, player, refreshOffline, trimBehind, openSeq, claimOpen, showWords]);
+
+  /**
+   * Work out, while this chapter plays, what the next one plays from - so the
+   * player can carry on into it inside the `ended` event, on the same element,
+   * with no network in between. See `Player.prepareNext`, and iOS, which is the
+   * reason. Its words are kept too, so the page can follow the audio without a
+   * fetch either.
+   *
+   * Asked again whenever the answer may have changed: the next chapter was
+   * packed on the server, or finished downloading here.
+   */
+  const nextWordsRef = useRef<{key: string; ci: number; text: ChapterWords} | null>(null);
+  const prepareNext = useCallback(async (b: OpenBook, ci: number) => {
+    const next = ci + 1;
+    const still = () => bookRef.current?.key === b.key && ciRef.current === ci;
+    if (next >= chaptersRef.current.length) { player?.prepareNext(null); return; }
+    const text = await loadChapterText(
+      textSources(qc, b.key, next), next, shardOf(indexRef.current, b.key, next), true);
+    if (!text || !still()) return;
+    const manifest = await loadManifest(qc, b.key, next, text.chunks.length);
+    const downloaded = (await cachedChapters(b.key)).has(next);
+    if (!still()) return;
+    nextWordsRef.current = {key: b.key, ci: next, text};
+    player?.prepareNext({
+      key: b.key, ci: next, chunkCount: text.chunks.length, manifest,
+      packed: !!manifest, downloaded, startChunk: 0,
+    });
+  }, [qc, player]);
+  const prepareNextRef = useRef(prepareNext);
+  prepareNextRef.current = prepareNext;
+
+  /**
+   * The player has already carried on into chapter `target`; catch the page up.
+   *
+   * Everything `openChapter` does except the one thing that must not happen
+   * here, which is `player.open()`: the audio is playing, on the element that
+   * holds the audio session, and resetting it is what used to stop the book at
+   * every chapter boundary with the screen off.
+   */
+  const onAdvance = useCallback(async (target: number) => {
+    const b = bookRef.current;
+    if (!b) return;
+    setCi(target);
+    ciRef.current = target;
+    setIdxState(0);
+    idxRef.current = 0;
+    const attempt = openSeq.begin();
+    const held = nextWordsRef.current;
+    const text = held && held.key === b.key && held.ci === target
+      ? held.text
+      : await loadChapterText(
+        textSources(qc, b.key, target), target, shardOf(indexRef.current, b.key, target), true);
+    if (!attempt.current()) return;
+    attempt.settle();
+    if (!text) { setMessage('this chapter is not on the device'); return; }
+    showWords(text);
+    rememberDevicePos(b.path, target, idxRef.current);
+    player?.setMedia(b.title, text.title);
+    // Not a claim: nobody chose this, the book simply went on.
+    lastWriteRef.current = Date.now();
+    void tellOpen(b.key, target, idxRef.current).catch(() => {});
+    touchChapter(b.key, target);
+    void refreshOffline().then(() => trimBehind(b.key, target));
+    void prepareNext(b, target);
+  }, [qc, player, openSeq, refreshOffline, trimBehind, prepareNext, showWords]);
+  advanceRef.current = (ci) => void onAdvance(ci);
 
   const goChapter = useCallback((d: number) => {
     const next = ciRef.current + d;
-    if (next < 0 || next >= chapters.length) return;
+    if (next < 0 || next >= chaptersRef.current.length) return;
     const wasPlaying = player?.playing ?? false;
-    void openChapter(next, 0).then(() => { if (wasPlaying) void player?.play(); });
-  }, [chapters.length, openChapter, player]);
+    const b = bookRef.current;
+    // Forward, playing, and already worked out: the same hand-off the end of a
+    // chapter makes, so a lock-screen "next" works with the screen off too.
+    if (d === 1 && wasPlaying && b && player?.preparedFor(b.key, next) && player.advance()) return;
+    void openChapter(next, 0).then((ok) => { if (ok && wasPlaying) void player?.play(); });
+  }, [openChapter, player]);
+  const goChapterRef = useRef(goChapter);
   goChapterRef.current = goChapter;
+
+  /* The end of a chapter that nothing was prepared for. At the last chapter
+     there is nowhere to go, and the book has finished: say so, rather than
+     leaving the bar on "pause" over silence. */
+  chapterEndRef.current = () => {
+    const next = ciRef.current + 1;
+    if (next >= chaptersRef.current.length) { player?.pause(); return; }
+    // The slow way, and not a claim: the book going on is nobody's choice.
+    const wasPlaying = player?.playing ?? false;
+    void openChapter(next, 0, {claim: false})
+      .then((ok) => { if (ok && wasPlaying) void player?.play(); });
+  };
 
   const openBook = useCallback(async (b: BookFile & {key?: string}) => {
     const lib = readLib();
@@ -778,10 +987,17 @@ export function NarratorProvider({children}: {children: ReactNode}) {
        every way out of here has to release it or the reading view keeps its
        skeleton. */
     const attempt = openSeq.begin();
+    /* And the book itself has a turn. `attempt` cannot say whether another book
+       was tapped meanwhile - the fast open below takes it over by design - so
+       without this, tapping two books quickly left the reader on whichever
+       `/api/load` answered last, the first one as often as not. */
+    const mine = ++bookSeqRef.current;
+    const stale = () => mine !== bookSeqRef.current;
     setChunks([]);
     setParas(null);
     setMessage(null);
     setMoved(null);
+    untoldRef.current = null;
 
     const queuedFor = async (name: string) =>
       (await db.allPositions()).find((p) => p.book === name) ?? null;
@@ -792,6 +1008,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
        still wins if it is newer; it only moves the page if the reader has not
        already moved it themselves. */
     let fast: Resume | null = null;
+    let deviceMs: number | null = null;
     if (entry) {
       const known: OpenBook = {path: entry.path, name: entry.name, key: entry.key,
                                title: entry.title};
@@ -808,22 +1025,30 @@ export function NarratorProvider({children}: {children: ReactNode}) {
         staleTime: Infinity,
         retry: awaitedRetry,
       }).catch(() => undefined);
+      if (stale()) return;
+      deviceMs = readDevicePos(known.path)?.at ?? null;
       const want = resolveResume({
         queued: await queuedFor(known.name), device: readDevicePos(known.path),
       });
+      if (stale()) return;
       // Only if this device knows where he was. Opening a book it has never read
       // at chapter one, to yank it to chapter 576 ten seconds later, would be a
       // worse thing to look at than the skeleton.
       if (want.from !== 'none') {
-        fast = clampResume(want, entry.chapters.length,
-                           entry.chapters.find((c) => c.i === want.chapter)?.n);
-        if (await openChapter(fast.chapter, fast.chunk, {cacheOnly: true})) setResumedAt(fast);
-        else fast = null;
+        const f = clampResume(want, entry.chapters.length,
+                              entry.chapters.find((c) => c.i === want.chapter)?.n);
+        fast = f;
+        if (await openChapter(f.chapter, f.chunk, {cacheOnly: true})) setResumedAt(f);
+        // A miss - unless another open took over, which is the reader moving,
+        // and the check below needs to know they did.
+        else if (ciRef.current === f.chapter && idxRef.current === f.chunk) fast = null;
       }
+      if (stale()) return;
     }
 
     try {
       const r = await loadBook(b.path);
+      if (stale()) return;
       entry = {path: b.path, name: b.name, key: r.key, title: r.title,
                chapters: r.chapters, shards: entry?.shards ?? 0};
       lib[r.key] = entry;
@@ -831,6 +1056,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
       server = r.position ?? null;
       void qc.invalidateQueries({queryKey: keys.chapters});
     } catch {
+      if (stale()) return;
       if (!entry) {
         setMessage('offline, and this book was never opened here');
         setBookLoading(false);
@@ -844,29 +1070,43 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     setChapters(entry.chapters);
     setBookLoading(false);
     await refreshOffline();
+    if (stale()) return;
 
     /* Where he stopped. The server's record is the cross-device truth; a position
        still sitting in the outbox is one it cannot know about yet. */
     const want = resolveResume({
       server, queued: await queuedFor(open.name), device: readDevicePos(open.path),
     });
+    if (stale()) return;
     const at = clampResume(want, entry.chapters.length,
                            entry.chapters.find((c) => c.i === want.chapter)?.n);
-    setResumedAt(at);
 
-    // The fast open already put the reader somewhere. Move them only if the
-    // server knows better *and* they have not moved themselves since - but tell
-    // the server where they are either way, or it renders ahead of chapter one.
+    /* The fast open already put the reader somewhere, and said nothing to the
+       server about it. Now there are two answers, and the rule for them is in
+       lib/resume.ts: the page never jumps by itself. Either this device's is
+       the one to keep - tell the server, or it renders somewhere nobody is - or
+       the server knows of reading done elsewhere, and that is *offered*, the
+       same quiet line a live move gets. Until he answers, the server is told
+       nothing: its record is the other device's, and it stays that way until
+       he either follows it or carries on here (`untoldRef`). */
     if (fast) {
-      const untouched = ciRef.current === fast.chapter && idxRef.current === fast.chunk;
-      if (!untouched || (at.chapter === fast.chapter && at.chunk === fast.chunk)) {
-        void tellOpen(open.key, ciRef.current, idxRef.current).catch(() => {});
-        // A no-op: the fast open superseded this attempt and already painted.
-        // Here so that every exit from this function releases the wait.
-        attempt.settle();
-        return;
+      const here = {chapter: ciRef.current, chunk: idxRef.current};
+      const verdict = afterFastOpen({
+        fast, here, at, serverMs: server?.updated_ms ?? null, deviceMs,
+      });
+      if (verdict === 'offer') {
+        untoldRef.current = open.key;
+        setMoved({chapter: at.chapter, chunk: at.chunk});
+      } else {
+        lastWriteRef.current = Date.now();   // /api/open force-writes a position
+        void tellOpen(open.key, here.chapter, here.chunk).catch(() => {});
       }
+      // A no-op: the fast open superseded this attempt and already painted.
+      // Here so that every exit from this function releases the wait.
+      attempt.settle();
+      return;
     }
+    setResumedAt(at);
     await openChapter(at.chapter, at.chunk);
   }, [qc, openChapter, refreshOffline, openSeq]);
 
@@ -955,11 +1195,23 @@ export function NarratorProvider({children}: {children: ReactNode}) {
 
   const toggle = useCallback(() => {
     if (!player) return;
-    if (!player.playing) player.armMediaSession({prev: () => goChapter(-1), next: () => goChapter(1)});
+    if (!player.playing) {
+      // Through the ref, so a lock-screen "next" an hour from now is today's
+      // goChapter and not the one this render happened to hold.
+      player.armMediaSession({prev: () => goChapterRef.current(-1),
+                              next: () => goChapterRef.current(1)});
+    }
     player.toggle();
-    if (player.playing) tellResume();
-    else tellPause();
-  }, [player, goChapter]);
+    if (player.playing) {
+      tellResume();
+      /* Pressing play is the reader choosing this book, here - so the server's
+         one session is taken for it if another device's book holds it, and put
+         where the page is if it was never told (see `claimOpen`). Only then:
+         every other report is passive and leaves the session alone. */
+      const b = bookRef.current;
+      if (b) void claimOpen(b, ciRef.current, idxRef.current).catch(() => {});
+    } else tellPause();
+  }, [player, claimOpen]);
 
   // ------------------------------------------------------------- live updates
   /* The live stream. One connection, opened once for the life of the app: every
@@ -1007,7 +1259,8 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     // Not playing: just go there. This is the phone-down, laptop-up case, and
     // it is the whole reason the feature exists.
     setMoved(null);
-    void openChapterRef.current(verdict.chapter, verdict.chunk);
+    // Not a claim: following another device is not this one choosing a book.
+    void openChapterRef.current(verdict.chapter, verdict.chunk, {claim: false});
   }, []);
 
   /* The other event that is not a refetch: a `hello` that names no book.
@@ -1052,7 +1305,12 @@ export function NarratorProvider({children}: {children: ReactNode}) {
      Cheap when nothing is pending (one IndexedDB read), and the sweep coalesces
      a burst of them into one pass. */
   const onRender = useCallback((ev: RenderEvent) => {
-    if (ev.kind === 'packed') void sweepDownloads();
+    if (ev.kind !== 'packed') return;
+    void sweepDownloads();
+    // The next chapter can now be carried on into as a file, not chunk by chunk.
+    const b = bookRef.current;
+    if (b && (ev.key == null || ev.key === b.key) && ev.chapter === ciRef.current + 1)
+      void prepareNextRef.current(b, ciRef.current);
   }, [sweepDownloads]);
 
   useEffect(() => connectLive(qc, {
@@ -1074,7 +1332,14 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     });
   }, [moved, player]);
 
-  const dismissMoved = useCallback(() => setMoved(null), []);
+  /* Turning the offer down is choosing to stay, and if the offer came from
+     opening the book the server has not been told where "here" is yet. */
+  const dismissMoved = useCallback(() => {
+    setMoved(null);
+    const b = bookRef.current;
+    if (b && untoldRef.current === b.key)
+      void claimOpen(b, ciRef.current, idxRef.current).catch(() => {});
+  }, [claimOpen]);
 
   useEffect(() => () => player?.destroy(), [player]);
 
@@ -1106,19 +1371,31 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   return <NarratorContext.Provider value={value}>{children}</NarratorContext.Provider>;
 }
 
-/** The last position this device opened or reported. */
+/**
+ * The last position this device opened or reported, and when it got there.
+ *
+ * `at` is what lets a book opened here tell "the server has heard from another
+ * device since" from "the server is behind me" (lib/resume.ts `afterFastOpen`).
+ * It moves only when the position does, so re-painting the same spot - the fast
+ * open does exactly that - does not make this device look newer than it is.
+ */
 function rememberDevicePos(path: string, chapter: number, chunk: number): void {
-  try { localStorage.setItem(`narrator.pos:${path}`, JSON.stringify({ci: chapter, idx: chunk})); }
-  catch { /* private mode */ }
+  try {
+    const had = readDevicePos(path);
+    const at = had && had.chapter === chapter && had.chunk === chunk && had.at
+      ? had.at : Date.now();
+    localStorage.setItem(`narrator.pos:${path}`, JSON.stringify({ci: chapter, idx: chunk, at}));
+  } catch { /* private mode */ }
 }
 
-function readDevicePos(path: string): {chapter: number; chunk: number} | null {
+function readDevicePos(path: string): {chapter: number; chunk: number; at?: number} | null {
   try {
     const raw = localStorage.getItem(`narrator.pos:${path}`);
     if (!raw) return null;
-    const p = JSON.parse(raw) as {ci?: number; idx?: number};
+    const p = JSON.parse(raw) as {ci?: number; idx?: number; at?: number};
     if (p?.ci == null) return null;
-    return {chapter: p.ci, chunk: p.idx ?? 0};
+    return {chapter: p.ci, chunk: p.idx ?? 0,
+            at: typeof p.at === 'number' && Number.isFinite(p.at) ? p.at : undefined};
   } catch { return null; }
 }
 

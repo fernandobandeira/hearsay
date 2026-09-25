@@ -68,6 +68,12 @@ export class ChunkPrefetcher {
     return this.map.get(this.key(ci, i))?.state === 'ready';
   }
 
+  /** The blob URL for a chunk already in hand, without waiting for anything. */
+  readyUrl(ci: number, i: number): string | null {
+    const e = this.map.get(this.key(ci, i));
+    return e?.state === 'ready' && e.url ? e.url : null;
+  }
+
   get bytes(): number {
     let n = 0;
     for (const e of this.map.values()) n += e.bytes ?? 0;

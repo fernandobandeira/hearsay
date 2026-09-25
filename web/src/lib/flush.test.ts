@@ -33,7 +33,8 @@ vi.mock('./db', () => ({
   },
 }));
 
-const {flushOutbox, flushPositions} = await import('./flush');
+const {deliverPosition, flushOutbox, flushPositions} = await import('./flush');
+const {DEVICE_HEADER, DEVICE_NAME_HEADER, deviceId, deviceLabel} = await import('./device');
 
 /** node has no FileReader, and the base64 of the blob is not what is under test. */
 class FakeReader {
@@ -249,5 +250,34 @@ describe('draining the position queue', () => {
         ? {ok: false, status: 500} : {ok: true, status: 200})));
     expect(await flushPositions()).toEqual(['B.epub']);
     expect(store.positions.map((p) => p.book)).toEqual(['A.epub']);
+  });
+});
+
+describe('who is posting', () => {
+  /* A position write with no device on it comes back as a `position` event with
+     no device on it, and this device's own echo then reads as another device's
+     move. Both posts name the device, like everything the generated client sends. */
+  const named = (init: unknown) => {
+    const h = new Headers((init as {headers?: HeadersInit}).headers);
+    return [h.get(DEVICE_HEADER), h.get(DEVICE_NAME_HEADER)];
+  };
+
+  test('a position and a memo both carry the device id and label', async () => {
+    const fetch = vi.fn(async (_u: string, _init: unknown) => ({...filed(), ok: true}));
+    vi.stubGlobal('fetch', fetch);
+    store.positions = [{book: 'A.epub', chapter: 1, chunk: 0, ts: 1}];
+    store.memos = [memo()];
+    await flushPositions();
+    await flushOutbox({online: true});
+    expect(fetch.mock.calls.map((c) => c[0])).toEqual(['/api/position', '/api/note']);
+    for (const c of fetch.mock.calls) expect(named(c[1])).toEqual([deviceId(), deviceLabel()]);
+    expect(deviceId()).not.toBe('');
+  });
+
+  test('deliverPosition says whether the server took it', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ok: true, status: 200})));
+    expect(await deliverPosition({book: 'A.epub', chapter: 1, chunk: 0, ts: 1})).toBe(true);
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('offline'); }));
+    expect(await deliverPosition({book: 'A.epub', chapter: 1, chunk: 0, ts: 1})).toBe(false);
   });
 });
