@@ -311,6 +311,16 @@ export async function removeText(key: string): Promise<void> {
  * The audio is what is retried. The manifest and the words are small, and a
  * chapter whose m4a is stored is already the expensive part of the job: they get
  * one attempt each inside the same round.
+ *
+ * **The manifest goes first.** The m4a is what `cachedChapters` counts, so it is
+ * the commit point, and everything the chapter needs to play has to be in place
+ * before it lands. The other order left a window - the app killed between the
+ * two puts, which on a phone is the screen locking - with a chapter that reads
+ * as downloaded, is never fetched again, and has no timeline: offline it will
+ * not seek, and the reading position cannot be mapped onto it. A manifest left
+ * behind by an m4a that never came is harmless by comparison - nothing counts
+ * it, the service worker will not serve it without its audio (web/vite.config.ts)
+ * - and it is taken back out when the download gives up.
  */
 export async function downloadChapter(
   key: string, ci: number,
@@ -324,12 +334,16 @@ export async function downloadChapter(
   const attempts = opts.attempts ?? MAX_RETRIES;
   for (let attempt = 0; ; attempt++) {
     try {
-      const size = await putVerified(audio, chapterAudioUrl(key, ci));
       await put(audio, chapterManifestUrl(key, ci));
       if (text) await put(text, chapterTextUrl(key, ci)).catch(() => 0);
-      return size;
+      return await putVerified(audio, chapterAudioUrl(key, ci));
     } catch (e) {
-      if (attempt >= attempts || !isRetryable(statusOf(e))) throw e;
+      if (attempt >= attempts || !isRetryable(statusOf(e))) {
+        // Only an orphan: a chapter stored by an earlier run keeps its timeline.
+        if (!(await audio.match(chapterAudioUrl(key, ci), MATCH)))
+          await audio.delete(chapterManifestUrl(key, ci), MATCH).catch(() => false);
+        throw e;
+      }
       await wait(attempt);
     }
   }
