@@ -12,7 +12,7 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use super::{err, json_file, ranged, ApiError};
+use super::{err, json_file, ranged, ApiError, AUDIO_CACHE};
 use crate::cache;
 use crate::chapters as pack;
 use crate::state::AppState;
@@ -59,7 +59,14 @@ pub async fn chunk_wav(
     if !p.exists() {
         return err(StatusCode::NOT_FOUND, "not ready");
     }
-    ranged(&headers, method == Method::HEAD, &p, "audio/wav").await
+    ranged(
+        &headers,
+        method == Method::HEAD,
+        &p,
+        "audio/wav",
+        AUDIO_CACHE,
+    )
+    .await
 }
 
 /// The packed chapter: AAC-LC mono 64 kbit/s, 24 kHz, `+faststart`. **Serves
@@ -92,7 +99,14 @@ pub async fn chapter_audio(
     if !p.exists() {
         return err(StatusCode::NOT_FOUND, "not built");
     }
-    ranged(&headers, method == Method::HEAD, &p, "audio/mp4").await
+    ranged(
+        &headers,
+        method == Method::HEAD,
+        &p,
+        "audio/mp4",
+        AUDIO_CACHE,
+    )
+    .await
 }
 
 /// chunk index -> start second for the packed chapter. Without this the m4a is
@@ -114,7 +128,7 @@ pub async fn chapter_manifest(
         return err(StatusCode::NOT_FOUND, "not built");
     };
     let (_, p) = pack::chapter_files(&st.cfg.work, &key_for(&st, &q), ci);
-    json_file(&p, "public, max-age=31536000", "not built").await
+    json_file(&p, AUDIO_CACHE, "not built").await
 }
 
 /// An HLS playlist for the packed chapter, built on first request.
@@ -164,7 +178,9 @@ pub async fn chapter_hls(
                         axum::http::header::CONTENT_TYPE,
                         "application/vnd.apple.mpegurl",
                     ),
-                    (axum::http::header::CACHE_CONTROL, "public, max-age=3600"),
+                    // Re-cut under the same URL whenever the m4a is rebuilt,
+                    // like the segments it lists: see `AUDIO_CACHE`.
+                    (axum::http::header::CACHE_CONTROL, AUDIO_CACHE),
                 ],
                 b,
             )
@@ -196,7 +212,14 @@ pub async fn hls_segment(
     if !p.exists() {
         return err(StatusCode::NOT_FOUND, "no such segment");
     }
-    ranged(&headers, method == Method::HEAD, &p, "video/mp4").await
+    ranged(
+        &headers,
+        method == Method::HEAD,
+        &p,
+        "video/mp4",
+        AUDIO_CACHE,
+    )
+    .await
 }
 
 fn valid_segment(name: &str) -> bool {
