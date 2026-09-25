@@ -124,6 +124,14 @@ pub fn write_wav(path: &Path, samples: &[f32]) -> Result<(), PackError> {
         w.finalize()
             .map_err(|e| PackError::Ffmpeg(format!("wav: {e}")))?;
     }
+    // The rename is only an atom if what it names is already on the disk. Without
+    // this, a power cut or a hard reset can land the rename and not the data —
+    // which leaves a zero-length or truncated `IIIII.wav` under the real name,
+    // the exact file the `.part` exists to prevent, and one that reads as
+    // rendered forever after. `finalize` has flushed hound's buffer into the
+    // kernel; this is what gets it out of the kernel. One fsync per chunk is
+    // nothing against the second or more it took to synthesize.
+    std::fs::File::open(&part)?.sync_all()?;
     std::fs::rename(&part, path)?;
     Ok(())
 }
