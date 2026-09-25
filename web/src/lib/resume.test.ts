@@ -1,5 +1,5 @@
 import {describe, expect, test} from 'vitest';
-import {clampResume, parseUpdated, resolveResume, FUTURE_SLACK_MS} from './resume';
+import {afterFastOpen, clampResume, parseUpdated, resolveResume, FUTURE_SLACK_MS} from './resume';
 
 const NOW = Date.parse('2026-09-11T12:00:00');
 
@@ -98,5 +98,42 @@ describe('clampResume', () => {
 
   test('a book with no chapters resolves to zero', () => {
     expect(clampResume({chapter: 7, chunk: 1, from: 'device'}, 0).chapter).toBe(0);
+  });
+});
+
+describe('afterFastOpen - the page painted, then the server answered', () => {
+  const fast = {chapter: 40, chunk: 3};
+  const server = (chapter: number, chunk: number) => ({chapter, chunk, from: 'server' as const});
+
+  test('the phone read on: offer it, never jump to it', () => {
+    expect(afterFastOpen({fast, here: fast, at: server(44, 0), serverMs: 2, deviceMs: 1}))
+      .toBe('offer');
+    // ahead is enough on its own, whatever the clocks say
+    expect(afterFastOpen({fast, here: fast, at: server(40, 9), serverMs: 1, deviceMs: 2}))
+      .toBe('offer');
+  });
+
+  test('another device moved behind, after this one wrote: still asked, not taken', () => {
+    expect(afterFastOpen({fast, here: fast, at: server(12, 0), serverMs: 5, deviceMs: 1}))
+      .toBe('offer');
+  });
+
+  test('behind and older is this device having read further, later', () => {
+    expect(afterFastOpen({fast, here: fast, at: server(39, 0), serverMs: 1, deviceMs: 5}))
+      .toBe('stay');
+  });
+
+  test('no stamp to compare is a question, not a guess', () => {
+    expect(afterFastOpen({fast, here: fast, at: server(39, 0), serverMs: null, deviceMs: 5}))
+      .toBe('offer');
+    expect(afterFastOpen({fast, here: fast, at: server(39, 0), serverMs: 5}))
+      .toBe('offer');
+  });
+
+  test('agreement, a reader who already moved, and a queued position all stay', () => {
+    expect(afterFastOpen({fast, here: fast, at: server(40, 3)})).toBe('stay');
+    expect(afterFastOpen({fast, here: {chapter: 41, chunk: 0}, at: server(44, 0)})).toBe('stay');
+    expect(afterFastOpen({fast, here: fast, at: {chapter: 44, chunk: 0, from: 'queued'}}))
+      .toBe('stay');
   });
 });

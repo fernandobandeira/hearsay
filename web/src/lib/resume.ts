@@ -85,6 +85,39 @@ export function resolveResume(
   return {chapter: 0, chunk: 0, from: 'none'};
 }
 
+interface Spot {chapter: number; chunk: number}
+const same = (a: Spot, b: Spot) => a.chapter === b.chapter && a.chunk === b.chunk;
+
+/**
+ * The fast open painted `fast` from this device alone; `/api/load` has since
+ * resolved `at`. Stay where the page is, or ask?
+ *
+ * Never "jump", which is what it used to do: a book opened on the laptop sat on
+ * the page it painted from localStorage for a second and then leapt to where the
+ * phone had got to - or, worse, the fast open had already told the server this
+ * device's stale position and written it over the phone's newer one, so nothing
+ * moved at all and the phone's progress was simply gone. He wants to be asked.
+ *
+ *   the reader already moved      stay: that was a choice, and it is theirs
+ *   the server agrees             stay
+ *   not the server's record       stay: a queued position is this device's own
+ *   ahead of the page, or newer   offer - someone read on somewhere else
+ *   than this device's last write
+ *   behind, and older             stay: this device read further, later
+ *
+ * `serverMs` is the record's `updated_ms`, `deviceMs` when this device last
+ * stored its own position. Either missing means "cannot tell", which offers:
+ * asking is the recoverable mistake.
+ */
+export function afterFastOpen({fast, here, at, serverMs, deviceMs}: {
+  fast: Spot; here: Spot; at: Resume; serverMs?: number | null; deviceMs?: number | null;
+}): 'stay' | 'offer' {
+  if (!same(here, fast) || same(at, fast) || at.from !== 'server') return 'stay';
+  const ahead = at.chapter !== fast.chapter ? at.chapter > fast.chapter : at.chunk > fast.chunk;
+  const newer = serverMs == null || deviceMs == null || serverMs > deviceMs;
+  return ahead || newer ? 'offer' : 'stay';
+}
+
 /** Keep a resolved position inside a book that may have been re-chunked. */
 export function clampResume(r: Resume, chapters: number, chunksInChapter?: number): Resume {
   const chapter = chapters > 0 ? Math.min(r.chapter, chapters - 1) : 0;
