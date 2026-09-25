@@ -351,6 +351,7 @@ fn next_idle(
     cur_key: &str,
     cur_plan: &Arc<Vec<crate::book::Chapter>>,
     from: usize,
+    plans: &mut Plans,
 ) -> Option<Idle> {
     // 1. The rest of the book in front of the reader. It is the one they are
     //    most likely to want next, and its plan is already in memory.
@@ -378,7 +379,7 @@ fn next_idle(
         // Raw, never through the parse cache: most of these books are not
         // loaded, their epubs may have moved, and the chunks on disk correspond
         // to this plan whatever has happened to the file they came from.
-        let Some(plan) = crate::plancache::read_raw(&st.cfg.work, &b.key) else {
+        let Some(plan) = plans.get(st, &b.key) else {
             continue;
         };
         let from = resume_chapter(st, &b.name).min(plan.len().saturating_sub(1));
@@ -399,6 +400,50 @@ fn next_idle(
 /// library cannot turn one loop iteration into a thousand plan reads.
 const IDLE_BOOKS: usize = 20;
 
+/// Plans of books the session is not holding, read off `plan.json` and kept.
+///
+/// Reading one is 0.30 s on the 1433-chapter book, and both branches that work
+/// on other books ask on every pass of the loop — `next_elsewhere` once per
+/// chunk rendered, `next_idle` once a second when there is nothing else to do.
+/// Each entry remembers the file's mtime and length and is re-read the moment
+/// either moves, so `narrator migrate` rewriting a plan is picked up on the next
+/// pass rather than never; a `stat` per book per pass is the whole cost of
+/// asking.
+///
+/// Bounded, because a plan is the whole text of a book: a handful of recent
+/// books is what the branches actually walk, and anything past that is read
+/// again rather than held.
+#[derive(Default)]
+struct Plans {
+    held: std::collections::HashMap<String, (Option<std::time::SystemTime>, u64, Plan)>,
+}
+
+type Plan = Arc<Vec<crate::book::Chapter>>;
+
+const PLANS_HELD: usize = 8;
+
+impl Plans {
+    fn get(&mut self, st: &AppState, key: &str) -> Option<Plan> {
+        let md = std::fs::metadata(cache::plan_path(&st.cfg.work, key)).ok()?;
+        let stamp = (md.modified().ok(), md.len());
+        if let Some((m, l, p)) = self.held.get(key) {
+            if (*m, *l) == stamp {
+                return Some(p.clone());
+            }
+        }
+        let plan = crate::plancache::read_raw(&st.cfg.work, key)?;
+        st.plan_reads.fetch_add(1, Ordering::Relaxed);
+        if self.held.len() >= PLANS_HELD && !self.held.contains_key(key) {
+            // No recency to speak of is worth tracking at this size: dropping
+            // the lot costs one re-read per book on the next pass.
+            self.held.clear();
+        }
+        self.held
+            .insert(key.to_string(), (stamp.0, stamp.1, plan.clone()));
+        Some(plan)
+    }
+}
+
 /// A standing order on a book the session is **not** holding.
 ///
 /// `next_queued` above covers the loaded book, because that is where the
@@ -415,28 +460,15 @@ const IDLE_BOOKS: usize = 20;
 /// Completion is still disk truth — an order whose chunks all exist simply
 /// leaves the list the first time this looks at it, exactly as `next_queued`
 /// does for the loaded book.
-fn next_elsewhere(
-    st: &Arc<AppState>,
-    cur_key: &str,
-    plans: &mut Option<(String, Arc<Vec<crate::book::Chapter>>)>,
-) -> Option<Idle> {
+fn next_elsewhere(st: &Arc<AppState>, cur_key: &str, plans: &mut Plans) -> Option<Idle> {
     for (key, items) in crate::wishlist::all_outstanding(st) {
         if key == cur_key {
             continue; // `next_queued` owns this one.
         }
         // Reading `plan.json` is 0.30 s on the 1433-chapter book, and this runs
-        // once per chunk rendered. Holding the last one read is what keeps that
-        // from being the dominant cost of the branch: an order is worked through
-        // one book at a time, so the cache hits on every iteration but the first.
-        let plan = match plans {
-            Some((k, p)) if *k == key => p.clone(),
-            _ => {
-                let Some(p) = crate::plancache::read_raw(&st.cfg.work, &key) else {
-                    continue;
-                };
-                *plans = Some((key.clone(), p.clone()));
-                p
-            }
+        // once per chunk rendered. See `Plans`.
+        let Some(plan) = plans.get(st, &key) else {
+            continue;
         };
         for it in items {
             if it.parked {
@@ -671,9 +703,12 @@ fn worker(st: Arc<AppState>) {
     // has already been logged — once per spell, not once a second.
     let mut measured: Option<Instant> = None;
     let mut said_full = false;
-    // The last foreign plan read, so a standing order on another book does not
-    // cost a `plan.json` parse per chunk. See `next_elsewhere`.
-    let mut plans: Option<(String, Arc<Vec<crate::book::Chapter>>)> = None;
+    // Foreign plans already read, so a standing order on another book does not
+    // cost a `plan.json` parse per chunk. See `Plans`.
+    let mut plans = Plans::default();
+    // When the speculative branch last looked across the library and found
+    // nothing, and where the reader was when it did. See branch 6.
+    let mut dry: Option<(Instant, String, usize, usize)> = None;
     let mut bo = Backoff::default();
     let mut parked: Option<Instant> = None;
     while !st.stop.load(Ordering::SeqCst) {
@@ -880,8 +915,29 @@ fn worker(st: Arc<AppState>) {
                     gc(&st);
                     measured = Some(Instant::now());
                 }
-                let target = if room_to_speculate(&st) {
-                    next_idle(&st, &key, &plan, ci + span + 1)
+                // A pass that found nothing is not repeated every second. With
+                // the whole library rendered it was: a `stat` per chapter of this
+                // book and a plan read and a `stat` per chapter of every recent
+                // one, once a second for as long as the box stayed finished —
+                // on the A1, a core's steady background hum to learn nothing
+                // new. What can make the answer change is the reader moving (a
+                // load, an open, a playhead — each of which moves `key`, `ci`
+                // or `ph` and is looked at again at once), or the library
+                // growing under it, which can wait for the next re-measure.
+                // Orders are not affected: branches 3 and 3b run before this on
+                // every pass.
+                let looked = dry.as_ref().is_some_and(|(t, k, c, p)| {
+                    t.elapsed() < IDLE_MEASURE_EVERY && *k == key && *c == ci && *p == ph
+                });
+                let target = if looked {
+                    None
+                } else if room_to_speculate(&st) {
+                    let t = next_idle(&st, &key, &plan, ci + span + 1, &mut plans);
+                    dry = match t {
+                        Some(_) => None,
+                        None => Some((Instant::now(), key.clone(), ci, ph)),
+                    };
+                    t
                 } else {
                     if !said_full {
                         said_full = true;

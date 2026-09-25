@@ -561,3 +561,84 @@ async fn an_order_placed_from_the_library_can_be_taken_back() {
     assert_eq!(code, axum::http::StatusCode::OK, "{body}");
     assert!(outstanding(&other_key).is_empty(), "{body}");
 }
+
+/// A library of two books, every chunk of both on disk, the worker settled on
+/// the first. Returns the other book's key.
+async fn finished_library(h: &Harness) -> String {
+    let other = h.add_book("Shelved (2026).epub");
+    let (code, loaded) = h.post_json("/api/load", json!({"path": other})).await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{loaded}");
+    let other_key = loaded["key"].as_str().unwrap_or_default().to_string();
+    let plan = narrator::plancache::read_raw(&h.work(), &other_key).expect("plan");
+    for (ci, ch) in plan.iter().enumerate() {
+        seed_chapter(h, &other_key, ci, ch.chunks.len(), 2400);
+    }
+    h.load().await;
+    let key = key_of(h);
+    for (ci, n) in chapters_of(h).into_iter().enumerate() {
+        seed_chapter(h, &key, ci, n, 2400);
+    }
+    h.post_json("/api/open", json!({"chapter": 0, "chunk": 0}))
+        .await;
+    until("the worker to settle", 20.0, || {
+        h.state.session().status == "ready"
+    })
+    .await;
+    other_key
+}
+
+#[tokio::test]
+async fn a_finished_library_is_not_re_read_every_second() {
+    // With nothing left anywhere, the speculative branch used to walk the whole
+    // shelf once a second — a `plan.json` parse per recent book (0.30 s for the
+    // 1433-chapter one on its own) and a `stat` per chapter of each — for as
+    // long as the box stayed finished.
+    let h = Harness::with(|c| {
+        c.lookahead = 4;
+        c.prerender_chapters = 0;
+    })
+    .await;
+    finished_library(&h).await;
+    // One more tick, so the first dry pass is behind us.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let reads = || {
+        h.state
+            .plan_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let before = reads();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        reads(),
+        before,
+        "the shelf was re-read while nothing changed"
+    );
+}
+
+#[tokio::test]
+async fn the_reader_moving_ends_the_backoff_at_once() {
+    // The other half: standing down after a dry pass must not mean standing down
+    // after the reader does something. A hole appears in the other book; while
+    // nothing moves, it waits for the next re-measure (a minute) — speculation
+    // outranks nothing, and that includes waiting. The moment the playhead
+    // moves, the library is looked at again.
+    let h = Harness::with(|c| {
+        c.lookahead = 4;
+        c.prerender_chapters = 0;
+    })
+    .await;
+    let other_key = finished_library(&h).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let hole = cache::chunk_path(&h.work(), &other_key, 0, 0);
+    std::fs::remove_file(&hole).expect("punch a hole");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(!hole.exists(), "the dry pass was repeated within seconds");
+
+    let (code, body) = h.post_json("/api/playhead", json!({"chunk": 1})).await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{body}");
+    until("the hole to be filled once the reader moved", 20.0, || {
+        hole.exists()
+    })
+    .await;
+}

@@ -224,6 +224,12 @@ pub struct AppState {
     /// rather than a guess, and it is what the backoff test asserts against.
     pub render_attempts: AtomicU64,
 
+    /// Every `plan.json` of another book the worker has had to read. The same
+    /// kind of number as `render_attempts` and for the same reason: "a finished
+    /// library does not re-read the shelf once a second" is a claim about a
+    /// count, and this is the count.
+    pub plan_reads: AtomicU64,
+
     /// When a chunk last landed on disk — `/healthz` turns a renderer that has
     /// silently wedged into a 503 a systemd timer can act on.
     pub progress_at: Mutex<Instant>,
@@ -321,6 +327,7 @@ impl AppState {
             render_started: AtomicBool::new(false),
             build_started: AtomicBool::new(false),
             render_attempts: AtomicU64::new(0),
+            plan_reads: AtomicU64::new(0),
             progress_at: Mutex::new(Instant::now()),
             started_at: Instant::now(),
             chstat: Mutex::new(None),
