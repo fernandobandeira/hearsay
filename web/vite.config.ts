@@ -92,6 +92,16 @@ export default defineConfig({
             // entries are put there deliberately by the download action; this
             // rule is what serves them back (Range included - Workbox's
             // rangeRequests plugin slices the cached body).
+            //
+            // **Read-only.** It used to write as well: every manifest a
+            // *streamed* chapter asked for went into this cache on the way
+            // past, and CacheFirst then answered from that copy for good - so a
+            // chapter re-rendered or re-packed later kept the old chunk->time
+            // map, and the page followed the wrong words. Only lib/offline.ts
+            // writes here now (`cacheWillUpdate` refusing everything), and a
+            // manifest is only served while its audio is here too, so one left
+            // behind by a download that never finished cannot answer for a
+            // chapter that is streaming.
             urlPattern: ({url, request}) => request.headers.get('x-narrator-store') !== '1'
               && /^\/api\/chapters\/\d+\.(m4a|json)$/.test(url.pathname),
             handler: 'CacheFirst',
@@ -99,7 +109,21 @@ export default defineConfig({
               cacheName: 'narrator-audio',
               matchOptions: {ignoreVary: true},
               rangeRequests: true,
-              cacheableResponse: {statuses: [200]},
+              plugins: [{
+                cacheWillUpdate: async () => null,
+                cachedResponseWillBeUsed: async ({cacheName, request, cachedResponse}) => {
+                  if (!cachedResponse || !/\.json$/.test(new URL(request.url).pathname))
+                    return cachedResponse;
+                  const audio = request.url.replace(/\.json(\?|$)/, '.m4a$1');
+                  // Serialised into the service worker, where `caches` exists;
+                  // this config is typechecked without the DOM lib.
+                  const store = (globalThis as unknown as {caches: {open: (n: string) =>
+                    Promise<{match: (u: string, o: object) => Promise<unknown>}>}}).caches;
+                  const held = await (await store.open(cacheName))
+                    .match(audio, {ignoreVary: true});
+                  return held ? cachedResponse : null;
+                },
+              }],
             },
           },
         ],
