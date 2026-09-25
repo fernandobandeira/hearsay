@@ -404,7 +404,7 @@ async fn an_order_on_another_book_is_packed_as_well_as_rendered() {
     // on the 1433-chapter book is 0.30 s *per chunk rendered*.
     //
     // Deliberately not asserted by catching the job mid-flight in
-    // `pack_elsewhere`: with no ffmpeg the encode fails immediately and the job
+    // `pack_queue`: with no ffmpeg the encode fails immediately and the job
     // is gone before a poll could see it, and a test that races is a test that
     // will fail on somebody else's machine for no reason.
     until("the order to be retired by the packer", 30.0, || {

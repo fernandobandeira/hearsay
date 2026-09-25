@@ -36,11 +36,13 @@ fn plan(n: usize) -> Arc<Vec<Chapter>> {
 /// queues.
 fn load(st: &AppState, book: &str) {
     let mut s = st.session();
+    let old = s.key();
+    s.pack_queue
+        .retain(|j| old.as_deref() != Some(j.key.as_str()));
     s.book = Some(book.into());
     s.plan = plan(10);
     s.queue.clear();
     s.build_want.clear();
-    s.pack_queue.clear();
 }
 
 fn state() -> (tempfile::TempDir, Arc<AppState>) {
@@ -236,7 +238,7 @@ async fn over_http_a_library_order_is_there_when_the_book_is_opened() {
     let owed: Vec<usize> = q
         .iter()
         .copied()
-        .chain(s.pack_queue.iter().copied())
+        .chain(s.loaded_pack_queue())
         .chain(s.build_want.iter().copied())
         .collect();
     drop(s);

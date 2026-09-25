@@ -24,6 +24,35 @@ use crate::stt::Whisper;
 use crate::tts::Engine;
 use crate::vault::Positions;
 
+/// One chapter of one book.
+///
+/// A bare chapter number means "of the loaded book", and that reading is only
+/// safe while the loaded book cannot change under it. The packer's work outlives
+/// a load — it packs standing orders on books nobody has open — so its queue and
+/// its in-flight job carry the book with the chapter, and chapter 7 of one novel
+/// cannot be mistaken for chapter 7 of another.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ChapterRef {
+    pub key: String,
+    pub ci: usize,
+}
+
+impl ChapterRef {
+    pub fn new(key: impl Into<String>, ci: usize) -> Self {
+        Self {
+            key: key.into(),
+            ci,
+        }
+    }
+}
+
+/// `key/chNNN`, the tag the packed-chapter gc keys its keep list by.
+impl std::fmt::Display for ChapterRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/ch{:03}", self.key, self.ci)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Session {
     pub status: String,
@@ -45,36 +74,22 @@ pub struct Session {
     pub queue: Vec<usize>,
     /// Chapters that should be packed once rendered.
     pub build_want: BTreeSet<usize>,
-    /// Chapters waiting for the packer, and the one it is on.
-    pub pack_queue: Vec<usize>,
-    /// The same, for chapters of a book this session is **not** holding.
+    /// Chapters waiting for the packer, of any book, in the order asked.
     ///
-    /// A separate list rather than a key on `pack_queue`, for one reason:
-    /// `pack_queue` is in `/api/status` as a list of chapter numbers and that is
-    /// a frozen shape. This is additive beside it.
-    ///
-    /// It exists because a standing order outlives the book being loaded. Order
-    /// seventy-four chapters, then open something else: the renderer follows
-    /// them (see `next_elsewhere`), and without this the packer could not, so a
-    /// night of rendering would produce no files at all until that book was
-    /// opened again — which is the exact bug `pack: true` was introduced to fix,
-    /// one level up.
-    pub pack_elsewhere: Vec<(String, usize)>,
-    /// The chapter of the **loaded** book the packer is on, and nothing else.
-    ///
-    /// It is in `/api/status` and `/api/chapters` as a bare chapter number, and
-    /// every reader of it — the drawer's `packing` flag, the cancel that leaves an
-    /// encode in flight alone — reads it as a chapter of the book in front of it.
-    /// A foreign job used to be written here too, so chapter 7 of a book nobody
-    /// had open showed as packing on chapter 7 of the one somebody did. That job
-    /// is in [`Session::packing`] instead.
-    pub building: Option<usize>,
+    /// Each names its book, because a standing order outlives the book being
+    /// loaded: order seventy-four chapters, then open something else, and the
+    /// renderer follows them (see `next_elsewhere`) — so the packer has to be
+    /// able to as well, or a night of rendering produces no files until that
+    /// book is opened again. `/api/status` shows the loaded book's share of it
+    /// as bare chapter numbers, which is [`Session::loaded_pack_queue`].
+    pub pack_queue: Vec<ChapterRef>,
     /// The job the packer is on, whichever book it belongs to.
     ///
-    /// The book-qualified twin of `building`, and the one the gc reads: the chunk
-    /// wavs of a chapter being encoded are the encode's *input*, and protecting
-    /// "chapter 7" of the wrong book is protecting nothing.
-    pub packing: Option<(String, usize)>,
+    /// The gc reads this one: the chunk wavs of a chapter being encoded are the
+    /// encode's *input*. `/api/status`, `/api/chapters` and `/healthz` show it
+    /// as a bare chapter number of the loaded book, which is
+    /// [`Session::building`].
+    pub packing: Option<ChapterRef>,
     pub build_error: Option<String>,
 }
 
@@ -105,6 +120,34 @@ impl Session {
         })
     }
 
+    /// Is this chapter one of the loaded book's?
+    pub fn is_loaded(&self, c: &ChapterRef) -> bool {
+        self.key().as_deref() == Some(c.key.as_str())
+    }
+
+    /// The chapter of the **loaded** book the packer is on, and nothing else.
+    ///
+    /// In `/api/status`, `/api/chapters` and `/healthz` as a bare chapter
+    /// number, and every reader of it — the drawer's `packing` flag, the cancel
+    /// that leaves an encode in flight alone — reads it as a chapter of the book
+    /// in front of it. A job on any other book is `None` here.
+    pub fn building(&self) -> Option<usize> {
+        self.packing
+            .as_ref()
+            .filter(|c| self.is_loaded(c))
+            .map(|c| c.ci)
+    }
+
+    /// The loaded book's chapters waiting for the packer, in queue order.
+    pub fn loaded_pack_queue(&self) -> Vec<usize> {
+        let key = self.key();
+        self.pack_queue
+            .iter()
+            .filter(|c| key.as_deref() == Some(c.key.as_str()))
+            .map(|c| c.ci)
+            .collect()
+    }
+
     /// How many chapters past `ci` the worker should build. An hours target set
     /// from the UI wins over the static `PRERENDER_CHAPTERS`; the span is however
     /// many chapters the estimator says those hours are.
@@ -132,10 +175,10 @@ impl Session {
     /// holding; that lives in the store, and [`AppState::gc_keep`] adds it.
     pub fn gc_keep(&self, cfg: &Config) -> HashSet<PathBuf> {
         let mut keep = HashSet::new();
-        // Not behind the loaded-book check below: a foreign pack is the one job
-        // that does not need a book loaded at all, and its chunks are its input.
-        for (k, c) in self.pack_elsewhere.iter().chain(self.packing.iter()) {
-            keep.insert(cache::chapter_dir(&cfg.work, k, *c));
+        // Not behind the loaded-book check below: a pack is the one job that
+        // does not need a book loaded at all, and its chunks are its input.
+        for c in self.pack_queue.iter().chain(self.packing.iter()) {
+            keep.insert(cache::chapter_dir(&cfg.work, &c.key, c.ci));
         }
         let Some(key) = self.key() else {
             return keep;
@@ -147,10 +190,6 @@ impl Session {
         }
         let mut pending: BTreeSet<usize> = self.queue.iter().copied().collect();
         pending.extend(self.build_want.iter().copied());
-        pending.extend(self.pack_queue.iter().copied());
-        if let Some(b) = self.building {
-            pending.insert(b);
-        }
         for c in pending {
             if c < n {
                 keep.insert(cache::chapter_dir(&cfg.work, &key, c));

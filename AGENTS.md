@@ -896,8 +896,9 @@ one.
 
 Nothing stood in the way any more. The worker follows standing orders across the
 library (branch 4) and the packer can pack a chapter of a book the session is
-not holding (`Session::pack_elsewhere`). So `/api/chapters/render`,
-`/api/chapters/build` and `/api/chapters/cancel` now act on any book **the
+not holding (every job in `Session::pack_queue` is a `ChapterRef`, naming its
+book). So `/api/chapters/render`, `/api/chapters/build` and
+`/api/chapters/cancel` now act on any book **the
 library knows**, and a 409 means *no such book* — a real refusal rather than a
 limitation wearing one's clothes. `GET /api/chapters` keeps its 409, because it
 is a read and `/api/library` is the endpoint that answers for the whole library.

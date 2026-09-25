@@ -194,6 +194,11 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
         .unwrap_or_default();
     {
         let mut s = st.session();
+        // The book being put down takes its pack jobs with it; a standing order
+        // on it is picked back up from the store by `next_elsewhere`.
+        let old = s.key();
+        s.pack_queue
+            .retain(|j| old.as_deref() != Some(j.key.as_str()));
         s.book = Some(body.path.clone());
         s.title = Some(title.clone());
         s.plan = plan.clone();
@@ -206,7 +211,6 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
         s.queue.clear();
         s.build_want.clear();
         s.build_error = None;
-        s.pack_queue.clear();
     }
 
     // Everything from here to the response is files and sqlite — the wishlist,
@@ -1182,9 +1186,9 @@ pub async fn status(State(st): State<Arc<AppState>>) -> Json<Status> {
         title: s.title.clone(),
         key: s.key(),
         queue: s.queue.clone(),
-        building: s.building,
+        building: s.building(),
         build_error: s.build_error.clone(),
-        pack_queue: s.pack_queue.clone(),
+        pack_queue: s.loaded_pack_queue(),
         pack_want: s.build_want.iter().copied().collect(),
         render_idx: s.render_idx,
         playhead: s.playhead,

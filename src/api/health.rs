@@ -89,7 +89,7 @@ pub async fn healthz(State(st): State<Arc<AppState>>) -> Response {
             s.book_name(),
             want,
             s.queue.len(),
-            s.building,
+            s.building(),
         )
     };
     let mut threads = Vec::new();

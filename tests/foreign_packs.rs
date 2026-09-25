@@ -1,11 +1,11 @@
 //! A pack for a book the session is not holding, and everything it used to get
 //! wrong about the book that *is* loaded.
 //!
-//! The packer grew a second queue (`pack_elsewhere`) so an order placed from the
-//! library could be packed without opening the book. The loaded book's own
-//! bookkeeping — `building`, `pack_queue`, `build_want`, the gc's keep lists —
-//! all hold bare chapter numbers, and each of them was being read or written
-//! with the foreign job's chapter number as if it were the loaded book's.
+//! The packer's queue carries the book with each chapter (`ChapterRef`) so an
+//! order placed from the library can be packed without opening the book. The
+//! loaded book's views of it — `building()`, `loaded_pack_queue()` — and its own
+//! bare-numbered bookkeeping — `build_want`, the gc's keep lists — must never
+//! read a foreign job's chapter number as if it were the loaded book's.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use narrator::book::{Chapter, Chunk};
 use narrator::cache;
 use narrator::config::Config;
-use narrator::state::AppState;
+use narrator::state::{AppState, ChapterRef};
 
 fn plan(n: usize) -> Vec<Chapter> {
     (0..n)
@@ -76,7 +76,22 @@ async fn until(what: &str, timeout_s: f64, mut f: impl FnMut() -> bool) {
 
 fn foreign_done(st: &AppState) -> bool {
     let s = st.session();
-    s.pack_elsewhere.is_empty() && s.packing.is_none()
+    s.pack_queue.is_empty() && s.packing.is_none()
+}
+
+#[test]
+fn a_foreign_job_is_not_the_loaded_books_chapter_of_the_same_number() {
+    let (_d, st) = state(|_| {});
+    load_a(&st);
+    let mut s = st.session();
+    s.packing = Some(ChapterRef::new("B", 7));
+    s.pack_queue.push(ChapterRef::new("B", 8));
+    s.pack_queue.push(ChapterRef::new("A", 3));
+    assert_eq!(s.building(), None, "B's chapter 7 is not A's");
+    assert_eq!(s.loaded_pack_queue(), vec![3]);
+    s.packing = Some(ChapterRef::new("A", 3));
+    assert_eq!(s.building(), Some(3));
+    assert_eq!(ChapterRef::new("A", 3).to_string(), "A/ch003");
 }
 
 #[test]
@@ -85,8 +100,8 @@ fn the_gc_spares_a_foreign_pack_and_a_foreign_order() {
     load_a(&st);
     {
         let mut s = st.session();
-        s.packing = Some(("B".into(), 7));
-        s.pack_elsewhere.push(("B".into(), 8));
+        s.packing = Some(ChapterRef::new("B", 7));
+        s.pack_queue.push(ChapterRef::new("B", 8));
     }
     // A standing order on a third book, placed from the library.
     st.store()
@@ -148,8 +163,8 @@ async fn a_foreign_pack_waits_for_a_stalled_renderer_too() {
     narrator::render::enqueue_build_elsewhere(&st, "B", 3);
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
-        st.session().pack_elsewhere,
-        vec![("B".to_string(), 3)],
+        st.session().pack_queue,
+        vec![ChapterRef::new("B", 3)],
         "the packer took a foreign encode while the renderer was behind"
     );
     // And it goes the moment the renderer catches up.

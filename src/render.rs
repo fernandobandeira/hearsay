@@ -46,7 +46,7 @@ use serde_json::json;
 use crate::book::Chunk;
 use crate::cache;
 use crate::chapters;
-use crate::state::AppState;
+use crate::state::{AppState, ChapterRef};
 
 /// Start the render thread if it is not already running.
 pub fn ensure_render_thread(st: &Arc<AppState>) {
@@ -645,7 +645,7 @@ pub fn autopack(st: &Arc<AppState>, force: bool) -> Option<usize> {
             s.chapter,
             s.plan.clone(),
             s.key(),
-            s.packing.is_some() || !s.pack_queue.is_empty() || !s.queue.is_empty(),
+            s.packing.is_some() || !s.loaded_pack_queue().is_empty() || !s.queue.is_empty(),
         )
     };
     let key = key?;
@@ -667,29 +667,30 @@ pub fn autopack(st: &Arc<AppState>, force: bool) -> Option<usize> {
     None
 }
 
-/// Ask the packer for chapter `ci`'s m4a. Idempotent; starts the thread.
+/// Ask the packer for chapter `ci` of the loaded book. Idempotent; starts the
+/// thread. With nothing loaded there is no book the chapter could be of, and
+/// nothing is queued.
 pub fn enqueue_build(st: &Arc<AppState>, ci: usize) {
-    {
-        let mut s = st.session();
-        if !s.pack_queue.contains(&ci) {
-            s.pack_queue.push(ci);
-        }
-    }
-    st.build_ev.set();
-    ensure_build_thread(st);
+    let Some(key) = st.session().key() else {
+        return;
+    };
+    enqueue_pack(st, ChapterRef::new(key, ci));
 }
 
 /// The same, for a chapter of a book the session is not holding.
 ///
-/// Ranked below `pack_queue` by the builder, which is the right way round: the
-/// book in front of the reader is the one whose file somebody may be waiting
+/// The builder takes the loaded book's jobs first, which is the right way round:
+/// the book in front of the reader is the one whose file somebody may be waiting
 /// for.
 pub fn enqueue_build_elsewhere(st: &Arc<AppState>, key: &str, ci: usize) {
+    enqueue_pack(st, ChapterRef::new(key, ci));
+}
+
+fn enqueue_pack(st: &Arc<AppState>, job: ChapterRef) {
     {
         let mut s = st.session();
-        let job = (key.to_string(), ci);
-        if !s.pack_elsewhere.contains(&job) {
-            s.pack_elsewhere.push(job);
+        if !s.pack_queue.contains(&job) {
+            s.pack_queue.push(job);
         }
     }
     st.build_ev.set();
@@ -1073,12 +1074,10 @@ fn builder(st: Arc<AppState>) {
         // lookahead is 80 chunks and also reports "rendering", and a packer that
         // waited for *that* would never run on this box at all.
         let stalled = st.stalled_for();
-        // Either queue: a foreign encode costs the core exactly what a local one
-        // does, and the listener stalled under the playhead is just as stalled.
-        let pending = {
-            let s = st.session();
-            !s.pack_queue.is_empty() || !s.pack_elsewhere.is_empty()
-        };
+        // Any book's job: a foreign encode costs the core exactly what a local
+        // one does, and the listener stalled under the playhead is just as
+        // stalled.
+        let pending = !st.session().pack_queue.is_empty();
         if stalled > 0.0 && stalled < PACK_HOLD_MAX_S && pending {
             if held.is_none() {
                 held = Some(Instant::now());
@@ -1093,58 +1092,43 @@ fn builder(st: Arc<AppState>) {
                 t.elapsed().as_secs_f64()
             );
         }
-        let Some((ci, plan, key, title)) = ({
+        let Some((job, plan, title)) = ({
             let mut s = st.session();
-            match s.pack_queue.first().copied() {
+            // The loaded book's first: its file is the one somebody may be
+            // waiting for. Then a chapter of some *other* book that somebody
+            // ordered, whose plan is read raw, like everything else that touches
+            // a book this process is not holding.
+            let loaded = s.pack_queue.iter().find(|j| s.is_loaded(j)).cloned();
+            match loaded.or_else(|| s.pack_queue.first().cloned()) {
                 None => {
-                    // Nothing for the loaded book. A chapter of some *other*
-                    // book that somebody ordered is next — see
-                    // `Session::pack_elsewhere` for why that list exists at all.
-                    // Its plan is read raw, like everything else that touches a
-                    // book this process is not holding.
-                    match s.pack_elsewhere.first().cloned() {
+                    st.build_ev.clear();
+                    None
+                }
+                Some(job) if s.is_loaded(&job) => {
+                    s.packing = Some(job.clone());
+                    Some((job, s.plan.clone(), s.title.clone().unwrap_or_default()))
+                }
+                Some(job) => {
+                    drop(s);
+                    match crate::plancache::read_raw(&st.cfg.work, &job.key) {
+                        Some(plan) => {
+                            st.session().packing = Some(job.clone());
+                            Some((job, plan, String::new()))
+                        }
                         None => {
-                            st.build_ev.clear();
+                            // No plan, so nothing that could be packed. Drop it
+                            // rather than spin on it.
+                            tracing::warn!("cannot pack {job}: no plan.json");
+                            st.session().pack_queue.retain(|j| *j != job);
                             None
                         }
-                        Some((k, cj)) => {
-                            drop(s);
-                            match crate::plancache::read_raw(&st.cfg.work, &k) {
-                                Some(plan) => {
-                                    let mut s = st.session();
-                                    s.packing = Some((k.clone(), cj));
-                                    // `building` speaks for the loaded book only.
-                                    // A job ordered from the library for the book
-                                    // that has since been loaded is that book's.
-                                    if s.key().as_deref() == Some(k.as_str()) {
-                                        s.building = Some(cj);
-                                    }
-                                    drop(s);
-                                    Some((cj, plan, k, String::new()))
-                                }
-                                None => {
-                                    // No plan, so nothing that could be packed.
-                                    // Drop it rather than spin on it.
-                                    tracing::warn!("cannot pack {k} ch{cj}: no plan.json");
-                                    st.session()
-                                        .pack_elsewhere
-                                        .retain(|j| j.0 != k || j.1 != cj);
-                                    None
-                                }
-                            }
-                        }
                     }
-                }
-                Some(ci) => {
-                    let key = s.key_or_x();
-                    s.building = Some(ci);
-                    s.packing = Some((key.clone(), ci));
-                    Some((ci, s.plan.clone(), key, s.title.clone().unwrap_or_default()))
                 }
             }
         }) else {
             continue;
         };
+        let (key, ci) = (job.key.clone(), job.ci);
 
         let outcome = match plan.get(ci) {
             None => Err("chapter out of range".to_string()),
@@ -1186,17 +1170,12 @@ fn builder(st: Arc<AppState>) {
         }
         let (cur, cur_key, loaded) = {
             let mut s = st.session();
-            s.building = None;
             s.packing = None;
-            s.pack_elsewhere.retain(|j| *j != (key.clone(), ci));
-            // The loaded book's queues hold bare chapter numbers, so they are
-            // only this job's to clear if this job was the loaded book's. A
-            // foreign chapter 7 finishing used to take chapter 7 of the book in
-            // front of the reader off the pack queue and out of `build_want` —
-            // a download somebody asked for, dropped without a word.
-            let loaded = s.key().as_deref() == Some(key.as_str());
+            s.pack_queue.retain(|j| *j != job);
+            // `build_want` holds bare chapter numbers of the loaded book, so it
+            // is only this job's to clear if this job is the loaded book's.
+            let loaded = s.is_loaded(&job);
             if loaded {
-                s.pack_queue.retain(|c| *c != ci);
                 s.build_want.remove(&ci);
             }
             (s.chapter, s.key(), loaded)
@@ -1222,7 +1201,7 @@ fn builder(st: Arc<AppState>) {
         // and it belongs to the loaded book — not to whichever book this job
         // happened to be for. Nothing loaded, nothing to spare.
         let keep: HashSet<String> = cur_key
-            .map(|k| format!("{k}/ch{cur:03}"))
+            .map(|k| ChapterRef::new(k, cur).to_string())
             .into_iter()
             .collect();
         chapters::gc(&st.cfg, &keep);

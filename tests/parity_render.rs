@@ -544,12 +544,12 @@ async fn a_transcription_holds_back_a_new_pack() {
     assert_eq!(code, StatusCode::OK, "{body}");
     tokio::time::sleep(Duration::from_millis(900)).await;
     assert_eq!(
-        h.state.session().building,
+        h.state.session().building(),
         None,
         "no encode may start while a memo is being transcribed"
     );
     // The request was accepted and is still waiting, not dropped.
-    assert!(h.state.session().pack_queue.contains(&0));
+    assert!(h.state.session().loaded_pack_queue().contains(&0));
 
     drop(busy);
     if which("ffmpeg").is_none() {
@@ -660,12 +660,12 @@ async fn a_pack_holds_back_while_the_renderer_is_stalled_under_the_playhead() {
     assert_eq!(body["packing"], json!([1]), "complete, so queued to pack");
     tokio::time::sleep(Duration::from_millis(900)).await;
     assert_eq!(
-        h.state.session().building,
+        h.state.session().building(),
         None,
         "no encode while the reader is waiting on a chunk"
     );
     assert!(
-        h.state.session().pack_queue.contains(&1),
+        h.state.session().loaded_pack_queue().contains(&1),
         "held back, not dropped"
     );
 
@@ -678,7 +678,7 @@ async fn a_pack_holds_back_while_the_renderer_is_stalled_under_the_playhead() {
     .await;
     until("the packer to take it", 40.0, || {
         let s = h.state.session();
-        s.building == Some(1) || !s.pack_queue.contains(&1)
+        s.building() == Some(1) || !s.loaded_pack_queue().contains(&1)
     })
     .await;
 }

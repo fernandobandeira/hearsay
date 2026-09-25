@@ -355,8 +355,8 @@ fn snapshot(s: &Session, w: &Wishlist) -> Option<Saved> {
             false,
         );
     }
-    for c in &s.pack_queue {
-        push(&mut items, &mut seen, w, *c, true, false);
+    for c in s.loaded_pack_queue() {
+        push(&mut items, &mut seen, w, c, true, false);
     }
     for c in &s.build_want {
         push(&mut items, &mut seen, w, *c, true, false);
@@ -1073,7 +1073,13 @@ mod tests {
         let st = state(d.path());
         // What `/api/chapters/build` does with a chapter that is already
         // rendered: straight to the packer, never through the queue.
-        st.session().pack_queue.push(2);
+        {
+            let mut s = st.session();
+            let key = s.key_or_x();
+            s.pack_queue.push(crate::state::ChapterRef::new(key, 2));
+            // Another book's job is not this book's order.
+            s.pack_queue.push(crate::state::ChapterRef::new("Other", 5));
+        }
         save(&st);
         assert_eq!(
             items(&st),

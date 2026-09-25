@@ -226,7 +226,8 @@ pub async fn chapters_list(
     // nothing was ever asked for.
     let parked = st.wishlist().parked();
     let s = st.session();
-    let (queue, want, bq) = (s.queue.clone(), s.build_want.clone(), s.pack_queue.clone());
+    let (queue, want, bq) = (s.queue.clone(), s.build_want.clone(), s.loaded_pack_queue());
+    let building = s.building();
     let total = rows.len();
     let from = range.from.unwrap_or(0).min(total.saturating_sub(1));
     let to = range
@@ -238,7 +239,7 @@ pub async fn chapters_list(
         .filter(|r| r.i >= from && r.i <= to)
         .map(|mut r| {
             r.queued = queue.contains(&r.i);
-            r.packing = s.building == Some(r.i);
+            r.packing = building == Some(r.i);
             r.pack_queued = bq.contains(&r.i) || want.contains(&r.i);
             r.parked = parked.contains(&r.i).then_some(true);
             r
@@ -251,7 +252,7 @@ pub async fn chapters_list(
         chapter: Some(s.chapter),
         chapters: rows,
         queue: Some(queue),
-        building: Some(s.building),
+        building: Some(building),
         build_error: Some(s.build_error.clone()),
         chapters_gb: Some(round3(chapter_bytes as f64 / 1024.0_f64.powi(3))),
         chapters_cap_gb: Some(st.cfg.max_chapter_gb),
@@ -697,14 +698,9 @@ fn cancel_elsewhere(st: &Arc<AppState>, key: &str, body: &ChapterSetBody) -> Opt
     };
     {
         let mut s = st.session();
-        // `packing` rather than `building`: the in-flight job may be this book's,
-        // and `building` only ever names the loaded one.
         let inflight = s.packing.clone();
-        s.pack_elsewhere.retain(|(k, c)| {
-            k != key
-                || !dropped.contains(c)
-                || inflight.as_ref().is_some_and(|(pk, pc)| pk == k && pc == c)
-        });
+        s.pack_queue
+            .retain(|j| j.key != key || !dropped.contains(&j.ci) || inflight.as_ref() == Some(j));
     }
     crate::wishlist::project(st, key);
     Some(
@@ -753,16 +749,21 @@ pub async fn chapters_cancel(
             None => {
                 s.queue.clear();
                 s.build_want.clear();
-                s.pack_queue.clear();
+                let key = s.key();
+                s.pack_queue
+                    .retain(|j| key.as_deref() != Some(j.key.as_str()));
             }
             Some(w) => {
                 s.queue.retain(|c| !w.contains(c));
                 for c in w {
                     s.build_want.remove(c);
                 }
-                let building = s.building;
-                s.pack_queue
-                    .retain(|c| !w.contains(c) || Some(*c) == building);
+                let (key, inflight) = (s.key(), s.packing.clone());
+                s.pack_queue.retain(|j| {
+                    key.as_deref() != Some(j.key.as_str())
+                        || !w.contains(&j.ci)
+                        || inflight.as_ref() == Some(j)
+                });
             }
         }
         (s.queue.clone(), want)
