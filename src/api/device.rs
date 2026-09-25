@@ -194,6 +194,11 @@ pub struct Presence {
     pub last_seen: Instant,
     /// The book this device last said it was on, by file name.
     pub book: Option<String>,
+    /// How many `/api/events` streams this id holds open right now. A reader
+    /// reconnecting opens its new stream before the old one is noticed gone —
+    /// and two tabs of one browser profile share an id — so the device leaves
+    /// the roster when the *last* of them closes, not the first.
+    pub streams: usize,
 }
 
 /// Everyone currently holding an `/api/events` stream.
@@ -225,6 +230,7 @@ impl Roster {
                 since: now,
                 last_seen: now,
                 book: book.clone(),
+                streams: 0,
             });
             e.last_seen = now;
             if !dev.name.is_empty() {
@@ -238,6 +244,32 @@ impl Roster {
 
     pub fn drop_device(&self, id: &str) {
         self.with(|m| m.remove(id));
+    }
+
+    /// One more stream for this device. Touches it too, so it is on the roster.
+    fn open_stream(&self, dev: &Device, book: Option<String>) {
+        self.touch(dev, book);
+        self.with(|m| {
+            if let Some(e) = m.get_mut(&dev.id) {
+                e.streams += 1;
+            }
+        });
+    }
+
+    /// One stream fewer; the device goes when none are left.
+    fn close_stream(&self, id: &str) {
+        self.with(|m| {
+            let gone = match m.get_mut(id) {
+                Some(e) => {
+                    e.streams = e.streams.saturating_sub(1);
+                    e.streams == 0
+                }
+                None => false,
+            };
+            if gone {
+                m.remove(id);
+            }
+        });
     }
 
     /// Everyone seen inside `window`, newest first. Anything older is treated as
@@ -283,7 +315,7 @@ impl Connected {
         if !dev.known() {
             return None;
         }
-        roster.touch(dev, book);
+        roster.open_stream(dev, book);
         Some(Self {
             roster,
             id: dev.id.clone(),
@@ -293,7 +325,7 @@ impl Connected {
 
 impl Drop for Connected {
     fn drop(&mut self) {
-        self.roster.drop_device(&self.id);
+        self.roster.close_stream(&self.id);
     }
 }
 
@@ -438,6 +470,20 @@ mod tests {
             r.is_empty(),
             "the guard's Drop is the only way off the roster"
         );
+    }
+
+    #[test]
+    fn an_old_stream_closing_does_not_take_a_newer_one_off_the_roster() {
+        // A reconnect opens the new stream before the old one's task is
+        // dropped; the old guard going must not make a connected device vanish.
+        let r = Arc::new(Roster::default());
+        let old = Connected::new(r.clone(), &dev("a"), None);
+        let new = Connected::new(r.clone(), &dev("a"), None);
+        assert_eq!(r.len(), 1);
+        drop(old);
+        assert_eq!(r.len(), 1, "the newer stream is still open");
+        drop(new);
+        assert!(r.is_empty());
     }
 
     #[test]
