@@ -292,12 +292,24 @@ fn next_ahead(st: &AppState, key: &str, ci: usize, span: usize) -> Option<(usize
 /// gigabytes.
 const IDLE_MEASURE_EVERY: Duration = Duration::from_secs(60);
 
-/// A speculative target: somewhere worth rendering when there is nothing to do.
-struct Idle {
+/// A chunk worth rendering on a book found by searching — a standing order or
+/// speculation — carrying the plan it was found in.
+struct Target {
     key: String,
     chapter: usize,
     chunk: usize,
     plan: Arc<Vec<crate::book::Chapter>>,
+}
+
+impl Target {
+    fn choice(self, rule: Rule) -> Choice {
+        Choice::Render {
+            rule,
+            at: ChapterRef::new(self.key, self.chapter),
+            idx: self.chunk,
+            plan: self.plan,
+        }
+    }
 }
 
 /// Where the reader would resume a book that is not the loaded one.
@@ -352,11 +364,11 @@ fn next_idle(
     cur_plan: &Arc<Vec<crate::book::Chapter>>,
     from: usize,
     plans: &mut Plans,
-) -> Option<Idle> {
+) -> Option<Target> {
     // 1. The rest of the book in front of the reader. It is the one they are
     //    most likely to want next, and its plan is already in memory.
     if let Some((cj, j)) = first_hole(st, cur_key, cur_plan, from) {
-        return Some(Idle {
+        return Some(Target {
             key: cur_key.to_string(),
             chapter: cj,
             chunk: j,
@@ -384,7 +396,7 @@ fn next_idle(
         };
         let from = resume_chapter(st, &b.name).min(plan.len().saturating_sub(1));
         if let Some((cj, j)) = first_hole(st, &b.key, &plan, from) {
-            return Some(Idle {
+            return Some(Target {
                 key: b.key,
                 chapter: cj,
                 chunk: j,
@@ -460,7 +472,7 @@ impl Plans {
 /// Completion is still disk truth — an order whose chunks all exist simply
 /// leaves the list the first time this looks at it, exactly as `next_queued`
 /// does for the loaded book.
-fn next_elsewhere(st: &Arc<AppState>, cur_key: &str, plans: &mut Plans) -> Option<Idle> {
+fn next_elsewhere(st: &Arc<AppState>, cur_key: &str, plans: &mut Plans) -> Option<Target> {
     for (key, items) in crate::wishlist::all_outstanding(st) {
         if key == cur_key {
             continue; // `next_queued` owns this one.
@@ -487,7 +499,7 @@ fn next_elsewhere(st: &Arc<AppState>, cur_key: &str, plans: &mut Plans) -> Optio
                 continue;
             }
             if let Some(j) = first_missing(st, &key, it.chapter, 0, n) {
-                return Some(Idle {
+                return Some(Target {
                     key,
                     chapter: it.chapter,
                     chunk: j,
@@ -699,21 +711,98 @@ fn enqueue_pack(st: &Arc<AppState>, job: ChapterRef) {
 
 // ----------------------------------------------------------------- the worker
 
+/// Which rule picked a chunk, highest rank first.
+///
+/// Every rule renders the same way; they differ only in what they report while
+/// they do it and what follows. See [`execute`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    /// The chunk under the playhead is missing: somebody is waiting on it now.
+    UnderPlayhead,
+    /// A hole in the lookahead window of the chapter being read.
+    Lookahead,
+    /// A chapter somebody named in the chapter manager, on the loaded book.
+    Queued,
+    /// A standing order on a book the session is not holding.
+    Elsewhere,
+    /// The chapters after this one, up to the prerender span.
+    Prerender,
+    /// The rest of this book, then the library, when nothing else is owed.
+    Speculative,
+}
+
+impl Rule {
+    /// What `Session::status` says while this rule renders.
+    fn status(self) -> &'static str {
+        match self {
+            Rule::UnderPlayhead | Rule::Lookahead => "rendering",
+            Rule::Queued | Rule::Elsewhere => "queued",
+            Rule::Prerender | Rule::Speculative => "prerendering",
+        }
+    }
+
+    /// What `Session::prerender` becomes, or `None` to leave it alone.
+    ///
+    /// It names a chapter of the loaded book, so a standing order elsewhere
+    /// does not touch it.
+    fn prerender(self, ci: usize) -> Option<Option<usize>> {
+        match self {
+            Rule::UnderPlayhead | Rule::Elsewhere => None,
+            Rule::Lookahead => Some(None),
+            Rule::Queued | Rule::Prerender | Rule::Speculative => Some(Some(ci)),
+        }
+    }
+
+    /// Does a chunk this rule renders count towards the gc every 25?
+    ///
+    /// The lookahead keys its gc off the render hint instead, and speculation
+    /// re-measures on a clock (see `IDLE_MEASURE_EVERY`).
+    fn counted(self) -> bool {
+        matches!(self, Rule::Queued | Rule::Elsewhere | Rule::Prerender)
+    }
+}
+
+/// What the worker does next.
+#[derive(Debug)]
+enum Choice {
+    /// Render chunk `idx` of `at`, out of `plan`.
+    Render {
+        rule: Rule,
+        at: ChapterRef,
+        idx: usize,
+        plan: Plan,
+    },
+    /// Nothing to render: say "ready", offer the packer a chapter, then sleep.
+    Idle(Duration),
+    /// Not yet — no book is loaded, or renders have been failing. Sleep and
+    /// report nothing.
+    Wait(Duration),
+}
+
+/// What the worker keeps between passes. None of it is a record of what is
+/// rendered; that is always asked of the filesystem.
+#[derive(Default)]
+struct WorkerCtx {
+    /// Chunks rendered by the counted rules, for the gc every 25.
+    counted: usize,
+    /// When the chunk cache was last measured for the ceiling.
+    measured: Option<Instant>,
+    /// Whether "rendering ahead paused" has been logged — once per spell, not
+    /// once a second.
+    said_full: bool,
+    /// Foreign plans already read, so a standing order on another book does
+    /// not cost a `plan.json` parse per chunk. See `Plans`.
+    plans: Plans,
+    /// When speculation last looked across the library and found nothing, and
+    /// where the reader was when it did. See [`speculate`].
+    dry: Option<(Instant, String, usize, usize)>,
+    bo: Backoff,
+}
+
 fn worker(st: Arc<AppState>) {
     st.engine.load();
     st.session().model_ready = st.engine.ready();
-    let mut pre = 0usize;
-    // When the chunk cache was last measured, and whether the "it is full" line
-    // has already been logged — once per spell, not once a second.
-    let mut measured: Option<Instant> = None;
-    let mut said_full = false;
-    // Foreign plans already read, so a standing order on another book does not
-    // cost a `plan.json` parse per chunk. See `Plans`.
-    let mut plans = Plans::default();
-    // When the speculative branch last looked across the library and found
-    // nothing, and where the reader was when it did. See branch 6.
-    let mut dry: Option<(Instant, String, usize, usize)> = None;
-    let mut bo = Backoff::default();
+    let mut ctx = WorkerCtx::default();
     let mut parked: Option<Instant> = None;
     while !st.stop.load(Ordering::SeqCst) {
         if !st.run.wait(Duration::from_millis(500)) {
@@ -745,279 +834,247 @@ fn worker(st: Arc<AppState>) {
                 t.elapsed().as_secs_f64()
             );
         }
+        let choice = choose(&mut ctx, &st);
+        execute(&mut ctx, &st, choice);
+    }
+    st.render_started.store(false, Ordering::SeqCst);
+}
 
-        let (ci, hint, ph, plan, key) = {
-            let s = st.session();
-            (s.chapter, s.render_idx, s.playhead, s.plan.clone(), s.key())
-        };
-        let Some(key) = key else {
-            std::thread::sleep(Duration::from_millis(300));
-            continue;
-        };
-        // Renders have been failing: wait before trying again. Nothing is
-        // skipped and nothing is given up on — the loop comes straight back
-        // round to rule 1 — it just does not do it thousands of times a second.
-        if !bo.ready() {
-            std::thread::sleep(bo.nap());
-            continue;
-        }
-        let chunks: &[Chunk] = plan.get(ci).map(|c| c.chunks.as_slice()).unwrap_or(&[]);
-        let n = chunks.len();
+/// The next thing to render, by rank. The first rule with something to do wins,
+/// and every pass starts again from the top, so real work abandons speculation
+/// the moment it appears.
+///
+/// Every rule asks the filesystem rather than trusting `render_idx`; see the
+/// disk-truth invariant at the top of this module.
+fn choose(ctx: &mut WorkerCtx, st: &Arc<AppState>) -> Choice {
+    let (ci, hint, ph, plan, key) = {
+        let s = st.session();
+        (s.chapter, s.render_idx, s.playhead, s.plan.clone(), s.key())
+    };
+    let Some(key) = key else {
+        return Choice::Wait(Duration::from_millis(300));
+    };
+    // Renders have been failing: wait before trying again. Nothing is skipped
+    // and nothing is given up on — the next pass comes straight back to the
+    // chunk under the playhead — it just does not do it thousands of times a
+    // second.
+    if !ctx.bo.ready() {
+        return Choice::Wait(ctx.bo.nap());
+    }
+    let n = plan.get(ci).map(|c| c.chunks.len()).unwrap_or(0);
+    let here = |rule: Rule, cj: usize, j: usize| Choice::Render {
+        rule,
+        at: ChapterRef::new(key.clone(), cj),
+        idx: j,
+        plan: plan.clone(),
+    };
 
-        // 1. Disk truth: the chunk under the playhead outranks everything. If it
-        //    is missing the reader is stalled on it right now.
-        if ph < n && !exists(&st, &key, ci, ph) {
-            // And this is the one condition under which a pack would genuinely
-            // starve the renderer: two ARM cores, Kokoro at a quarter of
-            // realtime, and a listener waiting on this exact chunk. Flagged
-            // here rather than read off `status`, which also says "rendering"
-            // while the lookahead fills. See the packer's hold-back.
-            st.set_stalled(true);
-            st.session().status = "rendering".into();
-            attempt(&st, &key, ci, ph, chunks, &mut bo);
-            render_event(&st, "progress", ci, ph + 1, n, "rendering");
-            continue;
-        }
-        st.set_stalled(false);
+    // Disk truth: the chunk under the playhead outranks everything. If it is
+    // missing the reader is stalled on it right now.
+    //
+    // And this is the one condition under which a pack would genuinely starve
+    // the renderer: two ARM cores, Kokoro at a quarter of realtime, and a
+    // listener waiting on this exact chunk. Flagged here rather than read off
+    // `status`, which also says "rendering" while the lookahead fills, and
+    // cleared here too, before any rule below can hand the packer a job. See
+    // the packer's hold-back.
+    let stalled = ph < n && !exists(st, &key, ci, ph);
+    st.set_stalled(stalled);
+    if stalled {
+        return here(Rule::UnderPlayhead, ci, ph);
+    }
+    if let Some(i) = lookahead_hole(st, &key, ci, n, hint, ph) {
+        return here(Rule::Lookahead, ci, i);
+    }
+    // The playhead has all the buffer it asked for. Chapters the reader named
+    // in the chapter manager come next — an explicit offline request outranks
+    // the speculative span.
+    if let Some((cj, j)) = next_queued(st, &key) {
+        return here(Rule::Queued, cj, j);
+    }
+    // ...and the same for every *other* book somebody has a standing order on:
+    // an explicit ask beats a guess, and the book in front of the reader beats
+    // one that is not.
+    if let Some(t) = next_elsewhere(st, &key, &mut ctx.plans) {
+        return t.choice(Rule::Elsewhere);
+    }
+    // Buffered ahead within this chapter, and nothing asked for.
+    if n > 0 && first_missing(st, &key, ci, 0, n).is_some() {
+        return Choice::Idle(Duration::from_millis(300));
+    }
+    // This chapter is fully rendered. Rather than idle, build the buffer into
+    // the chapters ahead — that head start is what keeps playback continuous
+    // across a chapter boundary.
+    let span = st.session().prerender_span(ci, &st.cfg);
+    if let Some((cj, j)) = next_ahead(st, &key, ci, span) {
+        return here(Rule::Prerender, cj, j);
+    }
+    match speculate(ctx, st, &key, &plan, ci, ph, span) {
+        Some(t) => t.choice(Rule::Speculative),
+        None => Choice::Idle(Duration::from_secs(1)),
+    }
+}
 
-        // 2. The lookahead window, scanned for a real hole rather than trusted.
-        let limit = n.min(ph.saturating_add(st.cfg.lookahead).saturating_add(1));
-        let target = first_missing(&st, &key, ci, hint.min(limit), limit)
-            .or_else(|| first_missing(&st, &key, ci, ph, limit));
-        if let Some(i) = target {
-            {
-                let mut s = st.session();
-                s.status = "rendering".into();
-                s.prerender = None;
-            }
-            attempt(&st, &key, ci, i, chunks, &mut bo);
-            let next = {
-                let mut s = st.session();
-                // Only advance if nothing moved the hint while we were rendering:
-                // a forward jump from /api/playhead must not be clobbered by the
-                // stale i+1 computed several seconds ago.
-                if s.render_idx <= i {
-                    s.render_idx = i + 1;
-                }
-                s.render_idx
-            };
-            if next >= n {
-                render_event(&st, "complete", ci, next, n, "rendering");
-                // The chapter just became packable and the renderer is about to
-                // go do speculative work; pack it now, while it matters.
-                autopack(&st, true);
-                // ...and the library index has just gone stale in the one way
-                // that matters — a chapter went from partly to fully rendered.
-                // Cheap (one plan read, one `read_dir` per chapter) and worth
-                // doing here, because the alternative is that nothing notices
-                // until the scanner's next five-minute tick. Note the direction:
-                // the worker *writes* this index and never reads it. See the
-                // disk-truth invariant.
-                crate::library::rescan_book(&st, &key);
-            } else {
-                render_event(&st, "progress", ci, next, n, "rendering");
-            }
-            if next % 25 == 0 {
-                gc(&st);
-            }
-            continue;
-        }
+/// The lookahead window, scanned for a real hole rather than trusted: from the
+/// hint first, then from the playhead.
+fn lookahead_hole(
+    st: &AppState,
+    key: &str,
+    ci: usize,
+    n: usize,
+    hint: usize,
+    ph: usize,
+) -> Option<usize> {
+    let limit = n.min(ph.saturating_add(st.cfg.lookahead).saturating_add(1));
+    first_missing(st, key, ci, hint.min(limit), limit)
+        .or_else(|| first_missing(st, key, ci, ph, limit))
+}
 
-        // 3. The playhead has all the buffer it asked for. Chapters the reader
-        //    named in the chapter manager come next — an explicit offline request
-        //    outranks the speculative span.
-        if let Some((cj, j)) = next_queued(&st, &key) {
-            {
-                let mut s = st.session();
-                s.status = "queued".into();
-                s.prerender = Some(cj);
-            }
-            let qn = plan.get(cj).map(|c| c.chunks.len()).unwrap_or(0);
-            attempt(
-                &st,
-                &key,
-                cj,
-                j,
-                plan.get(cj).map(|c| c.chunks.as_slice()).unwrap_or(&[]),
-                &mut bo,
+/// Everything anybody has asked for is done and the buffer is full: something
+/// worth rendering anyway, or None.
+///
+/// The box renders at a quarter of realtime and can never catch up with a
+/// listener, so an idle second here is a second of waiting later: keep going
+/// through the rest of this book and then through the library, most recently
+/// opened first. Below every other rule, and stopped well short of the gc's
+/// threshold, which is the part that keeps it from becoming a treadmill. See
+/// `IDLE_CEILING`.
+fn speculate(
+    ctx: &mut WorkerCtx,
+    st: &Arc<AppState>,
+    key: &str,
+    plan: &Plan,
+    ci: usize,
+    ph: usize,
+    span: usize,
+) -> Option<Target> {
+    if ctx
+        .measured
+        .is_none_or(|t: Instant| t.elapsed() >= IDLE_MEASURE_EVERY)
+    {
+        gc(st);
+        ctx.measured = Some(Instant::now());
+    }
+    // A pass that found nothing is not repeated every second. With the whole
+    // library rendered it was: a `stat` per chapter of this book and a plan read
+    // and a `stat` per chapter of every recent one, once a second for as long as
+    // the box stayed finished — on the A1, a core's steady background hum to
+    // learn nothing new. What can make the answer change is the reader moving
+    // (a load, an open, a playhead — each of which moves `key`, `ci` or `ph` and
+    // is looked at again at once), or the library growing under it, which can
+    // wait for the next re-measure. Orders are not affected: the queue and the
+    // standing orders are ranked above this and asked on every pass.
+    let looked = ctx.dry.as_ref().is_some_and(|(t, k, c, p)| {
+        t.elapsed() < IDLE_MEASURE_EVERY && k == key && *c == ci && *p == ph
+    });
+    if looked {
+        return None;
+    }
+    if !room_to_speculate(st) {
+        if !ctx.said_full {
+            ctx.said_full = true;
+            tracing::info!(
+                "rendering ahead paused: the chunk cache is within {:.0}% of {} GB",
+                st.cfg.idle_ceiling * 100.0,
+                st.cfg.max_audio_gb
             );
-            render_event(&st, "progress", cj, j + 1, qn, "queued");
-            pre += 1;
-            if pre % 25 == 0 {
-                gc(&st);
-            }
-            continue;
         }
+        return None;
+    }
+    let t = next_idle(st, key, plan, ci + span + 1, &mut ctx.plans);
+    ctx.dry = match t {
+        Some(_) => None,
+        None => Some((Instant::now(), key.to_string(), ci, ph)),
+    };
+    if t.is_some() {
+        ctx.said_full = false;
+    }
+    t
+}
 
-        // 3b. ...and the same thing for every *other* book somebody has a
-        //     standing order on. Below the loaded book's queue, above the
-        //     speculative branch: an explicit ask beats a guess, and the book in
-        //     front of the reader beats one that is not.
-        if let Some(t) = next_elsewhere(&st, &key, &mut plans) {
-            {
-                let mut s = st.session();
-                s.status = "queued".into();
-            }
-            let tn = t.plan.get(t.chapter).map(|c| c.chunks.len()).unwrap_or(0);
-            attempt(
-                &st,
-                &t.key,
-                t.chapter,
-                t.chunk,
-                t.plan
-                    .get(t.chapter)
-                    .map(|c| c.chunks.as_slice())
-                    .unwrap_or(&[]),
-                &mut bo,
-            );
-            render_event_for(
-                &st,
-                Some(&t.key),
-                "progress",
-                t.chapter,
-                t.chunk + 1,
-                tn,
-                "queued",
-            );
-            pre += 1;
-            if pre % 25 == 0 {
-                gc(&st);
-            }
-            continue;
-        }
-
-        // 4. Buffered ahead within this chapter, nothing asked for.
-        if n > 0 && first_missing(&st, &key, ci, 0, n).is_some() {
+/// Do what [`choose`] picked.
+fn execute(ctx: &mut WorkerCtx, st: &Arc<AppState>, choice: Choice) {
+    match choice {
+        Choice::Wait(d) => std::thread::sleep(d),
+        Choice::Idle(d) => {
             {
                 let mut s = st.session();
                 s.status = "ready".into();
                 s.prerender = None;
             }
-            autopack(&st, false);
-            std::thread::sleep(Duration::from_millis(300));
-            continue;
+            autopack(st, false);
+            std::thread::sleep(d);
         }
-
-        // 5. This chapter is fully rendered. Rather than idle, build the buffer
-        //    into the chapters ahead — that head start is what keeps playback
-        //    continuous across a chapter boundary.
-        let span = st.session().prerender_span(ci, &st.cfg);
-        match next_ahead(&st, &key, ci, span) {
-            None => {
-                // 6. Everything anybody has asked for is done and the buffer is
-                //    full. The box renders at a quarter of realtime and can never
-                //    catch up with a listener, so an idle second here is a second
-                //    of waiting later: keep going through the rest of this book
-                //    and then through the library, most recently opened first.
-                //
-                //    Below everything above it, abandoned the moment there is
-                //    real work — the loop re-reads the playhead every iteration —
-                //    and stopped well short of the gc's threshold, which is the
-                //    part that keeps it from becoming a treadmill. See
-                //    `IDLE_CEILING`.
-                if measured.is_none_or(|t: Instant| t.elapsed() >= IDLE_MEASURE_EVERY) {
-                    gc(&st);
-                    measured = Some(Instant::now());
-                }
-                // A pass that found nothing is not repeated every second. With
-                // the whole library rendered it was: a `stat` per chapter of this
-                // book and a plan read and a `stat` per chapter of every recent
-                // one, once a second for as long as the box stayed finished —
-                // on the A1, a core's steady background hum to learn nothing
-                // new. What can make the answer change is the reader moving (a
-                // load, an open, a playhead — each of which moves `key`, `ci`
-                // or `ph` and is looked at again at once), or the library
-                // growing under it, which can wait for the next re-measure.
-                // Orders are not affected: branches 3 and 3b run before this on
-                // every pass.
-                let looked = dry.as_ref().is_some_and(|(t, k, c, p)| {
-                    t.elapsed() < IDLE_MEASURE_EVERY && *k == key && *c == ci && *p == ph
-                });
-                let target = if looked {
-                    None
-                } else if room_to_speculate(&st) {
-                    let t = next_idle(&st, &key, &plan, ci + span + 1, &mut plans);
-                    dry = match t {
-                        Some(_) => None,
-                        None => Some((Instant::now(), key.clone(), ci, ph)),
-                    };
-                    t
-                } else {
-                    if !said_full {
-                        said_full = true;
-                        tracing::info!(
-                            "rendering ahead paused: the chunk cache is within {:.0}% of {} GB",
-                            st.cfg.idle_ceiling * 100.0,
-                            st.cfg.max_audio_gb
-                        );
-                    }
-                    None
-                };
-                match target {
-                    Some(t) => {
-                        said_full = false;
-                        {
-                            let mut s = st.session();
-                            s.status = "prerendering".into();
-                            s.prerender = Some(t.chapter);
-                        }
-                        let tn = t.plan.get(t.chapter).map(|c| c.chunks.len()).unwrap_or(0);
-                        attempt(
-                            &st,
-                            &t.key,
-                            t.chapter,
-                            t.chunk,
-                            t.plan
-                                .get(t.chapter)
-                                .map(|c| c.chunks.as_slice())
-                                .unwrap_or(&[]),
-                            &mut bo,
-                        );
-                        render_event_for(
-                            &st,
-                            Some(&t.key),
-                            "progress",
-                            t.chapter,
-                            t.chunk + 1,
-                            tn,
-                            "prerendering",
-                        );
-                    }
-                    None => {
-                        {
-                            let mut s = st.session();
-                            s.status = "ready".into();
-                            s.prerender = None;
-                        }
-                        autopack(&st, false);
-                        std::thread::sleep(Duration::from_secs(1));
-                    }
+        Choice::Render {
+            rule,
+            at,
+            idx,
+            plan,
+        } => {
+            {
+                let mut s = st.session();
+                s.status = rule.status().into();
+                if let Some(p) = rule.prerender(at.ci) {
+                    s.prerender = p;
                 }
             }
-            Some((cj, j)) => {
-                {
-                    let mut s = st.session();
-                    s.status = "prerendering".into();
-                    s.prerender = Some(cj);
-                }
-                let an = plan.get(cj).map(|c| c.chunks.len()).unwrap_or(0);
-                attempt(
-                    &st,
-                    &key,
-                    cj,
-                    j,
-                    plan.get(cj).map(|c| c.chunks.as_slice()).unwrap_or(&[]),
-                    &mut bo,
-                );
-                render_event(&st, "progress", cj, j + 1, an, "prerendering");
-                pre += 1;
-                if pre % 25 == 0 {
-                    gc(&st);
+            let chunks: &[Chunk] = plan.get(at.ci).map(|c| c.chunks.as_slice()).unwrap_or(&[]);
+            let n = chunks.len();
+            attempt(st, &at.key, at.ci, idx, chunks, &mut ctx.bo);
+            if rule == Rule::Lookahead {
+                advance(st, &at, idx, n);
+                return;
+            }
+            render_event_for(
+                st,
+                Some(&at.key),
+                "progress",
+                at.ci,
+                idx + 1,
+                n,
+                rule.status(),
+            );
+            if rule.counted() {
+                ctx.counted += 1;
+                if ctx.counted % 25 == 0 {
+                    gc(st);
                 }
             }
         }
     }
-    st.render_started.store(false, Ordering::SeqCst);
+}
+
+/// After a lookahead chunk: move the hint on, and when that finishes the
+/// chapter, say so.
+fn advance(st: &Arc<AppState>, at: &ChapterRef, i: usize, n: usize) {
+    let next = {
+        let mut s = st.session();
+        // Only advance if nothing moved the hint while we were rendering: a
+        // forward jump from /api/playhead must not be clobbered by the stale
+        // i+1 computed several seconds ago.
+        if s.render_idx <= i {
+            s.render_idx = i + 1;
+        }
+        s.render_idx
+    };
+    if next >= n {
+        render_event_for(st, Some(&at.key), "complete", at.ci, next, n, "rendering");
+        // The chapter just became packable and the renderer is about to go do
+        // speculative work; pack it now, while it matters.
+        autopack(st, true);
+        // ...and the library index has just gone stale in the one way that
+        // matters — a chapter went from partly to fully rendered. Cheap (one
+        // plan read, one `read_dir` per chapter) and worth doing here, because
+        // the alternative is that nothing notices until the scanner's next
+        // five-minute tick. Note the direction: the worker *writes* this index
+        // and never reads it. See the disk-truth invariant.
+        crate::library::rescan_book(st, &at.key);
+    } else {
+        render_event_for(st, Some(&at.key), "progress", at.ci, next, n, "rendering");
+    }
+    if next % 25 == 0 {
+        gc(st);
+    }
 }
 
 // ----------------------------------------------------------------- the packer
@@ -1238,4 +1295,146 @@ pub fn done_seconds(st: &AppState) -> f64 {
         }
     }
     t
+}
+
+#[cfg(test)]
+mod tests {
+    //! The ranking, asked of [`choose`] directly: no worker thread, no sleep.
+
+    use super::*;
+    use crate::book::Chapter;
+    use crate::config::Config;
+
+    const CHUNKS: usize = 3;
+
+    fn plan(chapters: usize) -> Vec<Chapter> {
+        (0..chapters)
+            .map(|i| Chapter {
+                index: i,
+                id: format!("c{i}"),
+                title: format!("C{i}"),
+                chunks: (0..CHUNKS)
+                    .map(|_| Chunk {
+                        text: "hello.".into(),
+                        para: 0,
+                        silent: false,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Book A loaded, three chapters of three chunks, the playhead at the
+    /// start; no prerender span and a lookahead of two.
+    fn state() -> (tempfile::TempDir, Arc<AppState>) {
+        let d = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::for_test(d.path());
+        cfg.lookahead = 2;
+        cfg.prerender_chapters = 0;
+        std::fs::create_dir_all(&cfg.work).expect("work");
+        let st = AppState::new(cfg);
+        {
+            let mut s = st.session();
+            s.book = Some("/books/A.epub".into());
+            s.plan = Arc::new(plan(3));
+        }
+        (d, st)
+    }
+
+    fn seed(st: &AppState, key: &str, ci: usize) {
+        for i in 0..CHUNKS {
+            cache::write_wav(&cache::chunk_path(&st.cfg.work, key, ci, i), &[0.1f32; 240])
+                .expect("wav");
+        }
+    }
+
+    /// Book B, on disk only, with a standing order on its chapter 1.
+    fn order_elsewhere(st: &AppState) {
+        let p = cache::plan_path(&st.cfg.work, "B");
+        std::fs::create_dir_all(p.parent().expect("dir")).expect("dir");
+        std::fs::write(&p, serde_json::to_vec(&plan(3)).expect("json")).expect("plan");
+        st.store()
+            .expect("store")
+            .add_intent("B", &[1], "", false, 1)
+            .expect("intent");
+    }
+
+    /// The rule, book, chapter and chunk a choice renders, if it renders.
+    fn picked(c: &Choice) -> Option<(Rule, &str, usize, usize)> {
+        match c {
+            Choice::Render { rule, at, idx, .. } => Some((*rule, at.key.as_str(), at.ci, *idx)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_missing_chunk_under_the_playhead_outranks_everything() {
+        let (_d, st) = state();
+        seed(&st, "A", 0);
+        std::fs::remove_file(cache::chunk_path(&st.cfg.work, "A", 0, 1)).expect("hole");
+        {
+            let mut s = st.session();
+            s.playhead = 1;
+            s.queue = vec![2];
+        }
+        order_elsewhere(&st);
+        let mut ctx = WorkerCtx::default();
+
+        let c = choose(&mut ctx, &st);
+        assert_eq!(picked(&c), Some((Rule::UnderPlayhead, "A", 0, 1)), "{c:?}");
+        assert!(st.stalled_for() > 0.0, "and only this rule flags a stall");
+
+        // Filled, the next rank down is the queue, and the stall is over.
+        seed(&st, "A", 0);
+        let c = choose(&mut ctx, &st);
+        assert_eq!(picked(&c), Some((Rule::Queued, "A", 2, 0)), "{c:?}");
+        assert_eq!(st.stalled_for(), 0.0);
+    }
+
+    #[test]
+    fn a_standing_order_elsewhere_beats_the_rest_of_the_library() {
+        let (_d, st) = state();
+        seed(&st, "A", 0);
+        order_elsewhere(&st);
+        let mut ctx = WorkerCtx::default();
+
+        let c = choose(&mut ctx, &st);
+        assert_eq!(picked(&c), Some((Rule::Elsewhere, "B", 1, 0)), "{c:?}");
+
+        // With the order gone, what is left is speculation on the loaded book.
+        st.store()
+            .expect("store")
+            .drop_intent("B", 1)
+            .expect("drop");
+        let c = choose(&mut ctx, &st);
+        assert_eq!(picked(&c), Some((Rule::Speculative, "A", 1, 0)), "{c:?}");
+    }
+
+    #[test]
+    fn above_the_ceiling_there_is_nothing_to_speculate_on() {
+        let (_d, st) = state();
+        seed(&st, "A", 0);
+        let mut ctx = WorkerCtx {
+            // Measured a moment ago, so the number below is what it goes on.
+            measured: Some(Instant::now()),
+            ..WorkerCtx::default()
+        };
+        st.audio_bytes.store(u64::MAX / 2, Ordering::Relaxed);
+        let c = choose(&mut ctx, &st);
+        assert!(matches!(c, Choice::Idle(_)), "{c:?}");
+        assert!(ctx.said_full);
+
+        st.audio_bytes.store(0, Ordering::Relaxed);
+        let c = choose(&mut ctx, &st);
+        assert_eq!(picked(&c), Some((Rule::Speculative, "A", 1, 0)), "{c:?}");
+        assert!(!ctx.said_full);
+    }
+
+    #[test]
+    fn with_nothing_loaded_there_is_nothing_to_choose() {
+        let (_d, st) = state();
+        st.session().book = None;
+        let c = choose(&mut WorkerCtx::default(), &st);
+        assert!(matches!(c, Choice::Wait(_)), "{c:?}");
+    }
 }
