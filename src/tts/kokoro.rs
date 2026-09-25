@@ -157,12 +157,22 @@ fn token_id(c: char) -> Option<i64> {
 /// Phoneme string -> token ids, dropping anything the model has no symbol for
 /// (rather than refusing the chunk: one unmappable character is not worth a
 /// silent gap in a book).
+///
+/// Past [`MAX_PHONEMES`] the rest is cut, because the voice pack has no style
+/// vector for a longer utterance — and that cut is words the listener never
+/// hears, so it is said out loud in the log rather than done silently. The
+/// chunker's 300-character cap keeps a chunk well under it; one that is not is
+/// worth knowing about.
 pub fn tokenize(phonemes: &str) -> Vec<i64> {
-    phonemes
-        .chars()
-        .filter_map(token_id)
-        .take(MAX_PHONEMES)
-        .collect()
+    let ids: Vec<i64> = phonemes.chars().filter_map(token_id).collect();
+    if ids.len() > MAX_PHONEMES {
+        tracing::warn!(
+            "kokoro: {} phonemes, only the first {MAX_PHONEMES} are spoken; {} dropped",
+            ids.len(),
+            ids.len() - MAX_PHONEMES
+        );
+    }
+    ids.into_iter().take(MAX_PHONEMES).collect()
 }
 
 /// One voice pack: 510 style vectors of 256 floats, little-endian f32.
