@@ -1184,6 +1184,8 @@ is the half of `Lexicon.get_number` that does not need a POS tagger:
 | `1066` | "one thousand sixty six" | "ten sixty-six" |
 | `1985` | "nineteen hundred eighty five" | "nineteen eighty-five" |
 | `1990s` | "nineteen hundred ninety z" | "nineteen nineties" |
+| `$1.5` | "dollar one point five" | "one point five dollars" |
+| `1914-1918` | "nineteen hundred fourteen dash nineteen hundred eighteen" | "nineteen fourteen to nineteen eighteen" |
 
 Currency is misaki's `CURRENCIES` table and its zero-half rule (`$0.50` is "fifty
 cents", not "zero dollars and fifty cents"); the amount stays in digits and
@@ -1199,14 +1201,26 @@ Two deliberate departures from misaki, both because the question here is what a
 person would say rather than what the reference does:
 
 - **`$1.5` is an amount, not one dollar and five cents.** misaki splits on any
-  fraction of fewer than three digits; hundredths here need exactly two. And a
-  scale word after the amount moves the unit to the end, which misaki cannot do
-  because it phonemizes token by token and never sees the next word.
+  fraction of fewer than three digits; hundredths here need exactly two, and
+  any other fraction reads as the decimal with a plural unit — `$1.5` and
+  `$2.5 each` are "one point five dollars", "two point five dollars each". And a
+  scale word after the amount (a no-break space before it counts as a space)
+  moves the unit to the end, which misaki cannot do because it phonemizes
+  token by token and never sees the next word.
 - **The year reading is bounded, and only for a number standing on its own.**
   misaki applies it to *any* four-digit number, which turns `9999` into
   "ninety-nine ninety-nine"; here it is 1000–2099, and a group joined to more
-  digits by `-`, `/` or `:` is left alone, so `555-1066` and `1050-1066` stay
-  numbers. Inside that it is still misaki's rule and still a heuristic: `1433
+  digits by `-`, `–`, `/` or `:` is left alone, so `555-1066` and `555–1066`
+  stay numbers. The one joined shape that is read as years is a **span**: two
+  bare four-digit groups, a hyphen or an en dash between them, both in range,
+  the second no earlier than the first and nothing else joined on — so
+  `1914-1918` and `1914–1918` are both "nineteen fourteen to nineteen
+  eighteen" (a hyphen kept as written makes espeak-ng fuse the two words
+  either side of it, and an en dash is silence), while `1066-1050`, `1914-18` and
+  `1914-1918-1939` are left to espeak-ng. A rewrite never starts in the middle
+  of a number either: `3.1415`, `12,1990` and `25.12.2016` are whole numbers,
+  not a digit run with a year on the end. And `1000s` is "thousands", not "one
+  thousands"; `2000s` is "two thousands". Inside all that it is still misaki's rule and still a heuristic: `1433
   chapters` becomes "fourteen thirty-three chapters", because nothing here knows
   the difference between a year and a count. Four-digit numbers in prose are
   overwhelmingly years, which is why misaki bets that way and why this does too
