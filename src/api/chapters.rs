@@ -212,9 +212,14 @@ pub async fn chapters_list(
         .into_response();
     }
     let st2 = st.clone();
-    let rows = tokio::task::spawn_blocking(move || chapter_rows(&st2))
-        .await
-        .unwrap_or_default();
+    // The size of the chapters tree is a walk of every packed file in the
+    // library, so it is taken here, on the blocking pool beside the row scan —
+    // not below, where it used to run on the runtime with the session lock held,
+    // once every two seconds for as long as the drawer is open.
+    let (rows, chapter_bytes) =
+        tokio::task::spawn_blocking(move || (chapter_rows(&st2), pack::total_bytes(&st2.cfg.work)))
+            .await
+            .unwrap_or_default();
     // Before the session lock, and outside the row memo: a parked chapter is in
     // neither of the three queues by definition, so the memoised scan cannot
     // know about it, and a restart must not be able to make the drawer look like
@@ -248,9 +253,7 @@ pub async fn chapters_list(
         queue: Some(queue),
         building: Some(s.building),
         build_error: Some(s.build_error.clone()),
-        chapters_gb: Some(round3(
-            pack::total_bytes(&st.cfg.work) as f64 / 1024.0_f64.powi(3),
-        )),
+        chapters_gb: Some(round3(chapter_bytes as f64 / 1024.0_f64.powi(3))),
         chapters_cap_gb: Some(st.cfg.max_chapter_gb),
         from: Some(from),
         to: Some(to),
