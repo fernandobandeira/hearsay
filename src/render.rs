@@ -803,7 +803,7 @@ fn worker(st: Arc<AppState>) {
     st.engine.load();
     st.session().model_ready = st.engine.ready();
     let mut ctx = WorkerCtx::default();
-    let mut parked: Option<Instant> = None;
+    let mut parked = Parked::new("renderer");
     while !st.stop.load(Ordering::SeqCst) {
         if !st.run.wait(Duration::from_millis(500)) {
             continue;
@@ -814,25 +814,10 @@ fn worker(st: Arc<AppState>) {
         // Whisper outranks this. A voice memo exists only in the phone that
         // recorded it until `/api/note` answers, and on the two-core A1 a memo
         // sharing the box with Kokoro took seven minutes instead of one. So the
-        // worker stands down for the duration — a bounded wait on the gate's
-        // condvar, so it starts again the instant the last transcription ends —
-        // and this is **not** a render failure, so the backoff is untouched.
-        //
-        // Said out loud both ways: a renderer that has quietly stopped is
-        // exactly the shape of the bug this round is about, and "it is parked
-        // for a memo" is only reassuring if it is written down somewhere.
-        if !st.whisper.gate().wait_clear(Duration::from_millis(250)) {
-            if parked.is_none() {
-                parked = Some(Instant::now());
-                tracing::info!("renderer parked: a voice memo is being transcribed");
-            }
+        // worker stands down for the duration, and this is **not** a render
+        // failure, so the backoff is untouched.
+        if !parked.clear(&st) {
             continue;
-        }
-        if let Some(t) = parked.take() {
-            tracing::info!(
-                "renderer resumed after {:.1}s parked for transcription",
-                t.elapsed().as_secs_f64()
-            );
         }
         let choice = choose(&mut ctx, &st);
         execute(&mut ctx, &st, choice);
@@ -1081,15 +1066,60 @@ fn advance(st: &Arc<AppState>, at: &ChapterRef, i: usize, n: usize) {
 
 /// The longest the packer defers to a stalled renderer before packing anyway.
 ///
-/// A courtesy, not a lock — see the hold-back in [`builder`]. Thirty seconds is
+/// A courtesy, not a lock — see the hold-back in [`next_job`]. Thirty seconds is
 /// many chunks on the desktop and a couple on the A1; past it the renderer is
 /// not slow, it is stuck (a wedged espeak-ng, a read-only work dir), and a
 /// download that waits on a stuck renderer forever would be a worse bug than the
 /// one the hold-back prevents.
 const PACK_HOLD_MAX_S: f64 = 30.0;
 
+/// A thread standing down for a voice memo, said once as it parks and once as
+/// it resumes.
+///
+/// Said out loud both ways because a thread that has quietly stopped is exactly
+/// the shape of failure this server exists to avoid, and "it is parked for a
+/// memo" is only reassuring if it is written down somewhere.
+struct Parked {
+    who: &'static str,
+    since: Option<Instant>,
+}
+
+impl Parked {
+    fn new(who: &'static str) -> Self {
+        Self { who, since: None }
+    }
+
+    /// Is the STT gate clear? A bounded wait on the gate's condvar, so the
+    /// caller starts again the instant the last transcription ends; false means
+    /// a memo is still being transcribed and the caller should come back round.
+    fn clear(&mut self, st: &AppState) -> bool {
+        if !st.whisper.gate().wait_clear(Duration::from_millis(250)) {
+            if self.since.is_none() {
+                self.since = Some(Instant::now());
+                tracing::info!("{} parked: a voice memo is being transcribed", self.who);
+            }
+            return false;
+        }
+        if let Some(t) = self.since.take() {
+            tracing::info!(
+                "{} resumed after {:.1}s parked for transcription",
+                self.who,
+                t.elapsed().as_secs_f64()
+            );
+        }
+        true
+    }
+}
+
+/// One chapter for the packer, with the plan and title it is packed from.
+struct Job {
+    at: ChapterRef,
+    plan: Plan,
+    title: String,
+}
+
 fn builder(st: Arc<AppState>) {
-    let mut parked: Option<Instant> = None;
+    let mut parked = Parked::new("packer");
     let mut held: Option<Instant> = None;
     while !st.stop.load(Ordering::SeqCst) {
         st.build_ev.wait(Duration::from_secs(1));
@@ -1103,167 +1133,179 @@ fn builder(st: Arc<AppState>) {
         // and the chapter has to be packed again from nothing, which costs the
         // box more than the transcription gains — and the packer is one chapter
         // at a time, so the wait is bounded by one encode either way.
-        if !st.whisper.gate().wait_clear(Duration::from_millis(250)) {
-            if parked.is_none() {
-                parked = Some(Instant::now());
-                tracing::info!("packer parked: a voice memo is being transcribed");
-            }
+        if !parked.clear(&st) {
             continue;
         }
-        if let Some(t) = parked.take() {
-            tracing::info!(
-                "packer resumed after {:.1}s parked for transcription",
-                t.elapsed().as_secs_f64()
-            );
-        }
-        // And the same shape one rank down: the renderer outranks the packer
-        // while somebody is actually waiting on a chunk.
-        //
-        // This is worth having now that packs arrive without a client asking for
-        // them. A wishlist resumed at boot can put twenty chapters in the pack
-        // queue seconds after the port opens, and on two ARM cores an ffmpeg
-        // encode running against a renderer that is stalled *under the playhead*
-        // is a reader waiting longer for the chapter in their hands so that a
-        // chapter for tonight can be filed. The policy, in one line: pack when
-        // the renderer is ahead or idle, hold while it is behind.
-        //
-        // Only rule 1 counts as behind — the chunk the playhead is on. The
-        // lookahead is 80 chunks and also reports "rendering", and a packer that
-        // waited for *that* would never run on this box at all.
-        let stalled = st.stalled_for();
-        // Any book's job: a foreign encode costs the core exactly what a local
-        // one does, and the listener stalled under the playhead is just as
-        // stalled.
-        let pending = !st.session().pack_queue.is_empty();
-        if stalled > 0.0 && stalled < PACK_HOLD_MAX_S && pending {
-            if held.is_none() {
-                held = Some(Instant::now());
-                tracing::info!("packer holding back: the renderer is stalled under the playhead");
-            }
-            std::thread::sleep(Duration::from_millis(250));
-            continue;
-        }
-        if let Some(t) = held.take() {
-            tracing::info!(
-                "packer resumed after {:.1}s held back for the renderer",
-                t.elapsed().as_secs_f64()
-            );
-        }
-        let Some((job, plan, title)) = ({
-            let mut s = st.session();
-            // The loaded book's first: its file is the one somebody may be
-            // waiting for. Then a chapter of some *other* book that somebody
-            // ordered, whose plan is read raw, like everything else that touches
-            // a book this process is not holding.
-            let loaded = s.pack_queue.iter().find(|j| s.is_loaded(j)).cloned();
-            match loaded.or_else(|| s.pack_queue.first().cloned()) {
-                None => {
-                    st.build_ev.clear();
-                    None
-                }
-                Some(job) if s.is_loaded(&job) => {
-                    s.packing = Some(job.clone());
-                    Some((job, s.plan.clone(), s.title.clone().unwrap_or_default()))
-                }
-                Some(job) => {
-                    drop(s);
-                    match crate::plancache::read_raw(&st.cfg.work, &job.key) {
-                        Some(plan) => {
-                            st.session().packing = Some(job.clone());
-                            Some((job, plan, String::new()))
-                        }
-                        None => {
-                            // No plan, so nothing that could be packed. Drop it
-                            // rather than spin on it.
-                            tracing::warn!("cannot pack {job}: no plan.json");
-                            st.session().pack_queue.retain(|j| *j != job);
-                            None
-                        }
-                    }
-                }
-            }
-        }) else {
+        let Some(job) = next_job(&st, &mut held) else {
             continue;
         };
-        let (key, ci) = (job.key.clone(), job.ci);
-
-        let outcome = match plan.get(ci) {
-            None => Err("chapter out of range".to_string()),
-            Some(ch) => chapters::build(
-                &st.cfg,
-                &key,
-                ci,
-                &ch.chunks,
-                &cache::chapter_dir(&st.cfg.work, &key, ci),
-                &ch.display_title(),
-                &title,
-            )
-            .map(|_| ch.chunks.len())
-            .map_err(|e| format!("chapter {}: {e}", ci + 1)),
-        };
-        match outcome {
-            Ok(n) => {
-                st.session().build_error = None;
-                // The m4a is what "download this chapter" is waiting for, on this
-                // device and on every other one with the drawer open.
-                st.bus.emit_render(
-                    "packed",
-                    json!({"key": key, "chapter": ci, "ok": true, "n": n, "status": "packed"}),
-                );
-                // The other moment a library row genuinely goes stale: an m4a
-                // landed, so this chapter is now downloadable from any device.
-                // Same direction as the renderer's — written here, never read.
-                crate::library::rescan_book(&st, &key);
-            }
-            Err(msg) => {
-                tracing::warn!("pack failed - {msg}");
-                st.session().build_error = Some(msg.clone());
-                st.bus.emit_render(
-                    "packed",
-                    json!({"key": key, "chapter": ci, "ok": false,
-                           "error": msg, "status": "packed"}),
-                );
-            }
-        }
-        let (cur, cur_key, loaded) = {
-            let mut s = st.session();
-            s.packing = None;
-            s.pack_queue.retain(|j| *j != job);
-            // `build_want` holds bare chapter numbers of the loaded book, so it
-            // is only this job's to clear if this job is the loaded book's.
-            let loaded = s.is_loaded(&job);
-            if loaded {
-                s.build_want.remove(&ci);
-            }
-            (s.chapter, s.key(), loaded)
-        };
-        // A foreign chapter that packed has nothing left to want: the order was
-        // "render it and pack it", and both have happened. Dropping the intent
-        // here rather than leaving it for the renderer to notice is what keeps
-        // `next_elsewhere` from walking a list that never shrinks.
-        if !loaded {
-            if let Some(db) = st.store() {
-                if let Err(e) = db.drop_intent(&key, ci) {
-                    tracing::warn!("could not clear the order for {key} ch{ci}: {e}");
-                }
-            }
-            crate::wishlist::project(&st, &key);
-        }
-        // Whether it packed or not. A failed encode already leaves the queues
-        // here rather than being retried forever in this process, and the file has
-        // to say the same thing — a pack that fails on every restart is the one
-        // loop a durable queue could otherwise run until someone noticed.
-        crate::wishlist::save(&st);
-        // The chapter being *read* is the one the packed-chapter gc must spare,
-        // and it belongs to the loaded book — not to whichever book this job
-        // happened to be for. Nothing loaded, nothing to spare.
-        let keep: HashSet<String> = cur_key
-            .map(|k| ChapterRef::new(k, cur).to_string())
-            .into_iter()
-            .collect();
-        chapters::gc(&st.cfg, &keep);
+        let outcome = pack(&st, &job);
+        finish(&st, &job, outcome);
     }
     st.build_started.store(false, Ordering::SeqCst);
+}
+
+/// The next chapter to pack, marked as in flight — or None, having held back,
+/// found nothing, or dropped a job that cannot be packed.
+///
+/// The loaded book's jobs first: its file is the one somebody may be waiting
+/// for. Then a chapter of some *other* book that somebody ordered, whose plan is
+/// read raw, like everything else that touches a book this process is not
+/// holding.
+fn next_job(st: &AppState, held: &mut Option<Instant>) -> Option<Job> {
+    // The same shape as the STT gate one rank down: the renderer outranks the
+    // packer while somebody is actually waiting on a chunk.
+    //
+    // This is worth having now that packs arrive without a client asking for
+    // them. A wishlist resumed at boot can put twenty chapters in the pack queue
+    // seconds after the port opens, and on two ARM cores an ffmpeg encode
+    // running against a renderer that is stalled *under the playhead* is a
+    // reader waiting longer for the chapter in their hands so that a chapter for
+    // tonight can be filed. The policy, in one line: pack when the renderer is
+    // ahead or idle, hold while it is behind.
+    //
+    // Only rule 1 counts as behind — the chunk the playhead is on. The lookahead
+    // is 80 chunks and also reports "rendering", and a packer that waited for
+    // *that* would never run on this box at all.
+    let stalled = st.stalled_for();
+    // Any book's job: a foreign encode costs the core exactly what a local one
+    // does, and the listener stalled under the playhead is just as stalled.
+    let pending = !st.session().pack_queue.is_empty();
+    if stalled > 0.0 && stalled < PACK_HOLD_MAX_S && pending {
+        if held.is_none() {
+            *held = Some(Instant::now());
+            tracing::info!("packer holding back: the renderer is stalled under the playhead");
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        return None;
+    }
+    if let Some(t) = held.take() {
+        tracing::info!(
+            "packer resumed after {:.1}s held back for the renderer",
+            t.elapsed().as_secs_f64()
+        );
+    }
+    let mut s = st.session();
+    let loaded = s.pack_queue.iter().find(|j| s.is_loaded(j)).cloned();
+    match loaded.or_else(|| s.pack_queue.first().cloned()) {
+        None => {
+            st.build_ev.clear();
+            None
+        }
+        Some(at) if s.is_loaded(&at) => {
+            s.packing = Some(at.clone());
+            Some(Job {
+                at,
+                plan: s.plan.clone(),
+                title: s.title.clone().unwrap_or_default(),
+            })
+        }
+        Some(at) => {
+            drop(s);
+            match crate::plancache::read_raw(&st.cfg.work, &at.key) {
+                Some(plan) => {
+                    st.session().packing = Some(at.clone());
+                    Some(Job {
+                        at,
+                        plan,
+                        title: String::new(),
+                    })
+                }
+                None => {
+                    // No plan, so nothing that could be packed. Drop it rather
+                    // than spin on it.
+                    tracing::warn!("cannot pack {at}: no plan.json");
+                    st.session().pack_queue.retain(|j| *j != at);
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Encode the job's chapter. The number of chunks packed, or why not.
+fn pack(st: &AppState, job: &Job) -> Result<usize, String> {
+    let (key, ci) = (&job.at.key, job.at.ci);
+    match job.plan.get(ci) {
+        None => Err("chapter out of range".to_string()),
+        Some(ch) => chapters::build(
+            &st.cfg,
+            key,
+            ci,
+            &ch.chunks,
+            &cache::chapter_dir(&st.cfg.work, key, ci),
+            &ch.display_title(),
+            &job.title,
+        )
+        .map(|_| ch.chunks.len())
+        .map_err(|e| format!("chapter {}: {e}", ci + 1)),
+    }
+}
+
+/// Report a job's outcome and take it off every list, whether it packed or not.
+fn finish(st: &Arc<AppState>, job: &Job, outcome: Result<usize, String>) {
+    let (key, ci) = (job.at.key.as_str(), job.at.ci);
+    match outcome {
+        Ok(n) => {
+            st.session().build_error = None;
+            // The m4a is what "download this chapter" is waiting for, on this
+            // device and on every other one with the drawer open.
+            st.bus.emit_render(
+                "packed",
+                json!({"key": key, "chapter": ci, "ok": true, "n": n, "status": "packed"}),
+            );
+            // The other moment a library row genuinely goes stale: an m4a
+            // landed, so this chapter is now downloadable from any device. Same
+            // direction as the renderer's — written here, never read.
+            crate::library::rescan_book(st, key);
+        }
+        Err(msg) => {
+            tracing::warn!("pack failed - {msg}");
+            st.session().build_error = Some(msg.clone());
+            st.bus.emit_render(
+                "packed",
+                json!({"key": key, "chapter": ci, "ok": false,
+                       "error": msg, "status": "packed"}),
+            );
+        }
+    }
+    let (cur, cur_key, loaded) = {
+        let mut s = st.session();
+        s.packing = None;
+        s.pack_queue.retain(|j| *j != job.at);
+        // `build_want` holds bare chapter numbers of the loaded book, so it is
+        // only this job's to clear if this job is the loaded book's.
+        let loaded = s.is_loaded(&job.at);
+        if loaded {
+            s.build_want.remove(&ci);
+        }
+        (s.chapter, s.key(), loaded)
+    };
+    // A foreign chapter that packed has nothing left to want: the order was
+    // "render it and pack it", and both have happened. Dropping the intent here
+    // rather than leaving it for the renderer to notice is what keeps
+    // `next_elsewhere` from walking a list that never shrinks.
+    if !loaded {
+        if let Some(db) = st.store() {
+            if let Err(e) = db.drop_intent(key, ci) {
+                tracing::warn!("could not clear the order for {key} ch{ci}: {e}");
+            }
+        }
+        crate::wishlist::project(st, key);
+    }
+    // Whether it packed or not. A failed encode already leaves the queues here
+    // rather than being retried forever in this process, and the file has to
+    // say the same thing — a pack that fails on every restart is the one loop a
+    // durable queue could otherwise run until someone noticed.
+    crate::wishlist::save(st);
+    // The chapter being *read* is the one the packed-chapter gc must spare, and
+    // it belongs to the loaded book — not to whichever book this job happened to
+    // be for. Nothing loaded, nothing to spare.
+    let keep: HashSet<String> = cur_key
+        .map(|k| ChapterRef::new(k, cur).to_string())
+        .into_iter()
+        .collect();
+    chapters::gc(&st.cfg, &keep);
 }
 
 /// Estimated seconds of the loaded book already in the streaming cache.
