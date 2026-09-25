@@ -165,54 +165,21 @@ impl Phonemizer {
     /// waits forever, so a wedged espeak — and it is a C program with a history
     /// of them — takes the render thread with it and the reader waits on a chunk
     /// nobody is rendering any more. Here it costs one dead subprocess and a
-    /// typed error that `render_one` logs and steps over.
-    ///
-    /// The pipes are drained on their own threads rather than read after the
-    /// wait: a child that fills the 64 KB pipe buffer while we are polling for
-    /// its exit would deadlock against us, which would be the same hang by
-    /// another route.
+    /// typed error that `render_one` logs and steps over. The mechanics are
+    /// [`output_within`]'s.
     fn run(&self, args: &[&str]) -> Result<Output, TtsError> {
-        let spawn_err = |e: std::io::Error| TtsError::Espeak(format!("spawn {}: {e}", self.binary));
-        let mut child = Command::new(&self.binary)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(spawn_err)?;
-
-        let pipes = drain(child.stdout.take()).and_then(|o| Ok((o, drain(child.stderr.take())?)));
-        let (out_t, err_t) = match pipes {
-            Ok(p) => p,
-            // No reader thread means no way to drain the pipes, so waiting for
-            // this child is exactly the hang this function exists to prevent.
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(TtsError::Espeak(format!(
-                    "could not read from {}: {e}",
-                    self.binary
-                )));
+        let mut cmd = Command::new(&self.binary);
+        cmd.args(args);
+        output_within(&mut cmd, self.timeout).map_err(|e| match e {
+            Bounded::Spawn(e) => TtsError::Espeak(format!("spawn {}: {e}", self.binary)),
+            Bounded::Pipes(e) => {
+                TtsError::Espeak(format!("could not read from {}: {e}", self.binary))
             }
-        };
-
-        let Some(status) = wait_deadline(&mut child, self.timeout) else {
-            // Wedged, or not reapable. Either way it is not going to answer:
-            // kill it, reap it, and let the caller log and degrade. The reader
-            // threads see EOF on the closed pipes and finish on their own.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(TtsError::Espeak(format!(
+            Bounded::TimedOut => TtsError::Espeak(format!(
                 "{} did not finish within {:.1}s; killed",
                 self.binary,
                 self.timeout.as_secs_f64()
-            )));
-        };
-        let joined = |t: Option<Drained>| t.and_then(|t| t.join().ok()).unwrap_or_default();
-        Ok(Output {
-            status,
-            stdout: joined(out_t),
-            stderr: joined(err_t),
+            )),
         })
     }
 
@@ -246,10 +213,71 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::io::Result<Option<Dr
 }
 
 /// What `Command::output()` would have returned, minus the unbounded wait.
-struct Output {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct Output {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+/// Why [`output_within`] has no output to give.
+#[derive(Debug)]
+pub(crate) enum Bounded {
+    /// The binary would not start.
+    Spawn(std::io::Error),
+    /// No thread could be spawned to drain a pipe, so the child was killed
+    /// rather than waited on.
+    Pipes(std::io::Error),
+    /// It did not finish in time, and was killed and reaped.
+    TimedOut,
+}
+
+/// `Command::output()` with a deadline: stdin closed, both pipes drained on
+/// their own threads, the child killed and reaped if it is still running when
+/// `timeout` is up.
+///
+/// Shared by everything here that runs a subprocess on a thread somebody is
+/// waiting on — espeak-ng on the render thread, ffmpeg under the STT gate —
+/// because the failure it prevents is the same one: a child that never exits
+/// holding its caller forever.
+///
+/// The pipes are drained on their own threads rather than read after the
+/// wait: a child that fills the 64 KB pipe buffer while we are polling for
+/// its exit would deadlock against us, which would be the same hang by
+/// another route.
+pub(crate) fn output_within(cmd: &mut Command, timeout: Duration) -> Result<Output, Bounded> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(Bounded::Spawn)?;
+
+    let pipes = drain(child.stdout.take()).and_then(|o| Ok((o, drain(child.stderr.take())?)));
+    let (out_t, err_t) = match pipes {
+        Ok(p) => p,
+        // No reader thread means no way to drain the pipes, so waiting for
+        // this child is exactly the hang this function exists to prevent.
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Bounded::Pipes(e));
+        }
+    };
+
+    let Some(status) = wait_deadline(&mut child, timeout) else {
+        // Wedged, or not reapable. Either way it is not going to answer:
+        // kill it, reap it, and let the caller log and degrade. The reader
+        // threads see EOF on the closed pipes and finish on their own.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(Bounded::TimedOut);
+    };
+    let joined = |t: Option<Drained>| t.and_then(|t| t.join().ok()).unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout: joined(out_t),
+        stderr: joined(err_t),
+    })
 }
 
 /// Wait for `child` for at most `timeout`. `None` means it is still running (or

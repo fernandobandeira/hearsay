@@ -379,3 +379,36 @@ async fn a_refusal_does_not_claim_the_memos_id() {
     assert_eq!(code, StatusCode::OK, "{got}");
     assert_eq!(notes(&h).len(), 1);
 }
+
+#[tokio::test]
+async fn a_long_memo_is_not_refused_for_its_size() {
+    // axum's `Json` stops at 2 MB by default — about a minute and a half of opus
+    // after base64 — and the reader reads that 413 as a rejection, so a long
+    // memo was never filed and never retried. Over three megabytes of body here.
+    let h = speaking().await;
+    h.load().await;
+    let words = "a thought that went on for quite a while ".repeat(60_000);
+    let body = json!({"audio": recorded(&words), "mime": "audio/webm",
+                      "chapter": 0, "chunk": 0, "id": "a-long-one"});
+    assert!(body.to_string().len() > 3 * 1024 * 1024);
+    let (code, got) = h.post_json("/api/note", body).await;
+    assert_eq!(code, StatusCode::OK, "{}", got["error"]);
+    assert_eq!(notes(&h).len(), 1);
+}
+
+#[tokio::test]
+async fn two_memos_in_one_second_keep_both_recordings() {
+    // The recording was named by the second it arrived in, so the second memo of
+    // a second replaced the first one's audio under the first one's record.
+    let h = speaking().await;
+    h.load().await;
+    for (id, words) in [
+        ("first-of-two", "one thought"),
+        ("second-of-two", "another"),
+    ] {
+        let body = json!({"audio": recorded(words), "mime": "audio/webm", "id": id});
+        let (code, got) = h.post_json("/api/note", body).await;
+        assert_eq!(code, StatusCode::OK, "{got}");
+    }
+    assert_eq!(recordings(&h), 2);
+}

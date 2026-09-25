@@ -139,13 +139,28 @@ fn safe_name(title: &str) -> String {
             _ => c,
         })
         .collect();
-    let s = s.trim().to_string();
+    // Most filesystems cap a *name* at 255 bytes, and this one still has
+    // `.m4b.part` to carry while it is written — so a subtitle-laden title
+    // would fail the export the moment ffmpeg tries to open its output. Cut on a
+    // character boundary, never through a UTF-8 sequence.
+    let mut s = s.trim();
+    if s.len() > NAME_BYTES {
+        let mut end = NAME_BYTES;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s = s[..end].trim_end();
+    }
     if s.is_empty() {
         "audiobook".into()
     } else {
-        s
+        s.to_string()
     }
 }
+
+/// The longest stem [`safe_name`] returns, in bytes: 255 less room for
+/// `.m4b.part`, with a margin for the filesystems that count differently.
+const NAME_BYTES: usize = 200;
 
 /// Title, author and cover, straight out of the EPUB. Best effort: a malformed
 /// package yields Nones and a note, never a failed export — the audio is the
@@ -553,6 +568,15 @@ mod tests {
         );
         assert_eq!(safe_name("A/B: C?"), "A-B- C-");
         assert_eq!(safe_name("   "), "audiobook");
+        // A title longer than a file name may be is cut, on a char boundary.
+        let long = "é".repeat(300);
+        let cut = safe_name(&long);
+        assert!(cut.len() <= NAME_BYTES, "{}", cut.len());
+        assert!(cut.chars().all(|c| c == 'é'));
+        assert_eq!(
+            safe_name(&format!("{}x", "a".repeat(NAME_BYTES))).len(),
+            NAME_BYTES
+        );
     }
 
     #[test]

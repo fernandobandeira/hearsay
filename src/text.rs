@@ -77,8 +77,8 @@ pub fn gz_path(p: &Path) -> PathBuf {
 /// plain size.
 ///
 /// Always together: a `.gz` that outlived its `.json` would serve the wrong
-/// words, which is the same failure a stale shard is. The bundle directory is
-/// wiped before a rebuild, so the pair can never be half-stale — and the plain
+/// words, which is the same failure a stale shard is. A bundle is built in a
+/// fresh directory and swapped in whole, so the pair can never be half-stale — and the plain
 /// file is written first, so the only crash window leaves a *missing* `.gz`,
 /// which the server falls back from silently.
 ///
@@ -102,6 +102,14 @@ pub fn round1(x: f64) -> f64 {
 }
 
 /// Write `<key>/index.json` + `<key>/NNN.json`.
+///
+/// Built whole in a hidden sibling directory and renamed into place, never
+/// rewritten where it is served from. The old way — wipe the directory, then
+/// write file by file — was a window of seconds on the big book (17 MB of
+/// level-9 gzip) in which a device asking for its shards got a 404, a
+/// half-written `.json`, or a truncated `.gz` whose plain twin already existed,
+/// and each of those is served with an hour of `max-age`. Now a request sees
+/// the old bundle or the new one: the only gap is between two renames.
 pub fn write_bundle(
     cfg: &Config,
     plan: &[Chapter],
@@ -110,10 +118,82 @@ pub fn write_bundle(
     name: &str,
     title: &str,
 ) -> std::io::Result<()> {
-    let d = text_dir(&cfg.work, key);
-    let _ = std::fs::remove_dir_all(&d);
+    // One build at a time: two loads of one book at once would otherwise sweep
+    // each other's half-built directory away as a leftover.
+    static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = BUILDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let live = text_dir(&cfg.work, key);
+    let parent = live.parent().unwrap_or(Path::new(".")).to_path_buf();
+    std::fs::create_dir_all(&parent)?;
+    sweep_leftovers(&parent, key);
+    let tag = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let d = parent.join(format!(".{key}.building-{tag}"));
     std::fs::create_dir_all(&d)?;
+    let built = build_bundle_in(&d, cfg, plan, est, key, name, title);
+    if let Err(e) = built {
+        let _ = std::fs::remove_dir_all(&d);
+        return Err(e);
+    }
+    // A directory cannot be renamed over a non-empty one, so the live bundle
+    // steps aside first and is deleted once the new one is in its place. If the
+    // second rename fails the old one is put back rather than leaving the book
+    // with no words at all.
+    let old = parent.join(format!(".{key}.old-{tag}"));
+    let had_old = match std::fs::rename(&live, &old) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&d);
+            return Err(e);
+        }
+    };
+    if let Err(e) = std::fs::rename(&d, &live) {
+        if had_old {
+            let _ = std::fs::rename(&old, &live);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        return Err(e);
+    }
+    if had_old {
+        let _ = std::fs::remove_dir_all(&old);
+    }
+    Ok(())
+}
 
+/// Remove what an interrupted [`write_bundle`] for this book left behind. Best
+/// effort: a leftover costs disk, never correctness, since nothing serves from
+/// a dot-directory.
+fn sweep_leftovers(parent: &Path, key: &str) {
+    let Ok(rd) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let (building, old) = (format!(".{key}.building-"), format!(".{key}.old-"));
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().to_string();
+        if n.starts_with(&building) || n.starts_with(&old) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+fn build_bundle_in(
+    d: &Path,
+    cfg: &Config,
+    plan: &[Chapter],
+    est: &[f64],
+    key: &str,
+    name: &str,
+    title: &str,
+) -> std::io::Result<()> {
     let mut shards: Vec<Vec<ShardChapter>> = Vec::new();
     let mut cur: Vec<ShardChapter> = Vec::new();
     let mut cur_bytes = 0usize;
@@ -259,6 +339,39 @@ mod tests {
                     .collect(),
             })
             .collect()
+    }
+
+    #[test]
+    fn a_rebuild_swaps_the_bundle_whole_and_leaves_nothing_beside_it() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::for_test(d.path());
+        cfg.text_shard_bytes = 500;
+        let est = vec![60.0; 6];
+        write_bundle(&cfg, &plan(6, 4, 100), &est, "K", "k.epub", "K").expect("first");
+        let live = text_dir(&cfg.work, "K");
+        assert!(live.join("005.json").exists());
+        // A leftover from a build that was killed half way.
+        let stale = live.parent().expect("parent").join(".K.building-1-2");
+        std::fs::create_dir_all(&stale).expect("stale");
+
+        // Fewer chapters: a shard the old bundle had must not survive the swap.
+        write_bundle(&cfg, &plan(2, 4, 100), &est[..2], "K", "k.epub", "K").expect("second");
+        assert!(live.join("001.json").exists());
+        assert!(live.join("001.json.gz").exists());
+        assert!(
+            !live.join("005.json").exists(),
+            "a stale shard outlived the rebuild"
+        );
+        let names: Vec<String> = std::fs::read_dir(live.parent().expect("parent"))
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["K".to_string()],
+            "nothing left beside the bundle"
+        );
     }
 
     #[test]

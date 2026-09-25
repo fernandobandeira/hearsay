@@ -85,6 +85,15 @@ fn rewrite_at(cs: &[char], i: usize) -> Option<(usize, String)> {
     if i > 0 && cs[i - 1].is_alphanumeric() {
         return None;
     }
+    // Nor inside a number. The scan below swallows a `,` or `.` between digits,
+    // but a token it declines is skipped one character at a time, so the next
+    // attempt used to land just past the separator: `3.1415` became "3." and a
+    // year, "3.fourteen fifteen", and `25.12.2016` a date with a year bolted on.
+    // A digit run that follows `<digit>.` or `<digit>,` is the rest of a number
+    // that has already been looked at.
+    if i >= 2 && matches!(cs[i - 1], '.' | ',') && cs[i - 2].is_ascii_digit() {
+        return None;
+    }
     let currency = CURRENCIES
         .iter()
         .find(|(sym, _, _)| *sym == cs[i])
@@ -127,7 +136,7 @@ fn rewrite_at(cs: &[char], i: usize) -> Option<(usize, String)> {
             money(cs, after, &digits, &suffix, unit, sub)
                 .unwrap_or_else(|| (after, cs[i..after].iter().collect())),
         ),
-        None if part_of_a_larger_number(cs, i, after) => None,
+        None if part_of_a_larger_number(cs, i, after) => year_range(cs, i, &digits, &suffix, after),
         None => year(&digits, &suffix).map(|w| (after, w)),
     }
 }
@@ -141,13 +150,83 @@ fn rewrite_at(cs: &[char], i: usize) -> Option<(usize, String)> {
 /// leave a four-digit group stranded next to more digits. A trailing `,` or
 /// `.` followed by a space is a sentence, not a number, which is why the digit
 /// on the far side is what is tested rather than the separator alone.
+///
+/// An en dash joins exactly as a hyphen does. It used to be no joiner at all,
+/// so `1914–1918` read as two years while `1914-1918` read as two cardinals,
+/// and `555–1066` put a year in a phone number.
 fn part_of_a_larger_number(cs: &[char], start: usize, end: usize) -> bool {
-    const JOINERS: &[char] = &['-', '/', ':'];
     let before = start >= 2 && JOINERS.contains(&cs[start - 1]) && cs[start - 2].is_ascii_digit();
     let after = cs
         .get(end)
         .is_some_and(|c| JOINERS.contains(c) && cs.get(end + 1).is_some_and(char::is_ascii_digit));
     before || after
+}
+
+/// What may join a four-digit group to more digits: see
+/// [`part_of_a_larger_number`].
+const JOINERS: &[char] = &['-', '\u{2013}', '/', ':'];
+
+/// `1914-1918` and `1914–1918`: a span of years, "nineteen fourteen to
+/// nineteen eighteen".
+///
+/// The one joined group that *is* a year, and it is recognised narrowly so that
+/// everything [`part_of_a_larger_number`] protects stays protected: exactly two
+/// bare four-digit groups, joined by a hyphen or an en dash, both inside
+/// [`YEARS`], the second no earlier than the first, and nothing joined on
+/// either end. `555-1066` fails the first test, `1066-1050` the fourth,
+/// `1914-1918-1939` and `12-1914-1918` the last.
+///
+/// The dash becomes "to", which is what a person says, and neither dash can
+/// simply be kept: espeak-ng fuses two words joined by a hyphen into one
+/// (`fourteen-nineteen` comes out as a single `fˈɔːɹtiːnnˈaɪntiːn`), and an en
+/// dash between words is silence, which leaves four year-words in a row with
+/// nothing to say where the first year ends.
+fn year_range(
+    cs: &[char],
+    start: usize,
+    first: &str,
+    suffix: &str,
+    end: usize,
+) -> Option<(usize, String)> {
+    let four = |d: &str| d.len() == 4 && d.bytes().all(|b| b.is_ascii_digit());
+    if !suffix.is_empty() || !four(first) {
+        return None;
+    }
+    // Joined on the left means this is the far end of something already
+    // declined, not the start of a span.
+    if start >= 2 && JOINERS.contains(&cs[start - 1]) && cs[start - 2].is_ascii_digit() {
+        return None;
+    }
+    let dash = *cs.get(end)?;
+    if !matches!(dash, '-' | '\u{2013}') {
+        return None;
+    }
+    let second_start = end + 1;
+    let mut second_end = second_start;
+    while cs.get(second_end).is_some_and(char::is_ascii_digit) {
+        second_end += 1;
+    }
+    let second: String = cs[second_start..second_end].iter().collect();
+    if !four(&second) {
+        return None;
+    }
+    // Nothing after the second year but a boundary: not a letter, not another
+    // digit, not a joiner leading to one, not a decimal.
+    let tail = cs.get(second_end).copied();
+    if tail.is_some_and(char::is_alphanumeric)
+        || (tail.is_some_and(|c| JOINERS.contains(&c) || matches!(c, '.' | ','))
+            && cs.get(second_end + 1).is_some_and(char::is_ascii_digit))
+    {
+        return None;
+    }
+    let (a, b): (u64, u64) = (first.parse().ok()?, second.parse().ok()?);
+    if !YEARS.contains(&a) || !YEARS.contains(&b) || b < a {
+        return None;
+    }
+    Some((
+        second_end,
+        format!("{} to {}", year(first, "")?, year(&second, "")?),
+    ))
 }
 
 /// `$1,500.50` -> `1500 dollars and 50 cents`, and the plain cases beside it.
@@ -174,9 +253,13 @@ fn money(
     let bare = digits.replace(',', "");
     let (whole, cents) = match bare.split_once('.') {
         // Only an exact two-digit fraction is hundredths. `$1.5` is an amount,
-        // not one dollar and five cents, whatever misaki makes of it.
+        // not one dollar and five cents, whatever misaki makes of it: "1.5
+        // dollars", the decimal left to espeak-ng, the unit plural because a
+        // fraction of anything is — "one point five dollars", "one point oh
+        // dollars".
         Some((w, c)) if c.len() == 2 => (w.to_string(), Some(c.to_string())),
-        _ => (bare.clone(), None),
+        Some(_) => return Some((after, format!("{bare} {}", plural(unit)))),
+        None => (bare.clone(), None),
     };
     let mut parts: Vec<String> = Vec::new();
     let whole_n: u64 = whole.parse().ok()?;
@@ -195,8 +278,14 @@ fn money(
 /// as it was written: espeak-ng reads an all-caps word differently, and a
 /// rewrite has no business changing the case of a word it is only moving.
 fn following_scale(cs: &[char], at: usize) -> Option<(usize, String)> {
+    // A no-break space is what typeset money puts there on purpose (`$5\u{a0}million`,
+    // and the narrow one French typography uses), so it separates exactly as a
+    // space does.
     let mut i = at;
-    while cs.get(i).is_some_and(|c| *c == ' ') {
+    while cs
+        .get(i)
+        .is_some_and(|c| matches!(c, ' ' | '\u{a0}' | '\u{202f}'))
+    {
         i += 1;
     }
     if i == at {
@@ -251,6 +340,13 @@ fn year(digits: &str, suffix: &str) -> Option<String> {
     if !plural_wanted {
         return Some(words);
     }
+    // "one thousand" pluralised word by word is "one thousands", which nobody
+    // says: `1000s of people` is "thousands of people". `2000s` is left to the
+    // rule below — "two thousands" is how the decade is spoken, "the two
+    // thousands" — and nothing else in the range is a whole thousand.
+    if n == 1000 {
+        return Some("thousands".into());
+    }
     let (head, last) = match words.rsplit_once(' ') {
         Some((h, l)) => (Some(h), l),
         None => (None, words.as_str()),
@@ -290,6 +386,66 @@ mod tests {
             "worth 1.5 million dollars today"
         );
         assert_eq!(n("$3 BILLION"), "3 BILLION dollars");
+        // A no-break space is a space.
+        assert_eq!(n("$5\u{a0}million"), "5 million dollars");
+        assert_eq!(n("$5\u{202f}million"), "5 million dollars");
+    }
+
+    #[test]
+    fn an_amount_that_is_not_hundredths_is_still_an_amount() {
+        // Consumed verbatim, `$1.5` was "dollar one point five".
+        assert_eq!(n("It was $1.5."), "It was 1.5 dollars.");
+        assert_eq!(n("$2.5 each"), "2.5 dollars each");
+        assert_eq!(n("£1.005"), "1.005 pounds");
+        assert_eq!(n("$1.0"), "1.0 dollars");
+    }
+
+    #[test]
+    fn a_rewrite_never_starts_inside_a_number() {
+        for same in [
+            "pi is 3.1415 or so",
+            "0.1234 of it",
+            "1.2000 exactly",
+            "12,1990 of them",
+            "on 25.12.2016",
+            "12,345,1990",
+        ] {
+            assert_eq!(n(same), same, "{same}");
+        }
+    }
+
+    #[test]
+    fn a_whole_thousand_pluralises_the_way_people_say_it() {
+        assert_eq!(n("1000s of people"), "thousands of people");
+        assert_eq!(n("the 2000s"), "the two thousands");
+        assert_eq!(n("the 1100s"), "the eleven hundreds");
+    }
+
+    #[test]
+    fn a_span_of_years_reads_the_same_whichever_dash_joins_it() {
+        let span = "the nineteen fourteen to nineteen eighteen war";
+        assert_eq!(n("the 1914-1918 war"), span);
+        assert_eq!(n("the 1914\u{2013}1918 war"), span);
+        assert_eq!(
+            n("(1939-1945)."),
+            "(nineteen thirty-nine to nineteen forty-five)."
+        );
+        assert_eq!(n("1066-1066"), "ten sixty-six to ten sixty-six");
+        // Not a span: backwards, abbreviated, three groups, out of range, or
+        // part of something with more digits in it.
+        for same in [
+            "1918-1914",
+            "1914-18",
+            "1914-1918-1939",
+            "12-1914-1918",
+            "1914-1918s",
+            "1914-1918.5",
+            "0999-1066",
+            "1990-2100",
+            "555\u{2013}1066",
+        ] {
+            assert_eq!(n(same), same, "{same}");
+        }
     }
 
     #[test]
@@ -328,12 +484,11 @@ mod tests {
     fn a_four_digit_group_of_something_bigger_is_not_a_year() {
         for same in [
             "call 555-1066",
-            "the 1050-1066 war",
+            "the 1066-1050 ledger",
             "12/1066 in the ledger",
             "10:1066",
             "$1990s",
             "$20k",
-            "$1.005",
         ] {
             assert_eq!(n(same), same, "{same}");
         }

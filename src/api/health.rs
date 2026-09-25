@@ -83,7 +83,9 @@ pub async fn healthz(State(st): State<Arc<AppState>>) -> Response {
             s.status.clone(),
             s.error.clone(),
             s.build_error.clone(),
-            s.model_ready,
+            // The session's flag is set when the worker starts; an engine that
+            // failed then and has loaded since is ready now.
+            s.model_ready || st.engine.ready(),
             s.book_name(),
             want,
             s.queue.len(),
@@ -126,6 +128,13 @@ pub async fn healthz(State(st): State<Arc<AppState>>) -> Response {
             "no chunk finished in {}s while status={status}",
             since as i64
         ));
+    }
+    // A model that was asked for and would not load is a reader that renders
+    // nothing, with every endpoint answering 200. Not reported while it has
+    // simply not been asked for yet — loading is lazy — and never under the
+    // fake. The engine retries on its own, so this clears when it heals.
+    if let Some(e) = st.engine.load_failure() {
+        problems.push(format!("tts model failed to load: {e}"));
     }
     if let Err(e) = std::fs::create_dir_all(&st.cfg.work)
         .and_then(|()| std::fs::write(st.cfg.work.join(".healthz"), b"1"))

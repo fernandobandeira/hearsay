@@ -89,6 +89,31 @@ async fn a_book_that_was_never_parsed_is_still_parsed() {
         .exists());
 }
 
+#[tokio::test]
+async fn a_load_that_fails_leaves_the_loaded_book_rendering() {
+    // The renderer used to be stopped before the parse, and the 400 paths never
+    // started it again: one wrong path from any client silenced the book that
+    // was still loaded, with nothing in the session to say so.
+    let h = Harness::new().await;
+    let first = h.load().await;
+    let (code, _) = h.post_json("/api/renderer", json!({"on": true})).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(h.state.run.is_set());
+
+    let bogus = h.root().join("not-a-book.epub");
+    std::fs::write(&bogus, b"this is not a zip").expect("write");
+    let (code, body) = h
+        .post_json("/api/load", json!({"path": bogus.to_string_lossy()}))
+        .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{body}");
+    assert!(h.state.run.is_set(), "a refused load stopped the renderer");
+    assert_eq!(
+        h.state.session().key().as_deref(),
+        first["key"].as_str(),
+        "and the book is still the one that was loaded"
+    );
+}
+
 /// 2. `/api/chapter/{ci}` must take `?book=`.
 #[tokio::test]
 async fn chapter_text_is_servable_for_a_book_the_session_is_not_holding() {
@@ -217,6 +242,30 @@ async fn an_unwritable_positions_dir_is_a_health_problem_not_a_silence() {
             .any(|x| x.as_str().is_some_and(|s| s.contains("positions dir")))),
         "{body}"
     );
+}
+
+#[tokio::test]
+async fn a_model_that_will_not_load_is_a_health_problem_once_it_was_asked_for() {
+    let h = Harness::with(|c| {
+        c.fake_tts = false;
+        c.kokoro_model = c.work.join("no-such-model.onnx");
+        c.kokoro_voices_dir = c.work.join("no-such-voices");
+    })
+    .await;
+    // Loading is lazy: a model nobody has asked for yet is not a failure.
+    let (code, body) = h.get_json("/healthz").await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+
+    assert!(!h.state.engine.load());
+    let (code, body) = h.get_json("/healthz").await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body["problems"].as_array().is_some_and(|p| p
+            .iter()
+            .any(|x| x.as_str().is_some_and(|s| s.contains("tts model")))),
+        "{body}"
+    );
+    assert_eq!(body["model_ready"], json!(false));
 }
 
 /// 6. `/api/chapters` must be windowable.

@@ -77,39 +77,109 @@ fn parse_range(raw: &str, size: u64) -> Option<Result<(u64, u64), ()>> {
     if !lo.chars().all(|c| c.is_ascii_digit()) || !hi.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
+    // Both halves are digits by now, so the only way a parse fails is a number
+    // too big for a u64 — which is a position past the end of any file, not the
+    // zero the old `unwrap_or(0)` made of it (that turned an absurd start into
+    // a 206 of the whole file).
+    let num = |s: &str| s.parse::<u64>().unwrap_or(u64::MAX);
     if lo.is_empty() {
-        // Suffix form: the last N bytes.
-        let n: u64 = hi.parse().unwrap_or(0);
-        return Some(Ok((size.saturating_sub(n), size.saturating_sub(1))));
+        // `bytes=-` names no range at all: ignored, like any malformed header.
+        if hi.is_empty() {
+            return None;
+        }
+        // Suffix form: the last N bytes. The last *zero* bytes, or any bytes of
+        // an empty file, is a range nothing can satisfy (RFC 9110 14.1.3) — not
+        // a 206 claiming `bytes 0-0/0` over an empty body.
+        let n = num(hi);
+        if n == 0 || size == 0 {
+            return Some(Err(()));
+        }
+        return Some(Ok((size - n.min(size), size - 1)));
     }
-    let start: u64 = lo.parse().unwrap_or(0);
-    let end: u64 = if hi.is_empty() {
-        size.saturating_sub(1)
-    } else {
-        hi.parse().unwrap_or(0)
-    };
+    let start = num(lo);
+    let end = if hi.is_empty() { u64::MAX } else { num(hi) };
+    // `start >= size` also covers the empty file, where every range misses.
     if start >= size || start > end {
         return Some(Err(()));
     }
-    Some(Ok((start, end.min(size.saturating_sub(1)))))
+    // An end past the file — including one too big to parse — means "to the
+    // end", which is what a client asking for more than there is gets.
+    Some(Ok((start, end.min(size - 1))))
 }
 
-/// Serve a file with byte ranges, honouring HEAD.
+/// `Cache-Control` for audio whose URL does not change when its bytes do.
+///
+/// That is every caller of [`ranged`], checked one by one:
+///
+/// - `/api/chunk/{ci}/{i}.wav` does not name the book at all — it means the
+///   loaded one — so a year of caching served book A's chunk 3 to a device that
+///   had since opened book B, and a chunk re-rendered or `retrim`med kept its
+///   old audio on every device that had heard it.
+/// - `/api/chapters/{ci}.m4a` names the book (when `?book=` is sent) but not the
+///   build: a forced rebuild, `narrator migrate`, a book re-rendered for a
+///   pronunciation fix all replace the file under the same URL. Its manifest
+///   carries the same policy, because a fresh manifest over a cached m4a seeks
+///   to the wrong words.
+/// - `/api/hls/{book}/{ci}/segNNNNN.m4s` is re-cut under the same names
+///   whenever the m4a it is cut from is rebuilt.
+///
+/// So all of it revalidates: stored, but asked about before use. The asking is
+/// cheap because [`ranged`] answers `If-Modified-Since` with a 304, and the
+/// reader's offline copies live in Cache Storage, which this does not touch.
+pub const AUDIO_CACHE: &str = "no-cache";
+
+/// An HTTP-date for `Last-Modified`, whole seconds, always GMT.
+fn http_date(t: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(t)
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string()
+}
+
+/// Is the file no newer than the client's `If-Modified-Since`? Anything that
+/// does not parse is "modified", which only ever costs a full response.
+fn not_modified(req_headers: &HeaderMap, mtime: std::time::SystemTime) -> bool {
+    let Some(since) = req_headers
+        .get(header::IF_MODIFIED_SINCE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| chrono::DateTime::parse_from_rfc2822(v.trim()).ok())
+    else {
+        return false;
+    };
+    chrono::DateTime::<chrono::Utc>::from(mtime).timestamp() <= since.timestamp()
+}
+
+/// Serve a file with byte ranges, honouring HEAD and `If-Modified-Since`.
 pub async fn ranged(
     req_headers: &HeaderMap,
     is_head: bool,
     path: &std::path::Path,
     media_type: &str,
+    cache: &str,
 ) -> Response {
     let Ok(md) = tokio::fs::metadata(path).await else {
         return err(StatusCode::NOT_FOUND, "not built");
     };
     let size = md.len();
-    let base = [
+    let mtime = md.modified().ok();
+    let mut base = vec![
         (header::ACCEPT_RANGES, "bytes".to_string()),
-        (header::CACHE_CONTROL, "public, max-age=31536000".into()),
+        (header::CACHE_CONTROL, cache.to_string()),
         (header::CONTENT_TYPE, media_type.to_string()),
     ];
+    if let Some(t) = mtime {
+        base.push((header::LAST_MODIFIED, http_date(t)));
+    }
+    // Checked before the range, as RFC 9110 orders it: a copy the client already
+    // holds is a 304 whatever part of it was asked for.
+    if mtime.is_some_and(|t| not_modified(req_headers, t)) {
+        let mut r = Response::builder().status(StatusCode::NOT_MODIFIED);
+        for (k, v) in base {
+            r = r.header(k, v);
+        }
+        return r
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
     if is_head {
         let mut r = Response::builder().status(StatusCode::OK);
         for (k, v) in base {
@@ -197,13 +267,14 @@ pub fn accepts_gzip(headers: &HeaderMap) -> bool {
     let mut gzip = None;
     let mut star = None;
     for part in raw.split(',') {
-        let (name, params) = match part.split_once(';') {
-            Some((n, p)) => (n.trim(), p.trim()),
-            None => (part.trim(), ""),
-        };
+        let mut params = part.split(';');
+        let name = params.next().unwrap_or("").trim();
+        // The weight is whichever parameter is `q`, wherever it sits — a
+        // refusal written `gzip;level=9;q=0` is still a refusal.
         let q = params
-            .strip_prefix("q=")
-            .map_or(1.0, |v| v.parse::<f64>().unwrap_or(1.0));
+            .filter_map(|p| p.split_once('='))
+            .find(|(k, _)| k.trim() == "q")
+            .map_or(1.0, |(_, v)| v.trim().parse::<f64>().unwrap_or(1.0));
         match name {
             "gzip" => gzip = Some(q),
             "*" => star = Some(q),
@@ -306,6 +377,26 @@ pub async fn json_file(path: &std::path::Path, cache: &str, missing: &str) -> Re
 )]
 pub struct ApiDoc;
 
+/// The largest `/api/note` body taken: a base64 memo, so ~48 MB of audio.
+///
+/// axum's `Json` extractor refuses anything over 2 MB by default, which is about
+/// a minute and a half of opus once base64 has had its third — and the reader
+/// reads that 413 as a rejection, not as "ask again", so a long memo was never
+/// filed and never retried. The ceiling is deliberately far above any memo a
+/// person records, and applies to this one route: nothing else here takes a
+/// body worth more than a few kilobytes.
+pub const NOTE_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// `/api/note`, with its own body limit layered onto the route and nothing else.
+fn note_route() -> utoipa_axum::router::UtoipaMethodRouter<Arc<AppState>> {
+    let (schemas, paths, method) = routes!(notes::note);
+    (
+        schemas,
+        paths,
+        method.layer(axum::extract::DefaultBodyLimit::max(NOTE_BODY_LIMIT)),
+    )
+}
+
 pub fn router(state: Arc<AppState>) -> (axum::Router, utoipa::openapi::OpenApi) {
     // A voice memo the last process was transcribing when it was killed — a
     // deploy, the watchdog, a restart nobody meant — is owed to the vault and
@@ -333,7 +424,7 @@ pub fn router(state: Arc<AppState>) -> (axum::Router, utoipa::openapi::OpenApi) 
         .routes(routes!(chapters::chapters_cancel))
         .routes(routes!(library::library))
         .routes(routes!(media::hls_segment))
-        .routes(routes!(notes::note))
+        .routes(note_route())
         .routes(routes!(stream::events))
         .routes(routes!(health::healthz))
         .with_state(state.clone())
@@ -497,6 +588,64 @@ fn not_built() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranges_that_cannot_be_satisfied_are_refused_not_mangled() {
+        // The last zero bytes, and anything of an empty file: a 416.
+        assert_eq!(parse_range("bytes=-0", 100), Some(Err(())));
+        assert_eq!(parse_range("bytes=-5", 0), Some(Err(())));
+        assert_eq!(parse_range("bytes=0-", 0), Some(Err(())));
+        assert_eq!(parse_range("bytes=0-0", 0), Some(Err(())));
+        // `bytes=-` names nothing, so it is ignored.
+        assert_eq!(parse_range("bytes=-", 100), None);
+        // A start too big for a u64 is past the end, not zero.
+        assert_eq!(
+            parse_range("bytes=99999999999999999999999-", 100),
+            Some(Err(()))
+        );
+        // An end too big for a u64 is "to the end", and so is a suffix longer
+        // than the file.
+        assert_eq!(
+            parse_range("bytes=10-99999999999999999999999", 100),
+            Some(Ok((10, 99)))
+        );
+        assert_eq!(
+            parse_range("bytes=-99999999999999999999999", 100),
+            Some(Ok((0, 99)))
+        );
+        assert_eq!(parse_range("bytes=-1", 1), Some(Ok((0, 0))));
+    }
+
+    fn enc(v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::ACCEPT_ENCODING, v.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn a_zero_weight_refuses_gzip_wherever_it_is_written() {
+        assert!(accepts_gzip(&enc("gzip")));
+        assert!(accepts_gzip(&enc("br, gzip;q=0.5")));
+        assert!(!accepts_gzip(&enc("gzip;q=0")));
+        assert!(!accepts_gzip(&enc("gzip; q=0")));
+        assert!(!accepts_gzip(&enc("gzip;level=9;q=0")));
+        assert!(!accepts_gzip(&enc("gzip ; foo=bar ; q = 0")));
+        assert!(!accepts_gzip(&enc("*;q=0")));
+        assert!(!accepts_gzip(&enc("br")));
+        assert!(accepts_gzip(&enc("*")));
+    }
+
+    #[test]
+    fn last_modified_is_an_http_date_that_reads_back() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+        let d = http_date(t);
+        assert!(d.ends_with(" GMT"), "{d}");
+        let mut h = HeaderMap::new();
+        h.insert(header::IF_MODIFIED_SINCE, d.parse().unwrap());
+        assert!(not_modified(&h, t));
+        assert!(!not_modified(&h, t + std::time::Duration::from_secs(1)));
+        assert!(!not_modified(&HeaderMap::new(), t));
+    }
 
     #[test]
     fn ranges_parse_the_forms_ios_actually_sends() {

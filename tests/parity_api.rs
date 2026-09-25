@@ -723,3 +723,59 @@ async fn naming_the_loaded_book_is_the_same_as_naming_nothing() {
         assert_eq!(a, b, "{name}");
     }
 }
+
+#[tokio::test]
+async fn a_chunk_wav_revalidates_instead_of_being_pinned_for_a_year() {
+    // `/api/chunk/{ci}/{i}.wav` does not name the book, so a year of caching
+    // served one book's chunk for another's, and a retrimmed chunk kept its old
+    // audio. It revalidates now, and the revalidation is a 304.
+    let h = Harness::new().await;
+    let loaded = h.load().await;
+    let key = loaded["key"].as_str().unwrap_or_default().to_string();
+    let p = narrator::cache::chunk_path(&h.work(), &key, 0, 0);
+    std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&p, vec![7u8; 100]).expect("write");
+
+    let res = h
+        .raw("GET", "/api/chunk/0/0.wav", &[("range", "bytes=0-9")])
+        .await;
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(header(&res, "cache-control").as_deref(), Some("no-cache"));
+    let lm = header(&res, "last-modified").expect("last-modified");
+    assert_eq!(body_of(res).await.len(), 10);
+
+    let res = h
+        .raw("GET", "/api/chunk/0/0.wav", &[("if-modified-since", &lm)])
+        .await;
+    assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    assert!(body_of(res).await.is_empty());
+
+    // The ranges that used to come back as a broken 206.
+    for bad in ["bytes=-0", "bytes=99999999999999999999999-"] {
+        let res = h.raw("GET", "/api/chunk/0/0.wav", &[("range", bad)]).await;
+        assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE, "{bad}");
+        assert_eq!(
+            header(&res, "content-range").as_deref(),
+            Some("bytes */100"),
+            "{bad}"
+        );
+    }
+    let res = h
+        .raw(
+            "GET",
+            "/api/chunk/0/0.wav",
+            &[("range", "bytes=90-99999999999999999999999")],
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        header(&res, "content-range").as_deref(),
+        Some("bytes 90-99/100")
+    );
+
+    std::fs::write(&p, b"").expect("empty");
+    let res = h
+        .raw("GET", "/api/chunk/0/0.wav", &[("range", "bytes=0-1")])
+        .await;
+    assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+}

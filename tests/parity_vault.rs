@@ -200,3 +200,50 @@ fn writing_the_vault_produces_both_files() {
     let back = vault::load_positions(dir.path());
     assert_eq!(back, pos);
 }
+
+#[test]
+fn concurrent_position_writes_leave_one_whole_file() {
+    // Many writers at once, each with a map one book larger than the last. The
+    // file must always parse, must be exactly `dumps_indent1` of *some* map a
+    // writer handed over, and nothing temporary may be left beside it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Positions::new()));
+    let threads: Vec<_> = (0..16)
+        .map(|n| {
+            let path = path.clone();
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                for k in 0..10 {
+                    shared.lock().expect("lock").insert(
+                        format!("book {n}-{k}.epub"),
+                        serde_json::json!({"chapter": k, "chunk": n, "chapter_title": "é",
+                            "chunks_total": 1, "chapters_total": 1,
+                            "updated": "2026-09-25T10:00:00"}),
+                    );
+                    vault::write_positions_from(&path, || shared.lock().expect("lock").clone())
+                        .expect("write");
+                    let back = vault::load_positions(&path);
+                    assert!(!back.is_empty(), "a reader saw an empty or torn file");
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().expect("join");
+    }
+    // The last write took the last snapshot, so every book is on disk.
+    let fin = shared.lock().expect("lock").clone();
+    let raw = std::fs::read_to_string(vault::positions_file(&path)).expect("read");
+    assert_eq!(
+        raw,
+        vault::dumps_indent1(&serde_json::Value::Object(fin.clone()))
+    );
+    assert_eq!(vault::load_positions(&path).len(), 160);
+    let names: Vec<_> = std::fs::read_dir(&path)
+        .expect("dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+}

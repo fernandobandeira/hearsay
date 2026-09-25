@@ -129,24 +129,49 @@ pub fn model_path(spec: &str, models_dir: &Path) -> PathBuf {
     }
 }
 
+/// How long ffmpeg gets to decode one memo before it is killed.
+///
+/// Decoding is the cheap part — seconds for a long memo even on the A1 — so a
+/// decode still running after two minutes is wedged, not busy: a recording
+/// ffmpeg is looping on, a filesystem that stopped answering. And it is wedged
+/// *while holding the STT gate*, which parks the renderer and the packer, so an
+/// unbounded wait here is the whole box standing still for one bad file.
+pub const DECODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Decode any container ffmpeg understands into 16 kHz mono f32.
 pub fn decode_16k_mono(path: &Path) -> Result<Vec<f32>, SttError> {
-    let out = std::process::Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(path)
-        .args([
-            "-f",
-            "f32le",
-            "-acodec",
-            "pcm_f32le",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-",
-        ])
-        .output()
-        .map_err(|e| SttError::Decode(format!("ffmpeg: {e}")))?;
+    decode_16k_mono_within(path, "ffmpeg", DECODE_TIMEOUT)
+}
+
+/// [`decode_16k_mono`] with the binary and the deadline named, so a test can
+/// make a wedge cheap.
+fn decode_16k_mono_within(
+    path: &Path,
+    ffmpeg: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<f32>, SttError> {
+    let mut cmd = std::process::Command::new(ffmpeg);
+    // `-nostdin`: ffmpeg reads the terminal for interactive keys unless told
+    // not to, and a server has no terminal to give it.
+    cmd.args(["-nostdin", "-v", "error", "-i"]).arg(path).args([
+        "-f",
+        "f32le",
+        "-acodec",
+        "pcm_f32le",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-",
+    ]);
+    use crate::tts::g2p::{output_within, Bounded};
+    let out = output_within(&mut cmd, timeout).map_err(|e| match e {
+        Bounded::Spawn(e) | Bounded::Pipes(e) => SttError::Decode(format!("{ffmpeg}: {e}")),
+        Bounded::TimedOut => SttError::Decode(format!(
+            "{ffmpeg} did not finish within {}s; killed",
+            timeout.as_secs()
+        )),
+    })?;
     if !out.status.success() {
         let e = String::from_utf8_lossy(&out.stderr);
         return Err(SttError::Decode(
@@ -219,10 +244,21 @@ mod real {
             let audio = decode_16k_mono(path)?;
             // Serialized: the model is loaded once and one transcription runs at
             // a time.
-            let mut guard = self
-                .ctx
-                .lock()
-                .map_err(|_| SttError::Failed("transcriber mutex poisoned".into()))?;
+            //
+            // A panic inside whisper.cpp's bindings poisons this lock, and
+            // refusing every memo after it would turn one bad recording into no
+            // voice notes until a restart. The context that was mid-transcription
+            // is not trusted, though: it is dropped and the model loaded afresh.
+            let mut guard = match self.ctx.lock() {
+                Ok(g) => g,
+                Err(p) => {
+                    tracing::error!("whisper: a transcription panicked; reloading the model");
+                    let mut g = p.into_inner();
+                    *g = None;
+                    self.ctx.clear_poison();
+                    g
+                }
+            };
             if guard.is_none() {
                 let c = WhisperContext::new_with_params(
                     &self.model,
@@ -318,6 +354,41 @@ pub use real::Whisper;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wedged_ffmpeg_is_killed_rather_than_holding_the_gate_forever() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().expect("tempdir");
+        let bin = d.path().join("ffmpeg-wedged");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 300\n").expect("stub");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let memo = d.path().join("memo.webm");
+        std::fs::write(&memo, b"not really a webm").expect("memo");
+        let t0 = std::time::Instant::now();
+        let e = decode_16k_mono_within(
+            &memo,
+            &bin.to_string_lossy(),
+            std::time::Duration::from_millis(150),
+        )
+        .expect_err("must not succeed");
+        assert!(
+            matches!(e, SttError::Decode(ref m) if m.contains("killed")),
+            "{e}"
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_missing_ffmpeg_is_a_decode_error_not_a_hang() {
+        let e = decode_16k_mono_within(
+            Path::new("/nonexistent.webm"),
+            "/nonexistent/ffmpeg",
+            std::time::Duration::from_secs(1),
+        )
+        .expect_err("must not succeed");
+        assert!(matches!(e, SttError::Decode(_)), "{e}");
+    }
 
     #[test]
     fn a_bare_model_name_resolves_under_the_models_dir() {

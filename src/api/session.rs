@@ -111,12 +111,6 @@ pub struct LoadResult {
     )
 )]
 pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -> Response {
-    // Stop the renderer before the plan changes underneath it.
-    st.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    st.run.clear();
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    st.stop.store(false, std::sync::atomic::Ordering::SeqCst);
-
     let path = body.path.clone();
     let max_chars = body.max_chars.unwrap_or(crate::book::DEFAULT_MAX_CHARS);
     let key = cache::book_key(&body.path);
@@ -124,10 +118,27 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
     // Re-parsing an unchanged book is the reader's twelve-second wait on first
     // paint, and it buys nothing: the plan is already on disk. Reuse it when the
     // file's size and mtime still match the stamp it was built from.
-    let want = plancache::stamp(Path::new(&path), max_chars);
-    let cached = want
-        .as_ref()
-        .and_then(|s| plancache::load(&st.cfg.work, &key, s));
+    //
+    // A `stat` and a read of a plan that is megabytes of JSON on the big book:
+    // blocking work, so it goes where blocking work goes. The box runs two
+    // runtime workers, and a load that holds one of them holds half the API.
+    let probed = tokio::task::spawn_blocking({
+        let (work, key, path) = (st.cfg.work.clone(), key.clone(), path.clone());
+        move || {
+            let want = plancache::stamp(Path::new(&path), max_chars);
+            let cached = want.as_ref().and_then(|s| plancache::load(&work, &key, s));
+            (want, cached)
+        }
+    })
+    .await;
+    let (want, cached) = match probed {
+        Ok(v) => v,
+        // Only a panic gets here, and a parse is the honest fallback for one.
+        Err(e) => {
+            tracing::warn!("load: probing the plan cache failed ({e}); parsing instead");
+            (None, None)
+        }
+    };
     let reused = cached.is_some();
     let plan: Arc<Vec<_>> = match cached {
         Some(p) => {
@@ -143,6 +154,10 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
                 extract_chapters(Path::new(&p2)).map(|c| build_plan(&c, max_chars))
             })
             .await;
+            // A refusal here leaves the session exactly as it was: the renderer
+            // has not been touched yet, so the book that is still loaded keeps
+            // rendering. It used to be stopped first, and a path the reader got
+            // wrong silenced a book nobody had asked to leave.
             match parsed {
                 Ok(Ok(p)) => Arc::new(p),
                 Ok(Err(e)) => return err(StatusCode::BAD_REQUEST, e.to_string()),
@@ -150,6 +165,13 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
             }
         }
     };
+
+    // Stop the renderer before the plan changes underneath it — now, with the
+    // new plan in hand, and not a moment before.
+    st.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    st.run.clear();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    st.stop.store(false, std::sync::atomic::Ordering::SeqCst);
 
     let est: Vec<f64> = plan
         .iter()
@@ -187,92 +209,32 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
         s.pack_queue.clear();
     }
 
-    // ... and then this book's own wishlist back, if it has one.
-    //
-    // Clearing the queues above is right — they are indices into the plan that
-    // has just been replaced — but on its own it would quietly undo the thing
-    // `wishlist` exists for. The reader re-opens the book it was on when the app
-    // starts, which is an `/api/load`, so a 74-chapter download that a restart
-    // had just picked back up would be wiped by a phone coming out of a pocket.
-    // The list is the book's, not the session's: it comes back with the book,
-    // and switching to something else for ten minutes no longer costs it.
-    let taken = crate::wishlist::adopt(&st);
-    if !taken.is_empty() {
-        // Queued work is what starts the worker, exactly as the POST that
-        // created the list would have.
-        tracing::info!("load: {} chapter(s) still wanted for {key}", taken.len());
-        st.run.set();
-        render::ensure_render_thread(&st);
-    }
-
-    // Drop the plan next to the cached audio: `narrator export` packs the
-    // streaming cache into an .m4b from it without the container, and the stamp
-    // beside it is what lets the next load skip the parse entirely.
-    if !reused {
-        if let Some(s) = &want {
-            if let Err(e) = plancache::store(&st.cfg.work, &key, &plan, s) {
-                tracing::warn!("could not write plan.json: {e}");
-            }
-        }
-    }
-    // The bundle is rebuilt whenever the plan was: re-parsing can move chunk
-    // boundaries and a stale shard puts every position in it on the wrong
-    // words. A reused plan is by definition the same words, so the bundle is
-    // only written when it is missing — which is also how a load recovers from
-    // a half-written one.
-    //
-    // A bundle written before the files were pre-gzipped has no `.gz` beside
-    // it, and a reused plan would never give it one; the words have not moved,
-    // so rewriting the bundle is both harmless and the cheapest way to earn the
-    // compressed copy every device then reads for the life of the book.
-    let bundle = crate::text::text_dir(&st.cfg.work, &key).join("index.json");
-    if !reused || !bundle.exists() || !crate::text::gz_path(&bundle).exists() {
-        if let Err(e) = crate::text::write_bundle(&st.cfg, &plan, &est, &key, &name, &title) {
-            tracing::warn!("could not write text bundle: {e}");
-        }
-    }
-
-    // The library register, *after* the plan and the bundle are on disk.
-    //
-    // `/api/load` is the one moment the server learns a book's key, name, path,
-    // title and chapter count all at once, and writing it down is what lets
-    // everything else answer about a book the session is not holding — the
-    // readiness view, the scheduler's "the most recently opened book", a
-    // standing order placed on something else entirely.
-    //
-    // The index is written from the plan **in memory** rather than through
-    // `library::rescan_book`, which re-reads `plan.json`. That is not an
-    // optimisation: on a cold load the plan is written a few lines above this,
-    // so a version of this that read the file had to sit below it anyway — and
-    // reading back what we are already holding is a way to be subtly wrong for
-    // no gain. Without it the book reports zero chapters and zero chunks until
-    // the scanner's next tick, which is up to `LIBRARY_SCAN_EVERY_S` of a
-    // freshly opened book looking empty.
-    if let Some(db) = st.store() {
-        let now_ms = chrono::Local::now().timestamp_millis();
-        let row = crate::store::BookRow {
+    // Everything from here to the response is files and sqlite — the wishlist,
+    // `plan.json`, a text bundle that is ~17 MB of level-9 gzip on the big book,
+    // a library scan, `session.json` — so it runs as one blocking job, in the
+    // order it always ran in. The response waits for it, exactly as before: a
+    // reader that gets its 200 can ask for a shard straight away.
+    let finished = tokio::task::spawn_blocking({
+        let st = st.clone();
+        let done = Loaded {
+            plan: plan.clone(),
+            est: est.clone(),
             key: key.clone(),
             name: name.clone(),
-            path: body.path.clone(),
             title: title.clone(),
-            chapters: plan.len(),
-            last_open_ms: Some(now_ms),
-            scanned_ms: Some(now_ms),
+            path: path.clone(),
+            max_chars,
+            reused,
+            want,
         };
-        if let Err(e) = db.put_book(&row) {
-            tracing::warn!("could not register {key}: {e}");
-        } else if let Err(e) = db.touch_book_open(&key, now_ms) {
-            tracing::warn!("could not stamp {key} as opened: {e}");
-        }
-        let rows = crate::library::scan_book(&st.cfg, &key, &plan);
-        if let Err(e) = db.put_chapter_index(&key, &rows) {
-            tracing::warn!("could not index {key}: {e}");
-        }
+        move || finish_load(&st, &done)
+    })
+    .await;
+    if let Err(e) = finished {
+        // The book is loaded; what failed is bookkeeping around it, and each
+        // part of that already logs and degrades on its own.
+        tracing::warn!("load: finishing {key} failed: {e}");
     }
-
-    // Which book this process is on is worth one small file: it is what lets the
-    // next process come back on it. See `restore_session`.
-    save_session(&st, &body.path, max_chars);
 
     let position = st
         .positions()
@@ -298,6 +260,112 @@ pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -
             .collect(),
     })
     .into_response()
+}
+
+/// What the blocking half of `/api/load` works from, owned so it can leave the
+/// runtime.
+struct Loaded {
+    plan: Arc<Vec<crate::book::Chapter>>,
+    est: Vec<f64>,
+    key: String,
+    name: String,
+    title: String,
+    path: String,
+    max_chars: usize,
+    reused: bool,
+    want: Option<plancache::Stamp>,
+}
+
+/// The blocking half of `/api/load`, after the session holds the new plan.
+fn finish_load(st: &Arc<AppState>, l: &Loaded) {
+    let key = l.key.as_str();
+    // ... and then this book's own wishlist back, if it has one.
+    //
+    // Clearing the queues above is right — they are indices into the plan that
+    // has just been replaced — but on its own it would quietly undo the thing
+    // `wishlist` exists for. The reader re-opens the book it was on when the app
+    // starts, which is an `/api/load`, so a 74-chapter download that a restart
+    // had just picked back up would be wiped by a phone coming out of a pocket.
+    // The list is the book's, not the session's: it comes back with the book,
+    // and switching to something else for ten minutes no longer costs it.
+    let taken = crate::wishlist::adopt(st);
+    if !taken.is_empty() {
+        // Queued work is what starts the worker, exactly as the POST that
+        // created the list would have.
+        tracing::info!("load: {} chapter(s) still wanted for {key}", taken.len());
+        st.run.set();
+        render::ensure_render_thread(st);
+    }
+
+    // Drop the plan next to the cached audio: `narrator export` packs the
+    // streaming cache into an .m4b from it without the container, and the stamp
+    // beside it is what lets the next load skip the parse entirely.
+    if !l.reused {
+        if let Some(s) = &l.want {
+            if let Err(e) = plancache::store(&st.cfg.work, key, &l.plan, s) {
+                tracing::warn!("could not write plan.json: {e}");
+            }
+        }
+    }
+    // The bundle is rebuilt whenever the plan was: re-parsing can move chunk
+    // boundaries and a stale shard puts every position in it on the wrong
+    // words. A reused plan is by definition the same words, so the bundle is
+    // only written when it is missing — which is also how a load recovers from
+    // a half-written one.
+    //
+    // A bundle written before the files were pre-gzipped has no `.gz` beside
+    // it, and a reused plan would never give it one; the words have not moved,
+    // so rewriting the bundle is both harmless and the cheapest way to earn the
+    // compressed copy every device then reads for the life of the book.
+    let bundle = crate::text::text_dir(&st.cfg.work, key).join("index.json");
+    if !l.reused || !bundle.exists() || !crate::text::gz_path(&bundle).exists() {
+        if let Err(e) = crate::text::write_bundle(&st.cfg, &l.plan, &l.est, key, &l.name, &l.title)
+        {
+            tracing::warn!("could not write text bundle: {e}");
+        }
+    }
+
+    // The library register, *after* the plan and the bundle are on disk.
+    //
+    // `/api/load` is the one moment the server learns a book's key, name, path,
+    // title and chapter count all at once, and writing it down is what lets
+    // everything else answer about a book the session is not holding — the
+    // readiness view, the scheduler's "the most recently opened book", a
+    // standing order placed on something else entirely.
+    //
+    // The index is written from the plan **in memory** rather than through
+    // `library::rescan_book`, which re-reads `plan.json`. That is not an
+    // optimisation: on a cold load the plan is written a few lines above this,
+    // so a version of this that read the file had to sit below it anyway — and
+    // reading back what we are already holding is a way to be subtly wrong for
+    // no gain. Without it the book reports zero chapters and zero chunks until
+    // the scanner's next tick, which is up to `LIBRARY_SCAN_EVERY_S` of a
+    // freshly opened book looking empty.
+    if let Some(db) = st.store() {
+        let now_ms = chrono::Local::now().timestamp_millis();
+        let row = crate::store::BookRow {
+            key: key.to_string(),
+            name: l.name.clone(),
+            path: l.path.clone(),
+            title: l.title.clone(),
+            chapters: l.plan.len(),
+            last_open_ms: Some(now_ms),
+            scanned_ms: Some(now_ms),
+        };
+        if let Err(e) = db.put_book(&row) {
+            tracing::warn!("could not register {key}: {e}");
+        } else if let Err(e) = db.touch_book_open(key, now_ms) {
+            tracing::warn!("could not stamp {key} as opened: {e}");
+        }
+        let rows = crate::library::scan_book(&st.cfg, key, &l.plan);
+        if let Err(e) = db.put_chapter_index(key, &rows) {
+            tracing::warn!("could not index {key}: {e}");
+        }
+    }
+
+    // Which book this process is on is worth one small file: it is what lets the
+    // next process come back on it. See `restore_session`.
+    save_session(st, &l.path, l.max_chars);
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -577,8 +645,7 @@ pub async fn position(
         );
         p
     };
-    let snapshot = st.positions().clone();
-    if let Err(e) = vault::write_positions(&st.cfg.positions_dir, &snapshot) {
+    if let Err(e) = vault::write_positions_from(&st.cfg.positions_dir, || st.positions().clone()) {
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not save: {e}"),
@@ -741,15 +808,13 @@ pub fn save_position(st: &Arc<AppState>, force: bool, dev: &Device) {
         chapters_total: chapters_total as i64,
         updated: vault::now_iso_seconds(),
     };
-    let snapshot = {
-        let mut pos = st.positions();
-        pos.insert(
-            name.clone(),
-            serde_json::to_value(&record).unwrap_or(Value::Null),
-        );
-        pos.clone()
-    };
-    match vault::write_positions(&st.cfg.positions_dir, &snapshot) {
+    st.positions().insert(
+        name.clone(),
+        serde_json::to_value(&record).unwrap_or(Value::Null),
+    );
+    // The snapshot is taken under the vault's writer lock, not here, so a slower
+    // writer holding an older map can never land after this one.
+    match vault::write_positions_from(&st.cfg.positions_dir, || st.positions().clone()) {
         Ok(()) => {
             if let Ok(mut w) = st.pos_written.lock() {
                 *w = Some(Instant::now());
@@ -1125,7 +1190,7 @@ pub async fn status(State(st): State<Arc<AppState>>) -> Json<Status> {
         playhead: s.playhead,
         total,
         chapters: s.plan.len(),
-        model_ready: s.model_ready,
+        model_ready: s.model_ready || st.engine.ready(),
         rtf,
         rendered_min: round1(s.rendered_s / 60.0),
         voice: st.engine.voice().to_string(),
