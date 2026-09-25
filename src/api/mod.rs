@@ -306,6 +306,26 @@ pub async fn json_file(path: &std::path::Path, cache: &str, missing: &str) -> Re
 )]
 pub struct ApiDoc;
 
+/// The largest `/api/note` body taken: a base64 memo, so ~48 MB of audio.
+///
+/// axum's `Json` extractor refuses anything over 2 MB by default, which is about
+/// a minute and a half of opus once base64 has had its third — and the reader
+/// reads that 413 as a rejection, not as "ask again", so a long memo was never
+/// filed and never retried. The ceiling is deliberately far above any memo a
+/// person records, and applies to this one route: nothing else here takes a
+/// body worth more than a few kilobytes.
+pub const NOTE_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// `/api/note`, with its own body limit layered onto the route and nothing else.
+fn note_route() -> utoipa_axum::router::UtoipaMethodRouter<Arc<AppState>> {
+    let (schemas, paths, method) = routes!(notes::note);
+    (
+        schemas,
+        paths,
+        method.layer(axum::extract::DefaultBodyLimit::max(NOTE_BODY_LIMIT)),
+    )
+}
+
 pub fn router(state: Arc<AppState>) -> (axum::Router, utoipa::openapi::OpenApi) {
     // A voice memo the last process was transcribing when it was killed — a
     // deploy, the watchdog, a restart nobody meant — is owed to the vault and
@@ -333,7 +353,7 @@ pub fn router(state: Arc<AppState>) -> (axum::Router, utoipa::openapi::OpenApi) 
         .routes(routes!(chapters::chapters_cancel))
         .routes(routes!(library::library))
         .routes(routes!(media::hls_segment))
-        .routes(routes!(notes::note))
+        .routes(note_route())
         .routes(routes!(stream::events))
         .routes(routes!(health::healthz))
         .with_state(state.clone())

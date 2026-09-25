@@ -251,8 +251,16 @@ pub async fn note(State(st): State<Arc<AppState>>, Json(body): Json<NoteBody>) -
             } else {
                 "ogg"
             };
-            let p = queue::audio_dir(&st.cfg.work)
-                .join(format!("{}.{ext}", stamp.format("%Y%m%d%H%M%S")));
+            // The name is chosen and the bytes written under one lock: the name
+            // is only unique once it exists, and two memos posted inside the same
+            // second would otherwise both pick it and the second rename would
+            // replace the first recording under the first memo's record.
+            let _naming = lock_naming();
+            let p = fresh_audio_path(
+                &queue::audio_dir(&st.cfg.work),
+                &stamp.format("%Y%m%d%H%M%S").to_string(),
+                ext,
+            );
             // The work order before the bytes, and the bytes before anything that
             // can fail: from here this server can finish the memo with no client
             // and no memory of this request, and a recording that is on disk
@@ -277,6 +285,41 @@ pub async fn note(State(st): State<Arc<AppState>>, Json(body): Json<NoteBody>) -
         pending,
     }));
     respond(waiter.wait().await)
+}
+
+/// Serializes choosing a recording's file name with writing it. Poison is
+/// recovered, not propagated: a panic in some other memo is not a reason to stop
+/// saving this one.
+fn lock_naming() -> std::sync::MutexGuard<'static, ()> {
+    static NAMING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    NAMING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `<stamp>.<ext>`, the python server's name for a recording — and, when a memo
+/// from the same second already holds it, `<stamp>-2.<ext>`, `-3`, and so on.
+///
+/// The python name is kept for the one memo a second that every memo used to
+/// be, because it is what the note's `audio:` frontmatter says; the suffix only
+/// ever appears where the old behaviour was to overwrite someone's recording.
+/// A `.part` counts as taken, since it is a recording on its way to that name.
+fn fresh_audio_path(dir: &std::path::Path, stamp: &str, ext: &str) -> std::path::PathBuf {
+    let taken = |p: &std::path::Path| {
+        p.exists() || {
+            let mut part = p.as_os_str().to_owned();
+            part.push(".part");
+            std::path::Path::new(&part).exists()
+        }
+    };
+    let first = dir.join(format!("{stamp}.{ext}"));
+    if !taken(&first) {
+        return first;
+    }
+    (2u32..)
+        .map(|n| dir.join(format!("{stamp}-{n}.{ext}")))
+        .find(|p| !taken(p))
+        .unwrap_or(first)
 }
 
 /// Everything the detached half needs, owned — it outlives the request, and in
@@ -480,5 +523,24 @@ fn respond(out: queue::Outcome) -> Response {
             StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             e.message,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_memo_in_the_same_second_gets_its_own_recording() {
+        let d = tempfile::tempdir().unwrap();
+        let first = fresh_audio_path(d.path(), "20260925101112", "webm");
+        assert_eq!(first, d.path().join("20260925101112.webm"));
+        std::fs::write(&first, b"one").unwrap();
+        let second = fresh_audio_path(d.path(), "20260925101112", "webm");
+        assert_eq!(second, d.path().join("20260925101112-2.webm"));
+        // A recording still on its way to a name holds it.
+        std::fs::write(d.path().join("20260925101112-2.webm.part"), b"two").unwrap();
+        let third = fresh_audio_path(d.path(), "20260925101112", "webm");
+        assert_eq!(third, d.path().join("20260925101112-3.webm"));
     }
 }
