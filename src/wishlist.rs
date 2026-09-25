@@ -762,13 +762,24 @@ pub fn cancelled(st: &AppState, chapters: Option<&[usize]>) {
     save(st);
 }
 
-/// A chunk of this chapter landed on disk.
+/// A chunk of chapter `chapter` of book `key` landed on disk.
 ///
 /// Which is the only evidence that matters for the poison counter: an item that
 /// is producing audio is not the item the parking rule is about, however many
 /// restarts it has lived through. Costs a map lookup in the common case and only
 /// writes when there was actually a count to clear.
-pub fn progress(st: &AppState, chapter: usize) {
+///
+/// **Keyed by book, because the counts are.** [`Wishlist`]'s map is the loaded
+/// book's and holds bare chapter numbers, and the worker renders other books'
+/// chapters too — a standing order, the speculative branch. Chapter 4 of some
+/// other novel landing used to clear chapter 4 of this one's count, which is a
+/// wedged chapter that can never be parked. A foreign book's count is not in
+/// that map at all (only a boot's [`resume`] counts, and only for the loaded
+/// book), so there is nothing to clear for one and nothing is touched.
+pub fn progress(st: &AppState, key: &str, chapter: usize) {
+    if st.session().key().as_deref() != Some(key) {
+        return;
+    }
     {
         let mut w = st.wishlist();
         if w.attempts.remove(&chapter).is_none() {
@@ -1077,7 +1088,8 @@ mod tests {
             resume(&st);
         }
         assert!(st.wishlist().attempts(6) > 0);
-        progress(&st, 6);
+        let key = st.session().key_or_x();
+        progress(&st, &key, 6);
         assert_eq!(st.wishlist().attempts(6), 0);
         assert_eq!(items(&st)[0].attempts, 0);
 

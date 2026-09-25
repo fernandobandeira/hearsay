@@ -224,7 +224,7 @@ fn attempt(st: &Arc<AppState>, key: &str, ci: usize, i: usize, chunks: &[Chunk],
     let ok = render_one(st, key, ci, i, chunks);
     bo.record(ok);
     if ok {
-        crate::wishlist::progress(st, ci);
+        crate::wishlist::progress(st, key, ci);
     }
 }
 
@@ -548,7 +548,7 @@ fn next_queued(st: &Arc<AppState>, key: &str) -> Option<(usize, usize)> {
 }
 
 fn gc(st: &AppState) {
-    let keep = st.session().gc_keep(&st.cfg);
+    let keep = st.gc_keep();
     let total = cache::gc_audio(&st.cfg.work, st.cfg.max_audio_gb, &keep);
     // The walk has already been done, so the number is free. It is what the
     // speculative branch stands down on.
@@ -610,7 +610,7 @@ pub fn autopack(st: &Arc<AppState>, force: bool) -> Option<usize> {
             s.chapter,
             s.plan.clone(),
             s.key(),
-            s.building.is_some() || !s.pack_queue.is_empty() || !s.queue.is_empty(),
+            s.packing.is_some() || !s.pack_queue.is_empty() || !s.queue.is_empty(),
         )
     };
     let key = key?;
@@ -1014,7 +1014,13 @@ fn builder(st: Arc<AppState>) {
         // lookahead is 80 chunks and also reports "rendering", and a packer that
         // waited for *that* would never run on this box at all.
         let stalled = st.stalled_for();
-        if stalled > 0.0 && stalled < PACK_HOLD_MAX_S && !st.session().pack_queue.is_empty() {
+        // Either queue: a foreign encode costs the core exactly what a local one
+        // does, and the listener stalled under the playhead is just as stalled.
+        let pending = {
+            let s = st.session();
+            !s.pack_queue.is_empty() || !s.pack_elsewhere.is_empty()
+        };
+        if stalled > 0.0 && stalled < PACK_HOLD_MAX_S && pending {
             if held.is_none() {
                 held = Some(Instant::now());
                 tracing::info!("packer holding back: the renderer is stalled under the playhead");
@@ -1046,7 +1052,15 @@ fn builder(st: Arc<AppState>) {
                             drop(s);
                             match crate::plancache::read_raw(&st.cfg.work, &k) {
                                 Some(plan) => {
-                                    st.session().building = Some(cj);
+                                    let mut s = st.session();
+                                    s.packing = Some((k.clone(), cj));
+                                    // `building` speaks for the loaded book only.
+                                    // A job ordered from the library for the book
+                                    // that has since been loaded is that book's.
+                                    if s.key().as_deref() == Some(k.as_str()) {
+                                        s.building = Some(cj);
+                                    }
+                                    drop(s);
                                     Some((cj, plan, k, String::new()))
                                 }
                                 None => {
@@ -1063,13 +1077,10 @@ fn builder(st: Arc<AppState>) {
                     }
                 }
                 Some(ci) => {
+                    let key = s.key_or_x();
                     s.building = Some(ci);
-                    Some((
-                        ci,
-                        s.plan.clone(),
-                        s.key_or_x(),
-                        s.title.clone().unwrap_or_default(),
-                    ))
+                    s.packing = Some((key.clone(), ci));
+                    Some((ci, s.plan.clone(), key, s.title.clone().unwrap_or_default()))
                 }
             }
         }) else {
@@ -1114,34 +1125,46 @@ fn builder(st: Arc<AppState>) {
                 );
             }
         }
-        let cur = {
+        let (cur, cur_key, loaded) = {
             let mut s = st.session();
             s.building = None;
-            s.pack_queue.retain(|c| *c != ci);
+            s.packing = None;
             s.pack_elsewhere.retain(|j| *j != (key.clone(), ci));
-            s.build_want.remove(&ci);
-            s.chapter
+            // The loaded book's queues hold bare chapter numbers, so they are
+            // only this job's to clear if this job was the loaded book's. A
+            // foreign chapter 7 finishing used to take chapter 7 of the book in
+            // front of the reader off the pack queue and out of `build_want` —
+            // a download somebody asked for, dropped without a word.
+            let loaded = s.key().as_deref() == Some(key.as_str());
+            if loaded {
+                s.pack_queue.retain(|c| *c != ci);
+                s.build_want.remove(&ci);
+            }
+            (s.chapter, s.key(), loaded)
         };
         // A foreign chapter that packed has nothing left to want: the order was
         // "render it and pack it", and both have happened. Dropping the intent
         // here rather than leaving it for the renderer to notice is what keeps
         // `next_elsewhere` from walking a list that never shrinks.
-        if let Some(db) = st.store() {
-            if st.session().key().as_deref() != Some(key.as_str()) {
+        if !loaded {
+            if let Some(db) = st.store() {
                 if let Err(e) = db.drop_intent(&key, ci) {
                     tracing::warn!("could not clear the order for {key} ch{ci}: {e}");
                 }
             }
         }
-        // The library row for a book nobody has loaded has just changed in the
-        // one way that matters: it became downloadable.
-        crate::library::rescan_book(&st, &key);
         // Whether it packed or not. A failed encode already leaves the queues
-        // here rather than being retried forever in this process, and the file
-        // has to say the same thing — a pack that fails on every restart is the
-        // one loop a durable queue could otherwise run until someone noticed.
+        // here rather than being retried forever in this process, and the file has
+        // to say the same thing — a pack that fails on every restart is the one
+        // loop a durable queue could otherwise run until someone noticed.
         crate::wishlist::save(&st);
-        let keep: HashSet<String> = [format!("{key}/ch{cur:03}")].into_iter().collect();
+        // The chapter being *read* is the one the packed-chapter gc must spare,
+        // and it belongs to the loaded book — not to whichever book this job
+        // happened to be for. Nothing loaded, nothing to spare.
+        let keep: HashSet<String> = cur_key
+            .map(|k| format!("{k}/ch{cur:03}"))
+            .into_iter()
+            .collect();
         chapters::gc(&st.cfg, &keep);
     }
     st.build_started.store(false, Ordering::SeqCst);

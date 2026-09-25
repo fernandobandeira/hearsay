@@ -60,7 +60,21 @@ pub struct Session {
     /// opened again — which is the exact bug `pack: true` was introduced to fix,
     /// one level up.
     pub pack_elsewhere: Vec<(String, usize)>,
+    /// The chapter of the **loaded** book the packer is on, and nothing else.
+    ///
+    /// It is in `/api/status` and `/api/chapters` as a bare chapter number, and
+    /// every reader of it — the drawer's `packing` flag, the cancel that leaves an
+    /// encode in flight alone — reads it as a chapter of the book in front of it.
+    /// A foreign job used to be written here too, so chapter 7 of a book nobody
+    /// had open showed as packing on chapter 7 of the one somebody did. That job
+    /// is in [`Session::packing`] instead.
     pub building: Option<usize>,
+    /// The job the packer is on, whichever book it belongs to.
+    ///
+    /// The book-qualified twin of `building`, and the one the gc reads: the chunk
+    /// wavs of a chapter being encoded are the encode's *input*, and protecting
+    /// "chapter 7" of the wrong book is protecting nothing.
+    pub packing: Option<(String, usize)>,
     pub build_error: Option<String>,
 }
 
@@ -111,9 +125,18 @@ impl Session {
     }
 
     /// The chapter directories `gc_audio` must not touch: the chapter being read
-    /// and its prerender span, plus everything the chapter manager is working on.
+    /// and its prerender span, plus everything the chapter manager is working on —
+    /// on this book and, for the packer, on any other.
+    ///
+    /// What this cannot see is a standing order on a book the session is not
+    /// holding; that lives in the store, and [`AppState::gc_keep`] adds it.
     pub fn gc_keep(&self, cfg: &Config) -> HashSet<PathBuf> {
         let mut keep = HashSet::new();
+        // Not behind the loaded-book check below: a foreign pack is the one job
+        // that does not need a book loaded at all, and its chunks are its input.
+        for (k, c) in self.pack_elsewhere.iter().chain(self.packing.iter()) {
+            keep.insert(cache::chapter_dir(&cfg.work, k, *c));
+        }
         let Some(key) = self.key() else {
             return keep;
         };
@@ -362,6 +385,29 @@ impl AppState {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
+    }
+
+    /// Everything `gc_audio` must leave alone, across the library.
+    ///
+    /// [`Session::gc_keep`] plus every chapter somebody has a standing order on,
+    /// whichever book it is. Those are exactly the chapters the worker is working
+    /// through while another book is open (`next_elsewhere`), and without them the
+    /// gc — oldest first — deletes an order's early chunks while its later ones
+    /// are still rendering: a chapter that is never complete, so never packed, so
+    /// never retired, rendered again from the top for as long as the process
+    /// lives. Parked chapters are included: still owed, and asking again resumes
+    /// them from what is on disk.
+    ///
+    /// The session lock is released before the store is asked, so this never
+    /// holds the two at once.
+    pub fn gc_keep(&self) -> HashSet<PathBuf> {
+        let mut keep = self.session().gc_keep(&self.cfg);
+        for (key, items) in crate::wishlist::all_outstanding(self) {
+            for it in items {
+                keep.insert(cache::chapter_dir(&self.cfg.work, &key, it.chapter));
+            }
+        }
+        keep
     }
 
     /// How long the renderer has been stuck under the playhead, in seconds.
