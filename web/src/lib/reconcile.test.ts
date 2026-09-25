@@ -261,6 +261,50 @@ describe('a download interrupted mid-flow', () => {
   });
 });
 
+// ------------------------------------------- the record moving under a pass
+
+describe('a selection that changes while a sweep is running', () => {
+  /** Run a sweep whose copy of chapter 1 is held open while `during` happens. */
+  async function midPass(
+    store: Map<string, PendingDownload>, rows: readonly ChapRow[], during: () => void,
+  ) {
+    let release = () => {};
+    const d = device({
+      store, rows,
+      gate: (ci) => (ci === 1 ? new Promise<void>((r) => { release = r; }) : Promise.resolve()),
+    });
+    const run = reconcile(d.deps);
+    await new Promise((r) => setTimeout(r, 0));
+    during();
+    release();
+    return run;
+  }
+
+  test('chapters added during the pass are still pending after it', async () => {
+    const store = new Map([['lom', pending([1, 2])]]);
+    const [out] = await midPass(store, [packed(1), row(2), row(7)], () => {
+      store.set('lom', pending([1, 2, 7]));        // the drawer, used again
+    });
+    expect(out.fetched).toEqual([1]);
+    expect(store.get('lom')?.chapters).toEqual([2, 7]);
+  });
+
+  test('chapters taken out during the pass are not put back', async () => {
+    const store = new Map([['lom', pending([1, 2, 3])]]);
+    await midPass(store, [packed(1), row(2), row(3)], () => {
+      store.set('lom', pending([1, 3]));           // 2 unqueued
+    });
+    expect(store.get('lom')?.chapters).toEqual([3]);
+  });
+
+  test('an order cancelled during the pass stays cancelled', async () => {
+    const store = new Map([['lom', pending([1, 2])]]);
+    const [out] = await midPass(store, [packed(1), row(2)], () => { store.delete('lom'); });
+    expect(out.fetched).toEqual([1]);
+    expect(store.has('lom')).toBe(false);
+  });
+});
+
 // ------------------------------------------------------- the record itself
 
 describe('the pending record round-trips', () => {
