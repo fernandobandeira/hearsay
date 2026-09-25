@@ -21,7 +21,7 @@
 
 mod harness;
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use harness::{until, Harness};
 use narrator::cache;
@@ -630,4 +630,84 @@ async fn the_reader_moving_ends_the_backoff_at_once() {
         hole.exists()
     })
     .await;
+}
+
+/// When a chapter's chunks landed: the earliest mtime and the latest.
+fn landed(h: &Harness, key: &str, ci: usize, n: usize) -> (SystemTime, SystemTime) {
+    let times: Vec<SystemTime> = (0..n)
+        .filter_map(|i| {
+            cache::chunk_path(&h.work(), key, ci, i)
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+        })
+        .collect();
+    assert_eq!(times.len(), n, "every chunk of {key} ch{ci} is on disk");
+    let first = times.iter().min().copied().expect("a chunk");
+    let last = times.iter().max().copied().expect("a chunk");
+    (first, last)
+}
+
+#[tokio::test]
+async fn the_branches_render_in_rank_order() {
+    // The ranking, read off the files as they land: a chapter the loaded book's
+    // chapter manager asked for, then a standing order on another book, then
+    // the rest of the loaded book on speculation. One thread renders every
+    // chunk, so a chapter wholly written before the next one began *is* the
+    // ranking, however fast the fake engine is. Compared with `<=`, because a
+    // filesystem clock ticks coarsely enough for two chunks to share a stamp.
+    //
+    // Everything is placed while a memo holds the worker parked, so it sees all
+    // three at once rather than whichever arrived first.
+    let h = Harness::with(|c| {
+        c.lookahead = 4;
+        c.prerender_chapters = 0;
+    })
+    .await;
+    let busy = h.state.whisper.gate().enter();
+
+    let other = h.add_book("Ranked (2026).epub");
+    let (code, loaded) = h.post_json("/api/load", json!({"path": other})).await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{loaded}");
+    let other_key = loaded["key"].as_str().unwrap_or_default().to_string();
+
+    h.load().await;
+    let key = key_of(&h);
+    let ns = chapters_of(&h);
+    assert!(ns.len() >= 3, "the fixture needs three chapters");
+    seed_chapter(&h, &key, 0, ns[0], 2400);
+
+    let (code, body) = h
+        .post_json("/api/chapters/render", json!({"chapters": [2]}))
+        .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{body}");
+    let (code, body) = h
+        .post_json(
+            "/api/chapters/render",
+            json!({"book": other_key, "chapters": [1]}),
+        )
+        .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{body}");
+    h.post_json("/api/open", json!({"chapter": 0, "chunk": 0}))
+        .await;
+    drop(busy);
+
+    let other_n = chunks_in(&h, &other_key, 1);
+    until("all three to be rendered", 30.0, || {
+        chapter_rendered(&h, &key, 2, ns[2])
+            && chapter_rendered(&h, &other_key, 1, other_n)
+            && chapter_rendered(&h, &key, 1, ns[1])
+    })
+    .await;
+    let queued = landed(&h, &key, 2, ns[2]);
+    let ordered = landed(&h, &other_key, 1, other_n);
+    let speculated = landed(&h, &key, 1, ns[1]);
+    assert!(
+        queued.1 <= ordered.0,
+        "the loaded book's queue comes before a standing order elsewhere"
+    );
+    assert!(
+        ordered.1 <= speculated.0,
+        "a standing order comes before speculation"
+    );
 }
