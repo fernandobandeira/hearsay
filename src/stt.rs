@@ -371,8 +371,7 @@ mod tests {
             &bin.to_string_lossy(),
             std::time::Duration::from_millis(150),
         )
-        .err()
-        .expect("must not succeed");
+        .expect_err("must not succeed");
         assert!(
             matches!(e, SttError::Decode(ref m) if m.contains("killed")),
             "{e}"
@@ -387,8 +386,7 @@ mod tests {
             "/nonexistent/ffmpeg",
             std::time::Duration::from_secs(1),
         )
-        .err()
-        .expect("must not succeed");
+        .expect_err("must not succeed");
         assert!(matches!(e, SttError::Decode(_)), "{e}");
     }
 
