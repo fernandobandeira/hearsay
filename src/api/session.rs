@@ -1190,7 +1190,7 @@ pub async fn status(State(st): State<Arc<AppState>>) -> Json<Status> {
         playhead: s.playhead,
         total,
         chapters: s.plan.len(),
-        model_ready: s.model_ready,
+        model_ready: s.model_ready || st.engine.ready(),
         rtf,
         rendered_min: round1(s.rendered_s / 60.0),
         voice: st.engine.voice().to_string(),

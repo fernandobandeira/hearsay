@@ -244,6 +244,30 @@ async fn an_unwritable_positions_dir_is_a_health_problem_not_a_silence() {
     );
 }
 
+#[tokio::test]
+async fn a_model_that_will_not_load_is_a_health_problem_once_it_was_asked_for() {
+    let h = Harness::with(|c| {
+        c.fake_tts = false;
+        c.kokoro_model = c.work.join("no-such-model.onnx");
+        c.kokoro_voices_dir = c.work.join("no-such-voices");
+    })
+    .await;
+    // Loading is lazy: a model nobody has asked for yet is not a failure.
+    let (code, body) = h.get_json("/healthz").await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+
+    assert!(!h.state.engine.load());
+    let (code, body) = h.get_json("/healthz").await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body["problems"].as_array().is_some_and(|p| p
+            .iter()
+            .any(|x| x.as_str().is_some_and(|s| s.contains("tts model")))),
+        "{body}"
+    );
+    assert_eq!(body["model_ready"], json!(false));
+}
+
 /// 6. `/api/chapters` must be windowable.
 #[tokio::test]
 async fn the_chapter_list_takes_a_range() {
