@@ -7,10 +7,13 @@
 //! bare-numbered bookkeeping — `build_want`, the gc's keep lists — must never
 //! read a foreign job's chapter number as if it were the loaded book's.
 
+mod harness;
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use harness::until;
 use narrator::book::{Chapter, Chunk};
 use narrator::cache;
 use narrator::config::Config;
@@ -61,17 +64,6 @@ fn seed_b(st: &AppState, ci: usize) {
         &vec![0.1f32; 2400],
     )
     .expect("wav");
-}
-
-async fn until(what: &str, timeout_s: f64, mut f: impl FnMut() -> bool) {
-    let t0 = Instant::now();
-    while t0.elapsed().as_secs_f64() < timeout_s {
-        if f() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for {what}");
 }
 
 fn foreign_done(st: &AppState) -> bool {

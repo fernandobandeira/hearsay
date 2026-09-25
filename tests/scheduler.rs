@@ -21,22 +21,11 @@
 
 mod harness;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use harness::Harness;
+use harness::{until, Harness};
 use narrator::cache;
 use serde_json::json;
-
-async fn until(what: &str, timeout_s: f64, mut f: impl FnMut() -> bool) {
-    let t0 = Instant::now();
-    while t0.elapsed().as_secs_f64() < timeout_s {
-        if f() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
 
 /// ffmpeg is not on the CI runner, so anything asserting a packed `.m4a` has to
 /// ask first. The rendering half of these tests is the half that is about the

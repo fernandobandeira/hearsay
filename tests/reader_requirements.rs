@@ -16,7 +16,7 @@ mod harness;
 use std::time::Instant;
 
 use axum::http::StatusCode;
-use harness::Harness;
+use harness::{until, Harness};
 use serde_json::json;
 
 /// 1. `/api/load` must not re-parse a book that has not changed.
@@ -558,16 +558,4 @@ async fn a_first_boot_restores_nothing() {
     assert_eq!(code, StatusCode::OK);
     assert_eq!(st["book"], json!(null), "{st}");
     assert_eq!(st["status"], json!("idle"), "{st}");
-}
-
-/// Wait for a predicate, or fail.
-async fn until(what: &str, timeout_s: f64, mut f: impl FnMut() -> bool) {
-    let t0 = Instant::now();
-    while t0.elapsed().as_secs_f64() < timeout_s {
-        if f() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for {what}");
 }

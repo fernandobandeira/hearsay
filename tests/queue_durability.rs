@@ -28,24 +28,12 @@
 mod harness;
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::http::StatusCode;
-use harness::Harness;
+use harness::{until, Harness};
 use narrator::cache;
 use serde_json::{json, Value};
-
-/// Wait for a predicate, or fail saying what was being waited for.
-async fn until(what: &str, timeout_s: f64, mut f: impl FnMut() -> bool) {
-    let t0 = Instant::now();
-    while t0.elapsed().as_secs_f64() < timeout_s {
-        if f() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
 
 fn key_of(h: &Harness) -> String {
     h.state.session().key_or_x()

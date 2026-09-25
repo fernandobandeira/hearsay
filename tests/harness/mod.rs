@@ -212,3 +212,27 @@ fn parse(body: &[u8]) -> Value {
 pub fn fixture_epub() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fixture.epub")
 }
+
+/// Wait for a predicate, or fail saying what was being waited for.
+pub async fn until(what: &str, timeout_s: f64, mut f: impl FnMut() -> bool) {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed().as_secs_f64() < timeout_s {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// Wait up to two seconds for a side effect a detached task is responsible
+/// for, and say whether it happened.
+pub async fn eventually(mut f: impl FnMut() -> bool) -> bool {
+    for _ in 0..400 {
+        if f() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    false
+}

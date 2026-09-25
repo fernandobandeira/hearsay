@@ -15,11 +15,9 @@
 
 mod harness;
 
-use std::time::Duration;
-
 use axum::http::StatusCode;
 use base64::Engine as _;
-use harness::Harness;
+use harness::{eventually, Harness};
 use serde_json::{json, Value};
 
 async fn speaking() -> Harness {
@@ -46,17 +44,6 @@ fn recordings(h: &Harness) -> usize {
     std::fs::read_dir(h.work().join("notes-audio"))
         .map(|d| d.count())
         .unwrap_or(0)
-}
-
-/// Wait for a side effect a detached task is responsible for.
-async fn eventually(mut f: impl FnMut() -> bool) -> bool {
-    for _ in 0..400 {
-        if f() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    false
 }
 
 #[tokio::test]
