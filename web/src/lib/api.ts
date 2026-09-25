@@ -153,7 +153,12 @@ export const keys = {
   books: ['books'] as const,
   library: ['library'] as const,
   status: ['status'] as const,
+  /** Every book's chapter rows: the prefix every invalidation uses. */
   chapters: ['chapters'] as const,
+  /* One book's rows, under that prefix. Unscoped, a drawer opened on another
+     book showed the last book's rows until the first poll came back - and a tap
+     in that window acts on what is shown. */
+  chaptersFor: (k: string | null) => ['chapters', k] as const,
   bookIndex: (k: string | null) => ['book-index', k] as const,
   shard: (k: string | null, s: number) => ['shard', k, s] as const,
   chapterText: (k: string | null, ci: number) => ['chapter-text', k, ci] as const,
@@ -227,7 +232,7 @@ export function useStatus(enabled = true) {
  */
 export function useChapters(enabled: boolean, book: string | null) {
   return useQuery({
-    queryKey: keys.chapters,
+    queryKey: keys.chaptersFor(book),
     queryFn: () => call(sdk.chaptersList({query: {book: book ?? undefined}})),
     refetchInterval: enabled ? 2_000 : false,
     enabled,

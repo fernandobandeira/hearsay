@@ -6,7 +6,7 @@
 import {onlineManager} from '@tanstack/react-query';
 import {afterEach, expect, test} from 'vitest';
 import {
-  ApiError, awaitedRetry, bookIndexUrl, chapterAudioUrl, chapterTextUrl, textShardUrl,
+  ApiError, awaitedRetry, bookIndexUrl, chapterAudioUrl, chapterTextUrl, keys, textShardUrl,
 } from './api';
 import {MAX_RETRIES} from './backoff';
 
@@ -33,4 +33,11 @@ test('awaitedRetry follows the browser: offline it settles, online it repeats', 
   // mode. Giving up here is what lets the caller reach the cached shard.
   onlineManager.setOnline(false);
   expect(awaitedRetry(0, gone)).toBe(false);
+});
+
+test('chapter rows are keyed by book, under the prefix every invalidation uses', () => {
+  expect(keys.chaptersFor('lom')).not.toEqual(keys.chaptersFor('7p'));
+  // Prefix matching is what `invalidateQueries({queryKey: keys.chapters})` does:
+  // one book's key has to start with it, or the live stream refetches nothing.
+  expect(keys.chaptersFor('lom').slice(0, keys.chapters.length)).toEqual([...keys.chapters]);
 });

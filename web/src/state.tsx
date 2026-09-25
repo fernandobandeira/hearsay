@@ -261,8 +261,13 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const [moved, setMoved] =
     useState<{chapter: number; chunk: number; device?: string} | null>(null);
   const [live, setLive] = useState<LiveState>('connecting');
-  const [fontScale, setFontScaleState] = useState(
-    () => Math.min(1.8, Math.max(0.7, Number(localStorage.getItem('narrator.font')) || 1)));
+  /* Wrapped like every other storage read here: with site data blocked, iOS
+     throws on the *access*, and an initializer that throws is a blank app. */
+  const [fontScale, setFontScaleState] = useState(() => {
+    let saved = 1;
+    try { saved = Number(localStorage.getItem('narrator.font')) || 1; } catch { /* blocked */ }
+    return Math.min(1.8, Math.max(0.7, saved));
+  });
 
   const status = useStatus();
   const index = useBookIndex(book?.key ?? null).data;

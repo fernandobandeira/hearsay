@@ -130,6 +130,7 @@ export function ChapterManager({open, active, onPick}: {
       .filter((r) => !n.offlineChapters.has(r.i) && !n.queuedChapters.has(r.i))
       .map((r) => r.i);
   }, [hits, sel.verb, n.offlineChapters, n.queuedChapters]);
+  const eligibleSet = useMemo(() => new Set(eligible), [eligible]);
 
   /* Centring the chapter being read.
      Once per visit to this level, never while he is scrolling: `done` is armed
@@ -260,7 +261,7 @@ export function ChapterManager({open, active, onPick}: {
             const mark = textMark(wordsHere ? wordsHere.has(r.i) : null, connected);
             const MarkIcon = mark ? TEXT_ICON[mark.icon] : null;
             const picked = sel.picked.has(r.i);
-            const can = !sel.verb || eligible.includes(r.i);
+            const can = !sel.verb || eligibleSet.has(r.i);
             return (
               <div
                 key={r.i}
