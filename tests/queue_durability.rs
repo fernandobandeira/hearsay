@@ -202,9 +202,20 @@ async fn a_cancel_outlives_the_process_that_took_it() {
 /// (which the rename is there to make impossible, but the file is on a
 /// filesystem this code does not own), hand-edited at three in the morning: none
 /// of those may keep the server from coming up on its book.
+///
+/// Without a store, where the file is the whole record. With one, the file is a
+/// copy and tearing it costs nothing at all — see
+/// `a_damaged_copy_costs_nothing_while_the_table_has_the_order`.
 #[tokio::test]
 async fn a_torn_queue_file_costs_the_queue_and_nothing_else() {
-    let mut h = Harness::new().await;
+    let mut h = Harness::with(|c| {
+        std::fs::create_dir_all(c.work.join("state.db")).expect("block state.db");
+    })
+    .await;
+    assert!(
+        h.state.store().is_none(),
+        "this test is about the file alone"
+    );
     h.load().await;
     h.post_json("/api/chapters/render", json!({"chapters": [1, 2]}))
         .await;
@@ -790,16 +801,17 @@ async fn with_no_database_the_file_is_still_the_whole_contract() {
         .all(|(_, items)| !items.iter().any(|i| i.chapter == 3)));
 }
 
-/// A damaged file is not overruled by the table, it empties it.
+/// A damaged copy costs nothing while the table holds the order.
 ///
 /// The half of `a_torn_queue_file_costs_the_queue_and_nothing_else` that is
-/// about the second record. The two are written from one snapshot, so a row the
-/// file no longer backs is a row about nothing — and leaving it would have the
-/// scheduler chasing an order this boot has already decided it does not have,
-/// on a book whose own file says nothing at all. Absent is the case the table
-/// rescues; damaged is not.
+/// about the store. The table is the record and the file is written from it, so
+/// a torn file is a torn *copy*: the order comes back from the table, and the
+/// boot writes a whole copy over the torn one. (This used to be the other way
+/// round — the file was read first and a damaged one emptied the table — which
+/// is the arrangement that let a stale file overrule orders placed and
+/// cancelled from the library.)
 #[tokio::test]
-async fn a_damaged_file_takes_the_table_with_it() {
+async fn a_damaged_copy_costs_nothing_while_the_table_has_the_order() {
     let mut h = Harness::with(|c| c.queue_resume_delay_s = 600.0).await;
     h.load().await;
     let key = key_of(&h);
@@ -811,13 +823,14 @@ async fn a_damaged_file_takes_the_table_with_it() {
     std::fs::write(&p, &whole[..whole.len() / 2]).expect("truncate");
     h.restart().await;
 
-    assert!(
-        h.state.session().queue.is_empty(),
-        "an unreadable queue is no queue"
+    assert_eq!(
+        h.state.session().queue,
+        vec![2, 1],
+        "the table had the order the whole time"
     );
-    assert!(
-        intents(&h, &key).is_empty(),
-        "the table kept an order the record it was written from no longer has"
-    );
-    assert!(narrator::wishlist::all_outstanding(&h.state).is_empty());
+    assert_eq!(intents(&h, &key).len(), 2);
+    let raw = std::fs::read(&p).expect("queue.json");
+    let doc: Value = serde_json::from_slice(&raw).expect("the boot rewrote a whole copy");
+    assert_eq!(doc["projection"], json!(true), "{doc}");
+    assert_eq!(doc["items"].as_array().map(|a| a.len()), Some(2), "{doc}");
 }

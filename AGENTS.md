@@ -33,7 +33,7 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `src/library.rs`, `src/api/library.rs` | The library index — a background scan of what is rendered and packed across *every* book, and `GET /api/library` over it. A cache of a filesystem scan, never truth. |
 | `src/api/` | Every endpoint, with typed request/response structs that **generate** the OpenAPI document. |
 | `src/watch.rs` | The library watcher (`notify`), which turns "the vault's git sync pulled an epub onto the server" into a `books` event. |
-| `src/wishlist.rs` | The chapters someone asked for, kept across restarts — now in `state.db`'s `intent` table, with `work/audio/<key>/queue.json` still written beside it. Intent only, never progress. See [downloading a chapter](#downloading-a-chapter-end-to-end). |
+| `src/wishlist.rs` | The chapters someone asked for, kept across restarts — `state.db`'s `intent` table is the record, and `work/audio/<key>/queue.json` a projection of it written beside the audio. Intent only, never progress. See [downloading a chapter](#downloading-a-chapter-end-to-end). |
 | `tests/` | Five parity suites, the reader-requirement suite, and a harness that runs a whole server in a temp dir. |
 | `scripts/golden/` | Generates the Python golden fixtures (uv + ebooklib + bs4) the parity tests assert against. |
 | `scripts/gen-client.sh` | OpenAPI → the reader's typed TS client (`web/src/client/`), and the `--check` gate CI runs. |
@@ -794,15 +794,26 @@ request. Additive in both halves — a client that sends neither the flag nor
 `/api/chapters/build` takes the same flag's meaning implicitly: a chapter it has
 to render first is queued with `pack: true`.
 
-The order survives the process in `src/wishlist.rs` — one `queue.json` per book,
-beside its `plan.json`, written `.part` → fsync → rename → fsync-dir on every
-mutation, resumed by `narrator::boot` after the session restore and re-adopted by
-`/api/load`. **Intent only, never progress**: which chapters, in what order, and
-whether each wants packing. Completion stays disk truth, so a chapter finished
-while the process was down simply leaves the queue the first time the worker
-looks at it. A chapter picked back up by five restarts with no chunk landing is
-*parked* — kept, logged, reported as `ChapterRow.parked`, retried by asking
-again. The details, including why the file is per-book, are in that module's doc.
+The order survives the process in `src/wishlist.rs` — rows in `state.db`'s
+`intent` table, resumed by `narrator::boot` after the session restore and
+re-adopted by `/api/load`. **Intent only, never progress**: which chapters, in
+what order, and whether each wants packing. Completion stays disk truth, so a
+chapter finished while the process was down simply leaves the queue the first
+time the worker looks at it. A chapter picked back up by five restarts with no
+chunk landing is *parked* — kept, logged, reported as `ChapterRow.parked`,
+retried by asking again.
+
+**The table is the record, and `queue.json` is its copy** — one per book, beside
+its `plan.json`, written `.part` → fsync → rename → fsync-dir after every change,
+for the rollback binary, for `cat` over ssh, and as the record when there is no
+store. It used to be read *first* for the loaded book, which stopped being safe
+the day orders could be placed and cancelled on a book that is not loaded: those
+paths write the table alone, and opening the book let the file they never
+touched wipe the order or undo the cancel. A file carries `"projection": true`
+when it was written beside a successful table write; one without it (the A1's
+files from before the table, a rollback's, one beside a failed write) is adopted
+into the table once and rewritten as a copy. The details are in that module's
+doc.
 
 **What is deliberately not persisted: `autopack`'s own speculative orders.** The
 packer also packs the chapter being read and the one after it, from the worker's

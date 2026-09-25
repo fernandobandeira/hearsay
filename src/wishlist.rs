@@ -22,13 +22,13 @@
 //! does — including that a chapter finished while the process was down simply
 //! leaves the queue again the moment the worker looks at it.
 //!
-//! **Two records, and each answers a question the other cannot.**
+//! **One record, and a copy of it.**
 //!
-//! `work/audio/<key>/queue.json` is still the record of the book in front of
-//! you, unchanged and still written on every mutation. [`crate::store`]'s
-//! `intent` table in `work/state.db` now holds the same items for **every** book
-//! — one row per (book, chapter), ordered by a globally monotonic `seq` that is
-//! *when it was asked for*.
+//! [`crate::store`]'s `intent` table in `work/state.db` is **the record**: one
+//! row per (book, chapter), for every book, ordered by a globally monotonic
+//! `seq` that is *when it was asked for*. `work/audio/<key>/queue.json` is a
+//! **projection** of it — the rule the store follows for the vault files too:
+//! the store is the record, the files are written from it.
 //!
 //! The table exists because of the one question a file per book cannot answer:
 //! **what does this box owe, across the whole library, in the order it was
@@ -37,46 +37,51 @@
 //! listing; it may as well not be there. The scheduler's entire job is to see
 //! all of them at once, and [`all_outstanding`] is that question.
 //!
-//! The file stays the one that is **read first for the loaded book**, and the
-//! reason is not sentiment: it is the only one of the two that says which book
-//! it is about. A row in `intent` is keyed by cache key and nothing else, so it
-//! believes whatever directory name it finds itself under; the file carries the
-//! book path and the key *inside* it and is checked against both on the way in,
-//! which is the one guard there is against a work directory restored from
-//! another box. Reading the table first would walk straight past it. Three more
-//! reasons the file is not retired, none of them the deciding one but all of
-//! them real:
+//! **Why the table has to win.** The file used to be read first for the loaded
+//! book, and the table made to agree with it. That was sound only while every
+//! change to an order went through the session and wrote both — and it stopped
+//! being true the day orders could be placed on a book that is not loaded.
+//! `/api/chapters/{render,cancel}` naming another book, the worker retiring a
+//! foreign order it has finished, the packer dropping one it has packed: all of
+//! them write the table alone, because the book is not in the session and there
+//! are no queues to snapshot. The file they never touched then overruled them
+//! the moment that book was opened — an order placed from the library vanished,
+//! a cancel from the library was undone — and the table was synced to the stale
+//! file, so the loss was durable. [`project`] now rewrites the file on those
+//! paths too, but correctness no longer depends on anybody remembering to.
 //!
-//! - It is the **rollback**. `state.db` is new; the binary that predates it is
-//!   one `docker run` away and reads only the file. Deleting the file would make
-//!   going back cost an overnight download, which is precisely the thing this
-//!   module exists to protect.
+//! **Why the file is not retired**, none of them a reason for it to be read first
+//! but all of them real:
+//!
+//! - It is the **rollback**. The binary that predates the table is one
+//!   `docker run` away and reads only the file. Deleting it would make going
+//!   back cost an overnight download, which is precisely the thing this module
+//!   exists to protect.
 //! - It is what an **operator can `cat`**. A table needs a client; a file over
 //!   ssh needs nothing, and "what does the box think it owes me" is a question
 //!   Fernando asks at the console.
 //! - It **travels with the audio**. `work/audio/<key>` copied to another box
-//!   carries the order along with the chunks it is about, where one global
-//!   database would not.
+//!   carries the order along with the chunks it is about.
+//! - It is **the record when there is no store** — see the end of this doc.
 //!
-//! So: **the file if it is there, the table if it is not.** A file that is there
-//! and will not parse is a *damaged record*, not a missing one, and it costs the
-//! list exactly as it always has — the table is then made to agree with it
-//! rather than consulted as a second opinion, because the two were written from
-//! the same snapshot and a table row the file no longer backs is a row about
-//! nothing. A file that is genuinely **absent** is the case the table rescues,
-//! and it is not hypothetical: a `work/` restored without its audio, a tidy-up,
-//! a bad merge of a backup.
+//! **Telling a copy from a record: the `projection` mark.** A file written beside
+//! a successful table write says so. A file without the mark was written by a
+//! binary with no store, or beside a table write that failed; either way it may
+//! hold asks the table has never seen, and it is **adopted** — the table made to
+//! match it, order, pack flags and attempt counts — and rewritten with the mark,
+//! so it is adopted exactly once. That is how the A1's existing `queue.json`
+//! files are taken in rather than thrown away, and how a rollback's are on the
+//! way forward again. A file that fails its checks (version, and the book and
+//! key written inside it) is never adopted; the table stands.
 //!
-//! **The two cannot drift, because they are written from one snapshot.** [`save`]
-//! builds exactly one [`Saved`] out of the session's queues and hands the same
-//! `items` to the file and to the table. There is no second derivation to get
-//! wrong, and anything that is true of the file — a cancel landing, an item
-//! leaving the moment the worker is done with it — is true of the table for the
-//! same reason and at the same instant. The file is written *first*, because it
-//! is the one that is read first: if only one of the two lands, the next boot
-//! reads the file and [`sync`] drags the table back into line with it, which
-//! heals. The other order does not — a stale file that wins the read would drag
-//! a *correct* table back to stale.
+//! **Table first, then the copy.** [`save`] builds exactly one [`Saved`] out of
+//! the session's queues and hands the same `items` to both, so there is no
+//! second derivation to get wrong. The table is written first because it is the
+//! one that is read first: a table that landed alone is merely ahead of its
+//! copy. And the file is marked only if the table write went through, so a store
+//! that refused a write leaves an unmarked file that the next load adopts back —
+//! a failure that heals rather than one shadowed by a table that never heard of
+//! it.
 //!
 //! **Parked is not a column.** The store keeps `tries`; parked is
 //! `tries >= MAX_ATTEMPTS`, derived on the way out. A second field would be a
@@ -84,13 +89,6 @@
 //! decides whether the box spends the week on one chapter. `Store::add_intent`
 //! resets `tries` for the same reason [`asked`] clears the count — asking again
 //! *is* the retry — so the two agree by construction rather than by agreement.
-//!
-//! **The file the running box already has is adopted, not thrown away.** The A1
-//! is holding orders in `queue.json` right now and has never had a row in
-//! `intent`. The first time this process reads a book's file ([`resume`] at boot,
-//! [`adopt`] on a load) the table is made to match it — order, pack flags and
-//! attempt counts — and the file is then **left exactly where it is**. Not
-//! deleted: see the rollback above.
 //!
 //! **Crash safety is the rename, and the transaction.** Every file write is a
 //! `.part`, fsynced, renamed over the real name, with the directory fsynced after
@@ -180,6 +178,18 @@ struct Saved {
     key: String,
     updated: String,
     items: Vec<Item>,
+    /// Written from `state.db`, which is the record: this file is a copy of it.
+    ///
+    /// The one bit that tells the two kinds of file apart, and the whole of how
+    /// the store became authoritative without throwing the A1's existing files
+    /// away. A file without it was written by a binary that had no store (or
+    /// whose store write failed) and is a record the store has never taken in —
+    /// adopted once, then rewritten with it. A file with it is only ever read
+    /// when there is no store to read instead. Absent from the JSON when false,
+    /// so a file written without a store is byte-for-byte what it always was,
+    /// and the binary that predates it ignores the field on a rollback.
+    #[serde(default, skip_serializing_if = "is_false")]
+    projection: bool,
 }
 
 /// What a resume or an adoption did, for the caller to log.
@@ -261,13 +271,69 @@ pub fn save(st: &AppState) {
         // Nothing is loaded, so there is no book whose wishlist this could be.
         return;
     };
-    // The file first, then the table. Both are written from this one `doc`, so
+    let mut doc = doc;
+    // The table first, then the file. Both are written from this one `doc`, so
     // they cannot disagree about what was asked for; the order decides only
     // which is right if the process dies between them, and it has to be the one
-    // that gets read first — a file that landed alone is healed by the next
-    // boot's `sync`, a table that landed alone is dragged back to the stale file.
+    // that is read first — the table. A table that landed alone is simply ahead
+    // of its copy. The file is marked as a copy only if the table write actually
+    // went through: a store that refused it leaves an unmarked file, which the
+    // next load adopts back into the table — so a failed write heals rather than
+    // being shadowed by a table that never heard of it.
+    doc.projection = store_sync(st, &doc.key, &doc.items);
     write(&path(&st.cfg.work, &doc.key), &doc);
-    store_sync(st, &doc.key, &doc.items);
+}
+
+/// Rewrite one book's `queue.json` from the table.
+///
+/// For the paths that change a standing order in the store alone — an order
+/// placed or cancelled from the library for a book the session is not holding,
+/// the worker retiring a foreign order it has finished, the packer dropping one
+/// it has packed. None of them has the session's queues to snapshot, because the
+/// book is not in the session. The table wins over the file either way now (see
+/// [`load_items`]); this is what keeps the copy worth `cat`ing and worth rolling
+/// back to.
+///
+/// The loaded book goes through [`save`] instead, whose snapshot of the
+/// session's queues is the fresher account. A book with no file and no order is
+/// left without one: there is nothing to say and nowhere it was said before.
+pub fn project(st: &AppState, key: &str) {
+    if st.session().key().as_deref() == Some(key) {
+        save(st);
+        return;
+    }
+    let Some(db) = st.store() else {
+        // No table, so nothing for the file to be a copy of.
+        return;
+    };
+    let items: Vec<Item> = match db.intents(key) {
+        Ok(rows) => rows.into_iter().map(item_of).collect(),
+        Err(e) => {
+            tracing::warn!("wishlist: could not read the standing order for {key:?}: {e}");
+            return;
+        }
+    };
+    let p = path(&st.cfg.work, key);
+    if items.is_empty() && !p.exists() {
+        return;
+    }
+    let book = read(&st.cfg.work, key)
+        .map(|d| d.book)
+        .or_else(|| db.book(key).ok().flatten().map(|b| b.path));
+    let Some(book) = book else {
+        return;
+    };
+    write(
+        &p,
+        &Saved {
+            version: VERSION,
+            book,
+            key: key.to_string(),
+            updated: chrono::Local::now().to_rfc3339(),
+            items,
+            projection: true,
+        },
+    );
 }
 
 fn snapshot(s: &Session, w: &Wishlist) -> Option<Saved> {
@@ -304,6 +370,7 @@ fn snapshot(s: &Session, w: &Wishlist) -> Option<Saved> {
         key,
         updated: chrono::Local::now().to_rfc3339(),
         items,
+        projection: false,
     })
 }
 
@@ -403,14 +470,17 @@ fn item_of(r: IntentRow) -> Item {
 /// order on some other book is not this snapshot's to have an opinion about.
 /// That is what makes a `/api/load` of a second book harmless to the first one's
 /// overnight download.
-fn store_sync(st: &AppState, key: &str, items: &[Item]) {
+///
+/// Returns whether the table now says it — which is what decides whether the
+/// file written beside it may call itself a copy.
+fn store_sync(st: &AppState, key: &str, items: &[Item]) -> bool {
     let Some(db) = st.store() else {
         // No database: the file is the record, exactly as it was before there
         // was a table. Nothing to log — this is a state the server is allowed to
         // run in, and it already said so once at boot.
-        return;
+        return false;
     };
-    sync(db, key, items);
+    sync(db, key, items)
 }
 
 /// The diff itself, against a store the caller has already got hold of.
@@ -420,23 +490,25 @@ fn store_sync(st: &AppState, key: &str, items: &[Item]) {
 /// back of tonight's queue. For the same reason a chapter that is already on the
 /// list is left completely alone: its place, its `created_ms` and its poison
 /// count are all facts about the original ask.
-fn sync(db: &Store, key: &str, items: &[Item]) {
+fn sync(db: &Store, key: &str, items: &[Item]) -> bool {
     let existing = match db.intents(key) {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!("wishlist: could not read the standing order for {key:?}: {e}");
-            return;
+            return false;
         }
     };
+    let mut ok = true;
     if items.is_empty() {
         // Cancel-all, or a queue that has been worked through. One statement
         // rather than a delete per row.
         if !existing.is_empty() {
             if let Err(e) = db.drop_intents_for_book(key) {
                 tracing::warn!("wishlist: could not clear the standing order for {key:?}: {e}");
+                ok = false;
             }
         }
-        return;
+        return ok;
     }
     for row in &existing {
         if !items.iter().any(|i| i.chapter == row.chapter) {
@@ -445,6 +517,7 @@ fn sync(db: &Store, key: &str, items: &[Item]) {
                     "wishlist: could not drop chapter {} of {key:?}: {e}",
                     row.chapter
                 );
+                ok = false;
             }
         }
     }
@@ -458,7 +531,7 @@ fn sync(db: &Store, key: &str, items: &[Item]) {
     for it in items {
         match existing.iter().find(|r| r.chapter == it.chapter) {
             Some(row) => {
-                flush(db, key, &mut run, run_pack, now);
+                ok &= flush(db, key, &mut run, run_pack, now);
                 if it.pack && !row.pack {
                     // Somebody asked for the download of a chapter that was only
                     // queued to render. That re-ask resets `tries`, which is
@@ -469,12 +542,13 @@ fn sync(db: &Store, key: &str, items: &[Item]) {
                             "wishlist: could not mark chapter {} of {key:?} for packing: {e}",
                             it.chapter
                         );
+                        ok = false;
                     }
                 }
             }
             None => {
                 if !run.is_empty() && run_pack != it.pack {
-                    flush(db, key, &mut run, run_pack, now);
+                    ok &= flush(db, key, &mut run, run_pack, now);
                 }
                 run_pack = it.pack;
                 run.push(it.chapter);
@@ -482,7 +556,7 @@ fn sync(db: &Store, key: &str, items: &[Item]) {
             }
         }
     }
-    flush(db, key, &mut run, run_pack, now);
+    ok &= flush(db, key, &mut run, run_pack, now);
     // A row is born with `tries` at zero, so a chapter that arrives already
     // carrying a count — an adopted `queue.json`, a parked item coming back —
     // has to be walked up to it. Bounded by [`MAX_ATTEMPTS`], and only ever on a
@@ -499,84 +573,87 @@ fn sync(db: &Store, key: &str, items: &[Item]) {
                     "wishlist: could not restore the attempt count of chapter {} of {key:?}: {e}",
                     it.chapter
                 );
+                ok = false;
                 break;
             }
         }
     }
+    ok
 }
 
-fn flush(db: &Store, key: &str, run: &mut Vec<usize>, pack: bool, now: i64) {
+fn flush(db: &Store, key: &str, run: &mut Vec<usize>, pack: bool, now: i64) -> bool {
     if run.is_empty() {
-        return;
+        return true;
     }
-    if let Err(e) = db.add_intent(key, run, NO_DEVICE, pack, now) {
-        tracing::warn!(
-            "wishlist: could not record {} chapter(s) of {key:?}: {e}",
-            run.len()
-        );
-    }
+    let ok = match db.add_intent(key, run, NO_DEVICE, pack, now) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                "wishlist: could not record {} chapter(s) of {key:?}: {e}",
+                run.len()
+            );
+            false
+        }
+    };
     run.clear();
+    ok
 }
 
-/// The standing order for one book: the file if it is there, the table if it is
-/// not.
+/// The standing order for one book: the table, unless the file is a record the
+/// table has never taken in.
 ///
-/// The asymmetry is deliberate and it is the whole of the module doc's "two
-/// records" section in one function.
+/// **With a store, the table is the record.** Everything that changes an order
+/// writes it — the session's own [`save`], and the paths that never go near the
+/// session: an order placed or cancelled from the library for a book that is not
+/// loaded, the worker retiring a foreign order it has finished, the packer
+/// dropping one it has packed. Reading the file first, as this used to, let a
+/// copy none of those had touched overrule all of them the moment the book was
+/// opened: an order placed from the library vanished (the file said `[]`), and a
+/// cancelled one came back (the file still listed it). `sync` then made the
+/// table agree with the stale file, so the loss was durable too.
 ///
-/// **The file is present.** It is this book's record, whatever state it is in.
-/// It is read with every check it has always been read with — version, and the
-/// book and key written inside it, which is the only thing that catches a work
-/// directory restored from another box — and a file that fails any of them is a
-/// *damaged* record and yields nothing, exactly as it did before there was a
-/// table. Either way the table is then made to agree with what the file said:
-/// that one call is the adoption of a file this binary has never seen, the
-/// steady-state no-op when the two already match, and the tidying away of rows
-/// whose file has just been declared damaged. Rows the file no longer backs are
-/// rows about nothing, and leaving them would have the scheduler chasing an
-/// order that this boot has already decided it does not have.
+/// **The one file that still wins** is one without the `projection` mark: written
+/// by a binary with no store, or beside a table write that failed. Either way it
+/// holds asks the table may not, and it is adopted — the table made to match,
+/// order, pack flags and counts — and rewritten as a copy, so it is adopted once
+/// and never again. That is the A1's `queue.json` on the first boot of this
+/// binary, and a rollback's on the way forward again. It is still read with every
+/// check it always had (version, and the book and key inside it), and one that
+/// fails them is not adopted; the table stands.
 ///
-/// **The file is absent.** That is the case the table is here for — a `work/`
-/// restored without its audio, a tidy-up, a bad merge of a backup — and the
-/// rows are read back as they stand. Absent is a different claim from damaged,
-/// and this is the one place in the module where the difference is worth a
-/// branch.
+/// **Without a store** the file is the only record there is, whatever it says
+/// about itself, exactly as before the table existed.
 fn load_items(st: &AppState, key: &str) -> Vec<Item> {
     let p = path(&st.cfg.work, key);
-    if p.exists() {
-        let items = read(&st.cfg.work, key).map(|d| d.items).unwrap_or_default();
-        if let Some(db) = st.store() {
-            let had = db.intents(key).map(|r| r.len()).unwrap_or(0);
-            sync(db, key, &items);
-            if had == 0 && !items.is_empty() {
-                tracing::info!(
-                    "wishlist: adopted {} chapter(s) for {key:?} out of {}, which stays where it \
-                     is",
-                    items.len(),
-                    p.display()
-                );
-            }
-        }
-        return items;
-    }
     let Some(db) = st.store() else {
-        return Vec::new();
+        return read(&st.cfg.work, key).map(|d| d.items).unwrap_or_default();
     };
-    match db.intents(key) {
-        Ok(rows) => {
-            if !rows.is_empty() {
-                tracing::info!(
-                    "wishlist: {} has no {}; taking its {} outstanding chapter(s) from state.db",
-                    key,
-                    p.display(),
-                    rows.len()
-                );
+    if p.exists() {
+        if let Some(mut doc) = read(&st.cfg.work, key).filter(|d| !d.projection) {
+            let had = db.intents(key).map(|r| r.len()).unwrap_or(0);
+            if sync(db, key, &doc.items) {
+                if had == 0 && !doc.items.is_empty() {
+                    tracing::info!(
+                        "wishlist: adopted {} chapter(s) for {key:?} out of {}; state.db is the \
+                         record from here on",
+                        doc.items.len(),
+                        p.display()
+                    );
+                }
+                doc.projection = true;
+                write(&p, &doc);
             }
-            rows.into_iter().map(item_of).collect()
+            return doc.items;
         }
+    }
+    match db.intents(key) {
+        Ok(rows) => rows.into_iter().map(item_of).collect(),
         Err(e) => {
+            // The record will not answer. The copy is the next best account of
+            // what was asked for, and better than dropping the order on the
+            // floor for as long as the table stays unreadable.
             tracing::warn!("wishlist: could not read the standing order for {key:?}: {e}");
-            Vec::new()
+            read(&st.cfg.work, key).map(|d| d.items).unwrap_or_default()
         }
     }
 }
@@ -748,7 +825,7 @@ fn reset_tries(st: &AppState, chapters: &[usize]) {
 
 /// These chapters were cancelled — all of them, if `chapters` is None.
 ///
-/// The file has to be rewritten here rather than merely left alone: it is what
+/// The record has to be rewritten here rather than merely left alone: it is what
 /// the next boot believes, and a cancel that only happened in memory would be
 /// undone by the next restart, which is the same bug in the other direction.
 pub fn cancelled(st: &AppState, chapters: Option<&[usize]>) {
@@ -1046,6 +1123,7 @@ mod tests {
                 attempts: 0,
                 parked: false,
             }],
+            projection: false,
         };
         write(&path(&st.cfg.work, &key), &doc);
         assert!(resume(&st).is_none());

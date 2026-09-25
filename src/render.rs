@@ -528,6 +528,9 @@ fn retire(st: &Arc<AppState>, key: &str, ci: usize, n: usize, pack: bool) {
             tracing::warn!("could not clear the order for {key} ch{ci}: {e}");
         }
     }
+    // The table is the record; the book's `queue.json` is its copy, and it is
+    // not the session's to rewrite, so it is brought up to date here.
+    crate::wishlist::project(st, key);
 }
 
 /// First unrendered chunk of the chapter queue the UI filled, or None.
@@ -1208,6 +1211,7 @@ fn builder(st: Arc<AppState>) {
                     tracing::warn!("could not clear the order for {key} ch{ci}: {e}");
                 }
             }
+            crate::wishlist::project(&st, &key);
         }
         // Whether it packed or not. A failed encode already leaves the queues
         // here rather than being retried forever in this process, and the file has
