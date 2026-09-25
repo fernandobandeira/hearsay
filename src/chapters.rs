@@ -41,18 +41,28 @@ pub struct Manifest {
 /// Chapters being packed right now. gc on either side of the cache must leave
 /// these alone: the chunk wavs are the build's input and a half-written m4a is
 /// not a file anyone should see.
-static BUILDING: Mutex<Option<HashSet<(String, usize)>>> = Mutex::new(None);
+/// Counted, because `build()` and `build_hls()` can both be at work on one
+/// chapter, and the first to finish must not unprotect the other.
+static BUILDING: Mutex<Option<HashMap<(String, usize), usize>>> = Mutex::new(None);
 
 fn building_insert(key: &str, ci: usize) {
     if let Ok(mut g) = BUILDING.lock() {
-        g.get_or_insert_with(HashSet::new).insert((key.into(), ci));
+        *g.get_or_insert_with(HashMap::new)
+            .entry((key.into(), ci))
+            .or_insert(0) += 1;
     }
 }
 
 fn building_remove(key: &str, ci: usize) {
     if let Ok(mut g) = BUILDING.lock() {
-        if let Some(s) = g.as_mut() {
-            s.remove(&(key.into(), ci));
+        if let Some(m) = g.as_mut() {
+            let k = (key.to_string(), ci);
+            if let Some(n) = m.get_mut(&k) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(&k);
+                }
+            }
         }
     }
 }
@@ -107,7 +117,7 @@ fn building_tags() -> HashSet<String> {
         .and_then(|g| g.clone())
         .unwrap_or_default()
         .into_iter()
-        .map(|(k, c)| format!("{k}/ch{c:03}"))
+        .map(|((k, c), _)| format!("{k}/ch{c:03}"))
         .collect()
 }
 

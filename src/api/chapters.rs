@@ -363,6 +363,8 @@ fn order_elsewhere(
             format!("could not record the order: {e}"),
         )));
     }
+    // The store is the record; the book's `queue.json` is its copy on disk.
+    crate::wishlist::project(st, key);
     // Anything already rendered never reaches the worker, exactly as on the
     // loaded book's path — hand it straight to the packer rather than leaving it
     // to be noticed.
@@ -695,10 +697,16 @@ fn cancel_elsewhere(st: &Arc<AppState>, key: &str, body: &ChapterSetBody) -> Opt
     };
     {
         let mut s = st.session();
-        let building = s.building;
-        s.pack_elsewhere
-            .retain(|(k, c)| k != key || (!dropped.contains(c) || Some(*c) == building));
+        // `packing` rather than `building`: the in-flight job may be this book's,
+        // and `building` only ever names the loaded one.
+        let inflight = s.packing.clone();
+        s.pack_elsewhere.retain(|(k, c)| {
+            k != key
+                || !dropped.contains(c)
+                || inflight.as_ref().is_some_and(|(pk, pc)| pk == k && pc == c)
+        });
     }
+    crate::wishlist::project(st, key);
     Some(
         Json(CancelResult {
             ok: true,
