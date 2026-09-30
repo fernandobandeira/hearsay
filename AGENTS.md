@@ -1668,3 +1668,21 @@ the filesystem remains render truth. A failed cleanup is reported and can be
 retried while the source remains. A fresh upload clears the tombstone only after
 publication. The vault's git sync can propagate a deleted vault EPUB, which the
 confirmation explicitly states.
+
+
+### Device cleanup after server deletion
+
+`GET /api/books/deleted` is an uncached list of explicitly completed deletion
+keys, read from `work/deleted/`. It includes deletions performed before a device
+updated. Missing books in `/api/books` never imply deletion. A marker whose
+source or cache still exists is not published as completed.
+
+The reader fetches this list on startup, foreground/focus, reconnection and
+`books` events, with a 30-second foreground backstop. Only a successful, valid
+response triggers cleanup; offline, timeout, 4xx/5xx and malformed responses
+leave local copies untouched. Confirmed keys stop playback, cancel device
+pending downloads, evict audio/text/manifest caches and forget local library
+metadata. Download writes check the confirmed keys both before and after the
+fetch/store so in-flight downloads cannot restore a deleted copy. Voice memo
+outbox entries and reading positions are retained. A fresh upload clears the
+server tombstone and a later successful sync permits storing that book again.

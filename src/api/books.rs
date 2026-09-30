@@ -238,3 +238,68 @@ pub async fn delete_book(State(st): State<Arc<AppState>>, Json(b): Json<DeleteBo
         }
     }
 }
+
+/// Explicit completed deletions, including ones made before a device updated.
+/// A missing library entry is never a deletion signal.
+#[utoipa::path(get, path = "/api/books/deleted", tag = "library",
+ responses((status = 200, body = Vec<String>), (status = 500, body = ApiError)))]
+pub async fn deleted_books(State(st): State<Arc<AppState>>) -> Response {
+    let result = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<String>> {
+        let entries = match std::fs::read_dir(st.cfg.work.join("deleted")) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut keys = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let key = entry.file_name().to_string_lossy().to_string();
+            if key.is_empty() || cache::safe_key(&key) != key {
+                continue;
+            }
+            let source = std::fs::read_to_string(entry.path())?;
+            // Markers precede cleanup. Publish only after the source and the
+            // caches are gone, so a failed or in-flight delete is not broadcast.
+            if Path::new(&source).try_exists()? {
+                continue;
+            }
+            let mut complete = true;
+            for area in ["audio", "chapters", "hls", "text", "render", "export"] {
+                if st.cfg.work.join(area).join(&key).try_exists()? {
+                    complete = false;
+                    break;
+                }
+            }
+            if complete {
+                keys.push(key);
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    })
+    .await;
+    match result {
+        Ok(Ok(keys)) => (
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Json(keys),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!("reading deletions: {e}");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not read server deletions",
+            )
+        }
+        Err(e) => {
+            tracing::warn!("reading deletions: {e}");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not read server deletions",
+            )
+        }
+    }
+}

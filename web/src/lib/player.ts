@@ -323,6 +323,7 @@ export class Player {
    * error and stopped, so a five-second blip cost a manual tap.
    */
   async play(isRetry = false): Promise<boolean> {
+    if (!this.opts) return false;
     if (!isRetry) { this.failures = 0; this.stopRetry(); }
     this.wantPlaying = true;
     this.ev.onPlaying(true);
@@ -390,6 +391,23 @@ export class Player {
     }
     const t = clampTime(this.manifest, (this.au.currentTime || 0) + seconds);
     try { this.au.currentTime = t; } catch { /* not loaded yet */ }
+  }
+
+  /** Release the deleted book, including prefetched blobs and lock-screen audio. */
+  close(): void {
+    this.pause();
+    this.gen++;
+    this.pf.drop();
+    this.opts = null;
+    this.next = null;
+    this.manifest = null;
+    this.pendingSeek = null;
+    this.standbyChunk = null;
+    this.mode = 'none';
+    for (const e of this.els) { e.pause(); e.removeAttribute('src'); e.load(); }
+    this.ev.onMode('none');
+    const ms = mediaSession();
+    if (ms) { ms.metadata = null; ms.playbackState = 'none'; }
   }
 
   destroy(): void {

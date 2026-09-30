@@ -163,3 +163,38 @@ async fn deletion_waits_for_in_flight_disk_work() {
     reader.join().unwrap();
     assert!(!std::path::Path::new(&h.book_path()).exists());
 }
+
+#[tokio::test]
+async fn only_completed_explicit_deletions_are_reported_to_devices() {
+    let h = Harness::new().await;
+    let (_, raw) = h.get("/api/books/deleted").await;
+    assert_eq!(serde_json::from_slice::<Value>(&raw).unwrap(), json!([]));
+    // A source missing from the shelf is not an explicit deletion.
+    std::fs::remove_file(h.book_path()).unwrap();
+    let (_, raw) = h.get("/api/books/deleted").await;
+    assert_eq!(serde_json::from_slice::<Value>(&raw).unwrap(), json!([]));
+    let path = h.add_book("Finished.epub");
+    let markers = h.work().join("deleted");
+    std::fs::create_dir_all(&markers).unwrap();
+    std::fs::write(markers.join("Finished"), &path).unwrap();
+    let (_, raw) = h.get("/api/books/deleted").await;
+    assert_eq!(serde_json::from_slice::<Value>(&raw).unwrap(), json!([]));
+    assert_eq!(
+        h.post_json(
+            "/api/books/delete",
+            json!({"path":path,"confirm":"Finished.epub"})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, raw) = h.get("/api/books/deleted").await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&raw).unwrap(),
+        json!(["Finished"])
+    );
+    let fixture = std::fs::read(harness::fixture_epub()).unwrap();
+    assert_eq!(upload(&h, "Finished.epub", fixture).await, StatusCode::OK);
+    let (_, raw) = h.get("/api/books/deleted").await;
+    assert_eq!(serde_json::from_slice::<Value>(&raw).unwrap(), json!([]));
+}

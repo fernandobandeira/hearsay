@@ -24,8 +24,9 @@ import {onlineManager, useQueryClient} from '@tanstack/react-query';
 import {
   ApiError, awaitedRetry, bookIndexUrl, chapterManifestUrl, chapterTextUrl, fetchChapters, keys,
   get, loadBook, openChapter as tellOpen, reportPlayhead, tellPause, tellResume, textShardUrl,
-  useBookIndex, useStatus,
+  useBookIndex, useStatus, fetchDeletedBooks,
 } from './lib/api';
+import {isDeletedBook, syncDeletions} from './lib/deletions';
 import {loadChapterText, shardOf, type ChapterWords, type TextSources} from './lib/chaptertext';
 import {
   arbitrate, connectLive, lostSession, type HelloEvent, type LiveState, type PositionEvent,
@@ -146,6 +147,7 @@ interface Ctx {
   /** Give a whole book back: its words and every chapter downloaded for it. */
   dropBook: (key: string) => Promise<void>;
   closeDeletedBook: (key: string) => void;
+  syncDeletedBooks: () => Promise<void>;
   flush: (manual?: boolean) => Promise<void>;
   queueNote: (blob: Blob) => Promise<void>;
   player: Player | null;
@@ -630,7 +632,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   const orderedRef = useRef(new Map<string, {sig: string; at: number}>());
 
   const readPending = useCallback(async () => {
-    const all = await db.allDownloads().catch(() => [] as PendingDownload[]);
+    const all = (await db.allDownloads().catch(() => [] as PendingDownload[])).filter((p) => !isDeletedBook(p.key));
     setPendingDownloads(all);
     return all;
   }, []);
@@ -646,9 +648,9 @@ export function NarratorProvider({children}: {children: ReactNode}) {
           rows: async (key) => (await fetchChapters(key)).chapters,
           stored: cachedChapters,
           fetchChapter: downloadChapter,
-          save: db.putDownload,
+          save: (p) => isDeletedBook(p.key) ? db.deleteDownload(p.key) : db.putDownload(p),
           drop: db.deleteDownload,
-          order: (key, o) => Promise.all([
+          order: (key, o) => isDeletedBook(key) ? Promise.resolve() : Promise.all([
             o.render.length ? renderChapters(key, o.render, true) : null,
             o.build.length ? buildChapters(key, o.build) : null,
           ]),
@@ -670,6 +672,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
              nothing for an hour and then everything at once is indistinguishable
              from one that is stuck. One Cache Storage scan per chapter. */
           onStored: (key, ci) => {
+            if (isDeletedBook(key)) return;
             touchChapter(key, ci);
             void refreshOffline();
             void adoptStoredRef.current(key, ci);
@@ -692,7 +695,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   /** Add to the queue, write it down, and start on it now. */
   const queueDownload = useCallback(async (cis: number[]) => {
     const b = bookRef.current;
-    if (!b || !cis.length) return;
+    if (!b || !cis.length || isDeletedBook(b.key)) return;
     const held = await cachedChapters(b.key);
     const want = cis.filter((ci) => !held.has(ci));
     if (!want.length) return;
@@ -982,6 +985,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     const guessKey = bookKey(b);
     let entry: LibEntry | undefined = lib[guessKey];
     let server: LoadResult['position'] = null;
+    if (isDeletedBook(bookKey(b))) return;
     setBookLoading(true);
     /* Opening a book is an open too, and it has to be in the same sequence: it
        holds the wait until one of its own `openChapter` calls takes it over, and
@@ -1136,7 +1140,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     setTextBusy(true);
     void downloadText(k, index.shards, {
       onProgress: (done, total) => { if (alive) setTextProgress({done, total}); },
-      stop: () => !alive,
+      stop: () => !alive || isDeletedBook(k),
     })
       .then((r) => {
         if (!alive) return;
@@ -1175,7 +1179,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
    */
   const closeDeletedBook = useCallback((key: string) => {
     if (bookRef.current?.key !== key) return;
-    player?.pause();
+    player?.close();
     bookSeqRef.current += 1;
     openSeq.begin().settle();
     bookRef.current = null;
@@ -1186,6 +1190,47 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     setBookLoading(false);
     setChapterLoading(false);
   }, [player, openSeq]);
+
+  const deletionSyncing = useRef(false);
+  const syncDeletedBooks = useCallback(async () => {
+    if (deletionSyncing.current || navigator.onLine === false) return;
+    deletionSyncing.current = true;
+    try {
+      await syncDeletions({
+        fetch: fetchDeletedBooks,
+        close: closeDeletedBook,
+        remove: async (key) => {
+          await db.deleteDownload(key);
+          orderedRef.current.delete(key);
+          for (const prefix of ['book-index', 'shard', 'chapter-text', 'manifest', 'chapters']) {
+            await qc.cancelQueries({queryKey: [prefix, key]});
+            qc.removeQueries({queryKey: [prefix, key]});
+          }
+          await removeBook(key);
+          const lib = readLib();
+          delete lib[key];
+          writeLib(lib);
+        },
+      });
+      await readPending();
+      await refreshOffline();
+    } finally { deletionSyncing.current = false; }
+  }, [qc, closeDeletedBook, readPending, refreshOffline]);
+
+  useEffect(() => {
+    const wake = () => { if (document.visibilityState === 'visible') void syncDeletedBooks().catch(() => {}); };
+    wake();
+    const tick = setInterval(wake, 30_000);
+    window.addEventListener('online', wake);
+    window.addEventListener('focus', wake);
+    document.addEventListener('visibilitychange', wake);
+    return () => {
+      clearInterval(tick);
+      window.removeEventListener('online', wake);
+      window.removeEventListener('focus', wake);
+      document.removeEventListener('visibilitychange', wake);
+    };
+  }, [syncDeletedBooks]);
 
   const dropBook = useCallback(async (key: string) => {
     const next = [...new Set([...readOptOut(), key])];
@@ -1331,11 +1376,12 @@ export function NarratorProvider({children}: {children: ReactNode}) {
   useEffect(() => connectLive(qc, {
     onState: setLive,
     onEvent: (ev) => {
+      if (ev.name === 'hello' || ev.name === 'books') void syncDeletedBooks().catch(() => {});
       if (ev.name === 'position') onPosition(ev.data);
       else if (ev.name === 'hello') onHello(ev.data);
       else if (ev.name === 'render') onRender(ev.data);
     },
-  }), [qc, onPosition, onHello, onRender]);
+  }), [qc, onPosition, onHello, onRender, syncDeletedBooks]);
 
   const follow = useCallback(() => {
     const to = moved;
@@ -1368,7 +1414,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     openBook, openChapter, goChapter, setIdx, toggle,
     nudge: (s: number) => player?.nudge(s),
     setFontScale, refreshOffline, queueDownload, unqueueDownload, sweepDownloads,
-    saveText, dropBook, closeDeletedBook, flush, queueNote, player,
+    saveText, dropBook, closeDeletedBook, syncDeletedBooks, flush, queueNote, player,
   }), [book, chapters, index, ci, chunks, paras, chapterTitle, idx, mode, playing, waiting,
        message, conn, offlineChapters, queuedChapters, savingChapters,
        textShards, textBusy, textProgress, textOptOut,
@@ -1376,7 +1422,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
        follow, dismissMoved,
        status.data, openBook, openChapter, goChapter, setIdx, toggle, setFontScale,
        refreshOffline, queueDownload, unqueueDownload, sweepDownloads,
-       saveText, dropBook, closeDeletedBook, flush, queueNote, player]);
+       saveText, dropBook, closeDeletedBook, syncDeletedBooks, flush, queueNote, player]);
 
   // A handle for the dev console and for driving the reader from a headless
   // browser. Dev only: the production bundle has no such door.

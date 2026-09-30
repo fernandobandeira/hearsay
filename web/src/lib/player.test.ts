@@ -285,3 +285,19 @@ describe('chunk mode', () => {
     expect(active().src).toBe('blob:/api/chunk/1/2.wav');
   });
 });
+
+
+test('a deleted book releases its audio and cannot restart from old controls', async () => {
+  const {p, active} = player();
+  await p.open(opts(1));
+  await p.play();
+  p.prepareNext(opts(2));
+  p.close();
+  expect(p.playing).toBe(false);
+  expect(p.mode).toBe('none');
+  for (const audio of made) expect(audio.getAttribute('src')).toBeNull();
+  expect(await p.play()).toBe(false);
+  await p.open(opts(3));
+  expect(await p.play()).toBe(true);
+  expect(active().src).toBe('/api/chapters/3.m4a?book=lom');
+});

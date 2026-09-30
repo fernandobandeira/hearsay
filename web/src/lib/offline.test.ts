@@ -12,6 +12,7 @@ import {
   audioBytes, bookKey, cachedChapters, cachedShards, downloadChapter, downloadText,
   heldBooks, removeBook, removeChapter, removeText,
 } from './offline';
+import {syncDeletions} from './deletions';
 import {MAX_RETRIES} from './backoff';
 
 const ORIGIN = 'https://reader.test';
@@ -59,7 +60,8 @@ let asked: [string, RequestInit | undefined][];
 const header = (init: RequestInit | undefined, name: string): string | null =>
   new Headers(init?.headers).get(name);
 
-beforeEach(() => {
+beforeEach(async () => {
+  await syncDeletions({fetch: async () => [], close: () => {}, remove: async () => {}});
   store = new Map();
   served = new Map();
   (globalThis as {caches?: unknown}).caches = {
@@ -469,5 +471,37 @@ describe('what this device holds, and giving a book back', () => {
     await held(AUDIO_CACHE, '/api/chapters/1.m4a?book=sapiens');
     await removeBook('lom');
     expect(paths(AUDIO_CACHE)).toEqual(['/api/chapters/1.m4a?book=sapiens']);
+  });
+});
+
+
+describe('server deletion while a device has downloads', () => {
+  test('network failure keeps every cached book, then explicit sync removes only the named one', async () => {
+    for (const key of ['lom', 'Keep']) {
+      await held(AUDIO_CACHE, `/api/chapters/0.m4a?book=${key}`);
+      await held(TEXT_CACHE, `/api/book.json?book=${key}`);
+      await held(CHAPTER_CACHE, `/api/chapter/0?book=${key}`);
+    }
+    await syncDeletions({fetch: async () => { throw new Error('offline'); }, close: () => {}, remove: removeBook});
+    expect(await heldBooks()).toEqual(new Set(['lom', 'Keep']));
+    await syncDeletions({fetch: async () => ['lom'], close: () => {}, remove: removeBook});
+    expect(await heldBooks()).toEqual(new Set(['Keep']));
+    for (const name of [AUDIO_CACHE, TEXT_CACHE, CHAPTER_CACHE])
+      expect(paths(name).every((p) => !p.includes('book=lom'))).toBe(true);
+  });
+
+  test('an in-flight Cache.put cannot restore audio after confirmed deletion', async () => {
+    serve('/api/chapters/0.json?book=lom', '{}');
+    serve('/api/chapters/0.m4a?book=lom', 'audio');
+    const c = cache(AUDIO_CACHE);
+    const put = c.put.bind(c);
+    c.put = async (req, res) => {
+      if (urlOf(req).endsWith('.m4a?book=lom')) {
+        await syncDeletions({fetch: async () => ['lom'], close: () => {}, remove: removeBook});
+      }
+      await put(req, res); // A stale write finishing after the deletion sweep.
+    };
+    await expect(downloadChapter('lom', 0, {wait: async () => {}, attempts: 0})).rejects.toThrow('deleted');
+    expect(paths(AUDIO_CACHE)).toEqual([]);
   });
 });

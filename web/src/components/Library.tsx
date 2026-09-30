@@ -70,6 +70,7 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
     try {
       await call(sdk.deleteBook({body: {path: b.path, confirm: b.name}}));
       n.closeDeletedBook(bookKey(b));
+      await n.syncDeletedBooks();
       setMessage(`${b.name} deleted from the server`);
     } catch (e) { setMessage(e instanceof Error ? e.message : 'Could not delete the book'); }
     finally { await refresh(); setBusy(false); }
@@ -83,6 +84,7 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
         const data = await file.arrayBuffer();
         await call(sdk.upload({query: {name: file.name}, body: file.name, bodySerializer: () => data}));
       }
+      await n.syncDeletedBooks();
       setMessage('EPUBs added to the server');
     } catch (e) { setMessage(e instanceof Error ? e.message : 'Upload failed'); }
     finally { await refresh(); setBusy(false); }

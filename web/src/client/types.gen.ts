@@ -704,6 +704,25 @@ export type DeleteBookResponses = {
 
 export type DeleteBookResponse = DeleteBookResponses[keyof DeleteBookResponses];
 
+export type DeletedBooksData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/books/deleted';
+};
+
+export type DeletedBooksErrors = {
+    500: ApiError;
+};
+
+export type DeletedBooksError = DeletedBooksErrors[keyof DeletedBooksErrors];
+
+export type DeletedBooksResponses = {
+    200: Array<string>;
+};
+
+export type DeletedBooksResponse = DeletedBooksResponses[keyof DeletedBooksResponses];
+
 export type UploadData = {
     body: string;
     path?: never;

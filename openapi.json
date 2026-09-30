@@ -186,6 +186,40 @@
         }
       }
     },
+    "/api/books/deleted": {
+      "get": {
+        "tags": [
+          "library"
+        ],
+        "summary": "Explicit completed deletions, including ones made before a device updated.\nA missing library entry is never a deletion signal.",
+        "operationId": "deleted_books",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/books/upload": {
       "post": {
         "tags": [

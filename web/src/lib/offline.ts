@@ -15,6 +15,7 @@
 import {
   ApiError, chapterAudioUrl, chapterManifestUrl, chapterTextUrl, bookIndexUrl, textShardUrl,
 } from './api';
+import {isDeletedBook} from './deletions';
 import {delayFor, isRetryable, MAX_RETRIES, statusOf} from './backoff';
 
 /**
@@ -445,17 +446,25 @@ export async function requestPersistence(): Promise<boolean> {
  * Returns the size of what was stored, from the Blob rather than from a header.
  */
 async function put(c: Cache, url: string): Promise<number> {
+  const key = new URL(url, 'https://cache.invalid').searchParams.get('book');
+  const check = () => { if (key && isDeletedBook(key)) throw new ApiError(410, 'Book deleted from server'); };
+  check();
   const res = await fetch(url, STORE_INIT);
   // ApiError rather than Error, so the retry policy can read the status off it:
   // a 503 is a blip worth repeating and a 404 is an answer. See lib/backoff.ts.
   if (!res.ok) throw new ApiError(res.status, `${url.split('?')[0]} \u2192 ${res.status}`);
   const body = await res.blob();
+  check();
   const headers = new Headers(res.headers);
   headers.delete('content-encoding');
   headers.set('content-length', String(body.size));
   await c.put(url, new Response(body, {
     status: res.status, statusText: res.statusText, headers,
   }));
+  if (key && isDeletedBook(key)) {
+    await c.delete(url, MATCH);
+    throw new ApiError(410, 'Book deleted from server');
+  }
   return body.size;
 }
 

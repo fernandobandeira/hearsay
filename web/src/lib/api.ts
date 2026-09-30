@@ -344,3 +344,7 @@ export const tellResume = () => tell(sdk.resume());
 // about a response, not about a value, and an unwrapped envelope is the wrong
 // shape for it - the audio is on a phone and nowhere else until that call
 // succeeds.
+
+/** An uncached, successful answer is the only source of device deletions. */
+export const fetchDeletedBooks = (): Promise<string[]> =>
+  call(sdk.deletedBooks({cache: 'no-store', signal: AbortSignal.timeout(15_000)}));

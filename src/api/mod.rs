@@ -409,6 +409,7 @@ pub fn router(state: Arc<AppState>) -> (axum::Router, utoipa::openapi::OpenApi) 
     let (r, mut api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(session::books))
         .routes(routes!(books::delete_book))
+        .routes(routes!(books::deleted_books))
         .routes({
             let (schemas, paths, method) = routes!(books::upload);
             (
