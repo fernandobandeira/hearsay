@@ -145,6 +145,7 @@ interface Ctx {
   saveText: () => void;
   /** Give a whole book back: its words and every chapter downloaded for it. */
   dropBook: (key: string) => Promise<void>;
+  closeDeletedBook: (key: string) => void;
   flush: (manual?: boolean) => Promise<void>;
   queueNote: (blob: Blob) => Promise<void>;
   player: Player | null;
@@ -1172,6 +1173,20 @@ export function NarratorProvider({children}: {children: ReactNode}) {
    * whoever wants it back. In-memory copies of what was just evicted go too, or
    * Query would keep serving words this device no longer has.
    */
+  const closeDeletedBook = useCallback((key: string) => {
+    if (bookRef.current?.key !== key) return;
+    player?.pause();
+    bookSeqRef.current += 1;
+    openSeq.begin().settle();
+    bookRef.current = null;
+    setBook(null);
+    setChapters([]);
+    setChunks([]);
+    setParas(null);
+    setBookLoading(false);
+    setChapterLoading(false);
+  }, [player, openSeq]);
+
   const dropBook = useCallback(async (key: string) => {
     const next = [...new Set([...readOptOut(), key])];
     writeOptOut(next);
@@ -1353,7 +1368,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
     openBook, openChapter, goChapter, setIdx, toggle,
     nudge: (s: number) => player?.nudge(s),
     setFontScale, refreshOffline, queueDownload, unqueueDownload, sweepDownloads,
-    saveText, dropBook, flush, queueNote, player,
+    saveText, dropBook, closeDeletedBook, flush, queueNote, player,
   }), [book, chapters, index, ci, chunks, paras, chapterTitle, idx, mode, playing, waiting,
        message, conn, offlineChapters, queuedChapters, savingChapters,
        textShards, textBusy, textProgress, textOptOut,
@@ -1361,7 +1376,7 @@ export function NarratorProvider({children}: {children: ReactNode}) {
        follow, dismissMoved,
        status.data, openBook, openChapter, goChapter, setIdx, toggle, setFontScale,
        refreshOffline, queueDownload, unqueueDownload, sweepDownloads,
-       saveText, dropBook, flush, queueNote, player]);
+       saveText, dropBook, closeDeletedBook, flush, queueNote, player]);
 
   // A handle for the dev console and for driving the reader from a headless
   // browser. Dev only: the production bundle has no such door.

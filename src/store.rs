@@ -969,6 +969,18 @@ impl Store {
     }
 
     /// Every book, by key.
+    /// Remove scheduling and scan records, retaining reading history.
+    pub fn remove_book(&self, key: &str) -> Result<()> {
+        let mut c = self.lock();
+        let tx = c.transaction()?;
+        for table in ["intent", "chapter_index"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE book = ?1"), [key])?;
+        }
+        tx.execute("DELETE FROM book WHERE key = ?1", [key])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn books(&self) -> Result<Vec<BookRow>> {
         let c = self.lock();
         let mut q = c.prepare(

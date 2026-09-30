@@ -305,6 +305,7 @@ fn adopt(key: &str, chapters: usize, epub: Option<&PathBuf>, now_ms: i64) -> Boo
 /// book. A scan that indexes nine books out of ten is worth strictly more than
 /// one that gives up on the first bad row.
 pub fn scan_all(st: &Arc<AppState>) -> ScanReport {
+    let _disk = st.book_files.read().unwrap_or_else(|e| e.into_inner());
     let t0 = Instant::now();
     let mut rep = ScanReport::default();
     let Some(db) = st.store() else {
@@ -340,6 +341,9 @@ pub fn scan_all(st: &Arc<AppState>) -> ScanReport {
     keys.extend(strangers.iter().cloned());
 
     for key in keys {
+        if crate::api::books::deleted(&st.cfg.work, &key) {
+            continue;
+        }
         if st.stop.load(Ordering::SeqCst) {
             break;
         }

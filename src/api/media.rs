@@ -168,7 +168,11 @@ pub async fn chapter_hls(
     let st2 = st.clone();
     let k2 = key.clone();
     let b2 = base.clone();
-    let built = tokio::task::spawn_blocking(move || pack::build_hls(&st2.cfg, &k2, ci, &b2)).await;
+    let built = tokio::task::spawn_blocking(move || {
+        let _disk = st2.book_files.read().unwrap_or_else(|e| e.into_inner());
+        pack::build_hls(&st2.cfg, &k2, ci, &b2)
+    })
+    .await;
     match built {
         Ok(Ok(p)) => match tokio::fs::read(&p).await {
             Ok(b) => (

@@ -38,9 +38,15 @@ pub struct BookFile {
     responses((status = 200, body = Vec<BookFile>))
 )]
 pub async fn books(State(st): State<Arc<AppState>>) -> Json<Vec<BookFile>> {
+    Json(all_books(&st))
+}
+
+pub fn all_books(st: &AppState) -> Vec<BookFile> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for d in &st.cfg.books {
+    let mut roots = st.cfg.books.clone();
+    roots.insert(0, st.cfg.work.join("uploads"));
+    for d in &roots {
         let mut found = Vec::new();
         walk_epubs(d, &mut found);
         found.sort();
@@ -60,7 +66,7 @@ pub async fn books(State(st): State<Arc<AppState>>) -> Json<Vec<BookFile>> {
             });
         }
     }
-    Json(out)
+    out
 }
 
 fn walk_epubs(d: &Path, out: &mut Vec<std::path::PathBuf>) {
@@ -111,6 +117,10 @@ pub struct LoadResult {
     )
 )]
 pub async fn load(State(st): State<Arc<AppState>>, Json(body): Json<LoadBody>) -> Response {
+    let _mutation = st.book_mutation.lock().await;
+    if super::books::deleted(&st.cfg.work, &cache::book_key(&body.path)) {
+        return err(StatusCode::CONFLICT, "This book has been deleted");
+    }
     let path = body.path.clone();
     let max_chars = body.max_chars.unwrap_or(crate::book::DEFAULT_MAX_CHARS);
     let key = cache::book_key(&body.path);
@@ -1028,6 +1038,9 @@ pub fn restore_session(st: &Arc<AppState>) -> Option<String> {
     let path = Path::new(&last.book);
     let max_chars = last.max_chars.unwrap_or(crate::book::DEFAULT_MAX_CHARS);
     let key = cache::book_key(&last.book);
+    if super::books::deleted(&st.cfg.work, &key) {
+        return None;
+    }
     // Only ever from the parse cache: re-parsing here would put a 12-second
     // EPUB parse in front of the port opening, and a plan whose stamp no longer
     // matches is a book that changed — which is a `/api/load`'s business, not a

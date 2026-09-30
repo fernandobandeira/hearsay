@@ -7,6 +7,7 @@
 //! generated from, so a drift in either direction shows up as a type error
 //! rather than as a reader that silently stops working.
 
+pub mod books;
 pub mod chapters;
 pub mod device;
 pub mod health;
@@ -407,6 +408,15 @@ pub fn router(state: Arc<AppState>) -> (axum::Router, utoipa::openapi::OpenApi) 
     notes::resume_unfiled(state.clone());
     let (r, mut api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(session::books))
+        .routes(routes!(books::delete_book))
+        .routes({
+            let (schemas, paths, method) = routes!(books::upload);
+            (
+                schemas,
+                paths,
+                method.layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+            )
+        })
         .routes(routes!(session::load))
         .routes(routes!(session::chapter))
         .routes(routes!(session::open_chapter))

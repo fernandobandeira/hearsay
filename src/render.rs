@@ -180,6 +180,9 @@ impl Backoff {
 /// and skipped, because the alternative — a render thread that dies on one bad
 /// sentence — takes the whole book with it.
 fn render_one(st: &AppState, key: &str, ci: usize, i: usize, chunks: &[Chunk]) -> bool {
+    if crate::api::books::deleted(&st.cfg.work, key) {
+        return false;
+    }
     let p = cache::chunk_path(&st.cfg.work, key, ci, i);
     if p.exists() {
         return true;
@@ -339,6 +342,9 @@ fn first_hole(
     plan: &[crate::book::Chapter],
     from: usize,
 ) -> Option<(usize, usize)> {
+    if crate::api::books::deleted(&st.cfg.work, key) {
+        return None;
+    }
     for (cj, ch) in plan.iter().enumerate().skip(from) {
         let n = ch.chunks.len();
         if n == 0 {
@@ -385,7 +391,7 @@ fn next_idle(
         .map_err(|e| tracing::warn!("could not read the library: {e}"))
         .ok()?;
     for b in books {
-        if b.key == cur_key {
+        if b.key == cur_key || crate::api::books::deleted(&st.cfg.work, &b.key) {
             continue;
         }
         // Raw, never through the parse cache: most of these books are not
@@ -474,7 +480,7 @@ impl Plans {
 /// does for the loaded book.
 fn next_elsewhere(st: &Arc<AppState>, cur_key: &str, plans: &mut Plans) -> Option<Target> {
     for (key, items) in crate::wishlist::all_outstanding(st) {
-        if key == cur_key {
+        if key == cur_key || crate::api::books::deleted(&st.cfg.work, &key) {
             continue; // `next_queued` owns this one.
         }
         // Reading `plan.json` is 0.30 s on the 1433-chapter book, and this runs
@@ -819,6 +825,7 @@ fn worker(st: Arc<AppState>) {
         if !parked.clear(&st) {
             continue;
         }
+        let _disk = st.book_files.read().unwrap_or_else(|e| e.into_inner());
         let choice = choose(&mut ctx, &st);
         execute(&mut ctx, &st, choice);
     }
@@ -839,6 +846,9 @@ fn choose(ctx: &mut WorkerCtx, st: &Arc<AppState>) -> Choice {
     let Some(key) = key else {
         return Choice::Wait(Duration::from_millis(300));
     };
+    if crate::api::books::deleted(&st.cfg.work, &key) {
+        return Choice::Wait(Duration::from_millis(500));
+    }
     // Renders have been failing: wait before trying again. Nothing is skipped
     // and nothing is given up on — the next pass comes straight back to the
     // chunk under the playhead — it just does not do it thousands of times a
@@ -1136,6 +1146,7 @@ fn builder(st: Arc<AppState>) {
         if !parked.clear(&st) {
             continue;
         }
+        let _disk = st.book_files.read().unwrap_or_else(|e| e.into_inner());
         let Some(job) = next_job(&st, &mut held) else {
             continue;
         };
@@ -1186,6 +1197,8 @@ fn next_job(st: &AppState, held: &mut Option<Instant>) -> Option<Job> {
         );
     }
     let mut s = st.session();
+    s.pack_queue
+        .retain(|j| !crate::api::books::deleted(&st.cfg.work, &j.key));
     let loaded = s.pack_queue.iter().find(|j| s.is_loaded(j)).cloned();
     match loaded.or_else(|| s.pack_queue.first().cloned()) {
         None => {

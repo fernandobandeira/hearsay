@@ -238,6 +238,9 @@ impl Gate {
 
 pub struct AppState {
     pub cfg: Config,
+    /// Serialize source mutations and loads; disk workers share the read lock.
+    pub book_mutation: tokio::sync::Mutex<()>,
+    pub book_files: std::sync::RwLock<()>,
     pub session: Mutex<Session>,
     pub bus: Bus,
     pub engine: Engine,
@@ -354,6 +357,8 @@ impl AppState {
         Arc::new(Self {
             store,
             cfg,
+            book_mutation: tokio::sync::Mutex::new(()),
+            book_files: std::sync::RwLock::new(()),
             session: Mutex::new(Session::new()),
             bus,
             engine,

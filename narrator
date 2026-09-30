@@ -25,7 +25,7 @@ case "$cmd" in
     exec docker run -d --name "$NAME" --restart unless-stopped \
       -p "127.0.0.1:$PORT:7870" \
       -v "$WORK:/work" \
-      -v "$BOOKS:/books:ro" \
+      -v "$BOOKS:/books" \
       -v "$MODELS:/models:ro" \
       ${VAULT:+-v "$VAULT:/vault"} \
       ${VAULT:+-e NARRATOR_VAULT=/vault} \

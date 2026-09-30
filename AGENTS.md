@@ -1642,3 +1642,29 @@ python server left. What that sentence does not cover:
 - `cargo fmt` and `cargo clippy --all-targets -- -D warnings` are clean, and stay clean.
 - A change to any response shape means regenerating in the same commit: `./narrator client`, then commit `openapi.json` and `web/src/client/` with the Rust change. CI fails otherwise, and the reader's types come from those files.
 - If the chunker's output changes, that is a **migration**, not an edit — it invalidates every cache and every stored position. Say so out loud before doing it.
+
+
+## EPUB management
+
+The Books drawer has **Add EPUBs** (multi-file upload, 64 MiB per EPUB) and
+**Delete server**, which asks for confirmation before deleting the source EPUB
+and all generated audio, packed chapters, HLS, text and render caches. Deletion
+also removes duplicate filenames from the configured book roots, including the
+synced vault library. Notes, original memo recordings and reading history stay.
+Device downloads remain a separate action.
+
+`POST /api/books/upload?name=<filename>` takes raw `application/epub+zip` bytes.
+Uploads are validated before atomic publication into `work/uploads/`, which
+`GET /api/books` includes without needing a writable vault. Existing filenames
+or cache keys are refused: overwriting text under an existing reading position
+is unsafe. `POST /api/books/delete {path, confirm}` requires `confirm` to equal
+the EPUB filename. Sources must be writable; the book mount is now read/write.
+
+A durable `work/deleted/<key>` tombstone blocks stale rendering while deletion
+waits for the workers' shared filesystem lock. Loads and source mutations are
+serialized separately so deletion cannot race a new plan. The scanner and HLS
+builder share the worker lock. Deletion removes registry, index and intent rows;
+the filesystem remains render truth. A failed cleanup is reported and can be
+retried while the source remains. A fresh upload clears the tombstone only after
+publication. The vault's git sync can propagate a deleted vault EPUB, which the
+confirmation explicitly states.

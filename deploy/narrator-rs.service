@@ -56,7 +56,7 @@ ExecStart=/usr/bin/docker run --rm --name narrator-rs \
     --user 1001:1001 \
     -p 127.0.0.1:7870:7870 \
     -v /home/ubuntu/narrator/work:/work \
-    -v /home/ubuntu/narrator/books:/books:ro \
+    -v /home/ubuntu/narrator/books:/books \
     -v /home/ubuntu/narrator/models:/models:ro \
     -v /home/ubuntu/vault:/vault \
     -v /home/ubuntu/web:/web:ro \

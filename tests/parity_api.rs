@@ -341,7 +341,7 @@ async fn the_openapi_document_covers_the_urls_the_reader_builds() {
     // something that happens by accident. Every addition must be additive: no
     // client is obliged to call it, and none of the 25 changes shape because it
     // exists.
-    let extra = ["/api/library"];
+    let extra = ["/api/library", "/api/books/upload", "/api/books/delete"];
     for p in extra {
         assert!(paths.contains_key(p), "{p} missing from the spec");
     }

@@ -27,7 +27,8 @@ import {ScrollArea} from '@/components/ui/scroll-area';
 import {Separator} from '@/components/ui/separator';
 import {Skeleton} from '@/components/ui/skeleton';
 import {Spinner} from '@/components/ui/spinner';
-import {useBooks, useLibrary} from '@/lib/api';
+import {useBooks, useLibrary, call, queryClient, keys} from '@/lib/api';
+import * as sdk from '@/client/sdk.gen';
 import {bookKey, heldBooks, storageEstimate} from '@/lib/offline';
 import {bytes as fmtBytes} from '@/lib/format';
 import {initialView, type DrawerView} from '@/lib/drawernav';
@@ -60,7 +61,33 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
   const [held, setHeld] = useState<Set<string>>(new Set());
   const [armed, setArmed] = useState<string | null>(null);
   const [dropping, setDropping] = useState<string | null>(null);
-  const found: BookFile[] = books.data?.length ? books.data : knownBooks();
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+  const refresh = async () => { await Promise.all([queryClient.invalidateQueries({queryKey: keys.books}), queryClient.invalidateQueries({queryKey: keys.library}), queryClient.invalidateQueries({queryKey: keys.status})]); };
+  const deleteServerBook = async (b: BookFile) => {
+    if (!window.confirm(`Permanently delete ${b.name} from the server? This deletes the EPUB (including its synced vault copy), all rendered audio, packed chapters, text and HLS caches, and cancels rendering. Notes and reading history are kept. Device downloads are separate. This cannot be undone.`)) return;
+    setBusy(true); setMessage('Deleting…');
+    try {
+      await call(sdk.deleteBook({body: {path: b.path, confirm: b.name}}));
+      n.closeDeletedBook(bookKey(b));
+      setMessage(`${b.name} deleted from the server`);
+    } catch (e) { setMessage(e instanceof Error ? e.message : 'Could not delete the book'); }
+    finally { await refresh(); setBusy(false); }
+  };
+  const upload = async (files: FileList | null) => {
+    if (!files?.length) return;
+    setBusy(true); setMessage('Uploading…');
+    try {
+      for (const file of Array.from(files)) {
+        if (file.size > 64 * 1024 * 1024) throw new Error(`${file.name}: maximum EPUB size is 64 MB`);
+        const data = await file.arrayBuffer();
+        await call(sdk.upload({query: {name: file.name}, body: file.name, bodySerializer: () => data}));
+      }
+      setMessage('EPUBs added to the server');
+    } catch (e) { setMessage(e instanceof Error ? e.message : 'Upload failed'); }
+    finally { await refresh(); setBusy(false); }
+  };
+  const found: BookFile[] = books.data ?? knownBooks();
   const loadingList = books.isPending && !found.length;
 
   /* What the box has made of each book, which is a different question from what
@@ -171,6 +198,13 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
             className={cn('absolute inset-0 flex flex-col transition-transform duration-200 ease-out',
                           view !== 'books' && '-translate-x-full')}
           >
+            <div className="px-4 py-2 text-xs space-y-2">
+              <label className="inline-flex cursor-pointer rounded border px-3 py-2">
+                {busy ? 'Working…' : 'Add EPUBs'}
+                <input aria-label="Upload EPUBs to the server" type="file" accept=".epub,application/epub+zip" multiple disabled={busy} className="sr-only" onChange={(e) => { void upload(e.target.files); e.target.value = ''; }} />
+              </label>
+              {message && <p role="status">{message}</p>}
+            </div>
             <ScrollArea className="min-h-0 flex-1">
               {loadingList && (
                 <div data-testid="books-skeleton" className="space-y-2 px-4 py-2">
@@ -264,6 +298,7 @@ export function Library({open, onOpenChange}: {open: boolean; onOpenChange: (b: 
                       )}
                     </button>
 
+                    <button disabled={busy || books.isError} className="shrink-0 rounded px-2 py-2 text-[11px] text-muted-foreground hover:text-destructive" aria-label={`Delete ${title} from server`} onClick={() => void deleteServerBook(b)}>Delete server</button>
                     {/* Only for a book this device actually holds something for,
                         and only ever this device's copy: the server keeps its
                         files, so everything removed here is one download away. */}

@@ -239,6 +239,14 @@ export type ChaptersResult = {
     total?: number;
 };
 
+export type DeleteBody = {
+    /**
+     * Must exactly match the EPUB filename to confirm permanent deletion.
+     */
+    confirm: string;
+    path: string;
+};
+
 export type Health = {
     book: string | null;
     build_error: string | null;
@@ -674,6 +682,49 @@ export type BooksResponses = {
 };
 
 export type BooksResponse = BooksResponses[keyof BooksResponses];
+
+export type DeleteBookData = {
+    body: DeleteBody;
+    path?: never;
+    query?: never;
+    url: '/api/books/delete';
+};
+
+export type DeleteBookErrors = {
+    400: ApiError;
+    404: ApiError;
+    500: ApiError;
+};
+
+export type DeleteBookError = DeleteBookErrors[keyof DeleteBookErrors];
+
+export type DeleteBookResponses = {
+    200: Ok2;
+};
+
+export type DeleteBookResponse = DeleteBookResponses[keyof DeleteBookResponses];
+
+export type UploadData = {
+    body: string;
+    path?: never;
+    query: {
+        name: string;
+    };
+    url: '/api/books/upload';
+};
+
+export type UploadErrors = {
+    400: ApiError;
+    409: ApiError;
+};
+
+export type UploadError = UploadErrors[keyof UploadErrors];
+
+export type UploadResponses = {
+    200: BookFile;
+};
+
+export type UploadResponse = UploadResponses[keyof UploadResponses];
 
 export type ChapterData = {
     body?: never;

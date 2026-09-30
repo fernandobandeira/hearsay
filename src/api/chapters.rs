@@ -422,6 +422,7 @@ pub async fn chapters_render(
     dev: Device,
     Json(body): Json<ChapterSetBody>,
 ) -> Response {
+    let _mutation = st.book_mutation.lock().await;
     if let Some(r) = super::session::wrong_book(&st, body.book.as_deref()) {
         // Named, and not the loaded book — but the library may still know it, in
         // which case acting on it is what was asked for. See `order_elsewhere`.
@@ -553,6 +554,7 @@ pub async fn chapters_build(
     dev: Device,
     Json(body): Json<ChapterSetBody>,
 ) -> Response {
+    let _mutation = st.book_mutation.lock().await;
     if let Some(r) = super::session::wrong_book(&st, body.book.as_deref()) {
         // A build on a book that is not loaded is the same standing order a
         // render with `pack: true` places — the packer cannot encode a chapter
@@ -725,6 +727,7 @@ pub async fn chapters_cancel(
     State(st): State<Arc<AppState>>,
     Json(body): Json<ChapterSetBody>,
 ) -> Response {
+    let _mutation = st.book_mutation.lock().await;
     if let Some(r) = super::session::wrong_book(&st, body.book.as_deref()) {
         // Cancelling has to reach as far as ordering does, or a download placed
         // on a book you are not reading could be started and never stopped —

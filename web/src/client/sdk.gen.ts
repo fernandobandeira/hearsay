@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, ServerSentEventsResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { BookIndex2Data, BookIndex2Errors, BookIndex2Responses, BookIndexData, BookIndexErrors, BookIndexResponses, BooksData, BooksResponses, BookText2Data, BookText2Errors, BookText2Responses, BookTextData, BookTextErrors, BookTextResponses, ChapterAudio2Data, ChapterAudio2Errors, ChapterAudio2Responses, ChapterAudioData, ChapterAudioErrors, ChapterAudioResponses, ChapterData, ChapterErrors, ChapterHls2Data, ChapterHls2Errors, ChapterHls2Responses, ChapterHlsData, ChapterHlsErrors, ChapterHlsResponses, ChapterManifest2Data, ChapterManifest2Errors, ChapterManifest2Responses, ChapterManifestData, ChapterManifestErrors, ChapterManifestResponses, ChapterResponses, ChaptersBuildData, ChaptersBuildErrors, ChaptersBuildResponses, ChaptersCancelData, ChaptersCancelErrors, ChaptersCancelResponses, ChaptersListData, ChaptersListErrors, ChaptersListResponses, ChaptersRenderData, ChaptersRenderErrors, ChaptersRenderResponses, ChunkWav2Data, ChunkWav2Errors, ChunkWav2Responses, ChunkWavData, ChunkWavErrors, ChunkWavResponses, EventsData, EventsResponse, EventsResponses, HealthzData, HealthzErrors, HealthzResponses, HlsSegment2Data, HlsSegment2Errors, HlsSegment2Responses, HlsSegmentData, HlsSegmentErrors, HlsSegmentResponses, LibraryData, LibraryResponses, LoadData, LoadErrors, LoadResponses, NoteData, NoteErrors, NoteResponses, OpenChapterData, OpenChapterErrors, OpenChapterResponses, PauseData, PauseResponses, PlayheadData, PlayheadErrors, PlayheadResponses, PositionData, PositionErrors, PositionResponses, PrerenderData, PrerenderErrors, PrerenderResponses, RendererData, RendererResponses, ResumeData, ResumeResponses, StatusData, StatusResponses } from './types.gen';
+import type { BookIndex2Data, BookIndex2Errors, BookIndex2Responses, BookIndexData, BookIndexErrors, BookIndexResponses, BooksData, BooksResponses, BookText2Data, BookText2Errors, BookText2Responses, BookTextData, BookTextErrors, BookTextResponses, ChapterAudio2Data, ChapterAudio2Errors, ChapterAudio2Responses, ChapterAudioData, ChapterAudioErrors, ChapterAudioResponses, ChapterData, ChapterErrors, ChapterHls2Data, ChapterHls2Errors, ChapterHls2Responses, ChapterHlsData, ChapterHlsErrors, ChapterHlsResponses, ChapterManifest2Data, ChapterManifest2Errors, ChapterManifest2Responses, ChapterManifestData, ChapterManifestErrors, ChapterManifestResponses, ChapterResponses, ChaptersBuildData, ChaptersBuildErrors, ChaptersBuildResponses, ChaptersCancelData, ChaptersCancelErrors, ChaptersCancelResponses, ChaptersListData, ChaptersListErrors, ChaptersListResponses, ChaptersRenderData, ChaptersRenderErrors, ChaptersRenderResponses, ChunkWav2Data, ChunkWav2Errors, ChunkWav2Responses, ChunkWavData, ChunkWavErrors, ChunkWavResponses, DeleteBookData, DeleteBookErrors, DeleteBookResponses, EventsData, EventsResponse, EventsResponses, HealthzData, HealthzErrors, HealthzResponses, HlsSegment2Data, HlsSegment2Errors, HlsSegment2Responses, HlsSegmentData, HlsSegmentErrors, HlsSegmentResponses, LibraryData, LibraryResponses, LoadData, LoadErrors, LoadResponses, NoteData, NoteErrors, NoteResponses, OpenChapterData, OpenChapterErrors, OpenChapterResponses, PauseData, PauseResponses, PlayheadData, PlayheadErrors, PlayheadResponses, PositionData, PositionErrors, PositionResponses, PrerenderData, PrerenderErrors, PrerenderResponses, RendererData, RendererResponses, ResumeData, ResumeResponses, StatusData, StatusResponses, UploadData, UploadErrors, UploadResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -34,6 +34,24 @@ export const bookIndex2 = <ThrowOnError extends boolean = false>(options?: Optio
  * `./books` merged with the vault's library, deduped by filename.
  */
 export const books = <ThrowOnError extends boolean = false>(options?: Options<BooksData, ThrowOnError>): RequestResult<BooksResponses, unknown, ThrowOnError> => (options?.client ?? client).get<BooksResponses, unknown, ThrowOnError>({ url: '/api/books', ...options });
+
+export const deleteBook = <ThrowOnError extends boolean = false>(options: Options<DeleteBookData, ThrowOnError>): RequestResult<DeleteBookResponses, DeleteBookErrors, ThrowOnError> => (options.client ?? client).post<DeleteBookResponses, DeleteBookErrors, ThrowOnError>({
+    url: '/api/books/delete',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const upload = <ThrowOnError extends boolean = false>(options: Options<UploadData, ThrowOnError>): RequestResult<UploadResponses, UploadErrors, ThrowOnError> => (options.client ?? client).post<UploadResponses, UploadErrors, ThrowOnError>({
+    url: '/api/books/upload',
+    ...options,
+    headers: {
+        'Content-Type': 'application/epub+zip',
+        ...options.headers
+    }
+});
 
 /**
  * One chapter's words.
