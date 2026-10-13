@@ -1,0 +1,21 @@
+# /etc/systemd/system/hearsay-server-update.service — template, applied by hand.
+#
+#   sudo install -m 0755 hearsay-server-update.sh /usr/local/bin/
+#   sudo cp hearsay-server-update.service hearsay-server-update.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hearsay-server-update.timer
+#
+# Deploy now without waiting for the timer:
+#   sudo systemctl start hearsay-server-update
+[Unit]
+Description=restart narrator-rs onto the newest HearSay server image
+After=docker.service network-online.target narrator-rs.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hearsay-server-update.sh
+# The pull is ~600 MB on a new image; the restart waits on narrator-rs's own
+# 40 s stop timeout. This is the backstop for a hung registry.
+TimeoutStartSec=900

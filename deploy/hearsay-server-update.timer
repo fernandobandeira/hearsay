@@ -1,0 +1,17 @@
+# /etc/systemd/system/hearsay-server-update.timer — template, applied by hand.
+#   sudo systemctl enable --now hearsay-server-update.timer
+#
+# Ten minutes after a green `release` run is the worst case. The server image
+# takes the better part of an hour to build, so the interval is not the slow
+# part of a deploy.
+[Unit]
+Description=check for a new HearSay server image every ten minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=30s
+RandomizedDelaySec=60s
+
+[Install]
+WantedBy=timers.target

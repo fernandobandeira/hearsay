@@ -1529,6 +1529,34 @@ The work dir and the vault are **adopted in place**: same cache paths, same
 re-rendered and no position moves — that is what the parity suites above are
 for.
 
+### Deploying the server
+
+The same shape, one image over. `narrator-rs.service` has always pulled
+`:latest` in `ExecStartPre`, so a deploy is a restart; what was missing was
+anything that restarts it. `deploy/hearsay-server-update.{sh,service,timer}`
+is that thing:
+
+    unit not active? exit · pull hearsay:latest (offline? exit 0)
+    → image id == the running container's image? exit
+    → otherwise systemctl restart narrator-rs · prune old images
+
+Every ten minutes, five after boot. **So a server deploy is `git push` too** —
+release.yml builds and pushes on green, and within ten minutes of that the box
+is on it.
+
+It is **pull, not push, deliberately.** CI reaching in would mean a Tailscale
+auth key and an SSH key in this public repo's secrets, and an ACL tag exempt
+from Tailscale SSH's browser check — a standing way into the machine the vault
+lives on, to save ten minutes. The image is public; the box asks; nothing gets
+in. A restart mid-memo is safe (`notes::resume_unfiled` finishes it), and a
+restart mid-render costs one chunk.
+
+```bash
+sudo install -m 0755 hearsay-server-update.sh /usr/local/bin/
+sudo cp hearsay-server-update.service hearsay-server-update.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now hearsay-server-update.timer
+```
+
 ### Deploying the reader
 
 The unit mounts `-v /home/ubuntu/web:/web:ro` over the reader baked into the
@@ -1637,7 +1665,7 @@ python server left. What that sentence does not cover:
 - **Never edit `~/git/narrator`.** It is the reference and it is someone else's working tree — including its `web/`, which is now a historical copy of this repo's reader. The reader is edited **here**.
 - **`web/src/client/` is generated.** Never hand-edit a `.gen.ts`; change the Rust and regenerate.
 - **This repo is public.** Anything committed is on the internet: no tailnet addresses, no hostnames, no tokens, no vault contents. The reader talks to the API by relative path and has nothing to leak; keep it that way.
-- **Never touch production.** The VPS is deployed by hand.
+- **Never touch production.** A push to `master` deploys both images by itself (the two update timers on the box); the box's units and timers are installed by hand.
 - No `unwrap()` or `expect()` outside tests and the startup path. Errors are typed (`thiserror`), the edges use `anyhow`, and every failure path logs and degrades.
 - `cargo fmt` and `cargo clippy --all-targets -- -D warnings` are clean, and stay clean.
 - A change to any response shape means regenerating in the same commit: `./narrator client`, then commit `openapi.json` and `web/src/client/` with the Rust change. CI fails otherwise, and the reader's types come from those files.
