@@ -20,6 +20,8 @@ import {FollowOffer, PlayerBar, TopBar, useAutoHide} from '@/components/Chrome';
 import {Library} from '@/components/Library';
 import {ChapterSkeleton, ReadingPage} from '@/components/ReadingPage';
 import {isRotation, readInsets, shouldHeal, trackBaseline, viewportShortfall} from '@/lib/viewport';
+import {fetchBooks, keys, queryClient} from '@/lib/api';
+import {parseMessage, parseOpen, trustedOrigin, withoutOpen, type Here, type OpenRequest} from '@/lib/embed';
 import {useNarrator} from '@/state';
 
 export default function App() {
@@ -29,6 +31,7 @@ export default function App() {
   useViewportHeal();
   useViewportFill();
   useBarInsets();
+  useEmbed(() => setDrawer(false));
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -102,6 +105,55 @@ export default function App() {
       <Library open={drawer} onOpenChange={setDrawer} />
     </>
   );
+}
+
+/**
+ * Obsidian's half of the conversation - see lib/embed.ts. The open request on
+ * the URL is acted on once and taken off it; after that the parent window can
+ * ask to open a book or where the reader is, and is told it may by `ready`.
+ */
+function useEmbed(closeDrawer: () => void) {
+  const n = useNarrator();
+  const latest = useRef({n, closeDrawer});
+  latest.current = {n, closeDrawer};
+
+  useEffect(() => {
+    const open = async (r: OpenRequest) => {
+      const books = await queryClient.fetchQuery({queryKey: keys.books, queryFn: fetchBooks})
+        .catch(() => undefined);
+      const b = books?.find((x) => x.name === r.book);
+      if (!b) return;
+      latest.current.closeDrawer();
+      await latest.current.n.openBook(b);
+      if (r.chapter !== null) await latest.current.n.openChapter(r.chapter, r.chunk);
+    };
+
+    const first = parseOpen(window.location.search);
+    if (first) {
+      history.replaceState(history.state, '', withoutOpen(window.location.href));
+      void open(first);
+    }
+
+    const framed = window.parent !== window;
+    const onMessage = (e: MessageEvent) => {
+      if (!framed || e.source !== window.parent) return;
+      if (!trustedOrigin(e.origin, window.location.origin)) return;
+      const m = parseMessage(e.data);
+      if (!m) return;
+      if (m.type === 'hearsay:open') { void open(m); return; }
+      const {n: now} = latest.current;
+      const here: Here = {
+        type: 'hearsay:here', id: m.id,
+        book: now.book?.name ?? null, title: now.book?.title ?? null,
+        chapter: now.ci, chapterTitle: now.chapterTitle, chunk: now.idx,
+      };
+      window.parent.postMessage(here, e.origin);
+    };
+    window.addEventListener('message', onMessage);
+    // Told to every origin: it says only that a reader is listening.
+    if (framed) window.parent.postMessage({type: 'hearsay:ready'}, '*');
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
 }
 
 /**

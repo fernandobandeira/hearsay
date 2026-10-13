@@ -165,10 +165,12 @@ export const keys = {
   manifest: (k: string | null, ci: number) => ['manifest', k, ci] as const,
 };
 
+export const fetchBooks = () => call(sdk.books());
+
 export function useBooks() {
   return useQuery({
     queryKey: keys.books,
-    queryFn: () => call(sdk.books()),
+    queryFn: fetchBooks,
     staleTime: 60_000,
   });
 }

@@ -40,6 +40,7 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `listen-test/` | GATE 0: the ONNX engine rendered against the PyTorch render Fernando accepted. |
 | `web/src/client/` | **Generated**, committed, and the reader's only description of the API. Never hand-edited; see [the gate](#openapi-is-the-contract). |
 | `web/src/lib/library.ts` | The readiness ladder behind each book row — what is rendered, what is packed, what it would cost to take. See [the reader's half](#the-readers-half-readiness-on-the-book-row). |
+| `obsidian-plugin/` | The vault's Narrator plugin: an iframe onto this reader plus what only Obsidian can do. See [the reader in Obsidian](#the-reader-in-obsidian). |
 | `web/src/lib/device.ts` | This device's id, minted once into `localStorage`. See [naming the devices](#naming-the-devices). |
 | `web/` | **The reader itself** — the Vite/React/Tailwind PWA, source and all. It moved in from the python repo; the build is no longer vendored (`web/.gitignore` ignores `dist/`), because two images are built from this tree now. See [the two images](#two-images-server-and-reader). `web/placeholder/` is the fallback page when there is no build at all. |
 | `deploy/` | systemd templates for the Oracle A1 — **applied by hand, never by a playbook**, like the python repo's. |
@@ -615,6 +616,32 @@ invalidated by the live stream on `hello`, on `books`, and on a `render` event
 with `kind: "packed"` — but deliberately not on `progress`, which is throttled to
 one a second and would refetch the whole library at that rate for a number the
 list does not show.
+
+## The reader in Obsidian
+
+`obsidian-plugin/` is the vault's Narrator plugin, and it is no longer a reader.
+It used to be a hand port of the python UI, so every change to `web/` either got
+ported a second time or Obsidian fell behind. Now its pane is an iframe onto the
+box's reader, so a reader deploy reaches Obsidian with nothing to release, and
+the plugin keeps only what needs Obsidian: `.epub` files in the vault open in the
+pane, `obsidian://narrator-open?book=&chapter=&chunk=` links (every voice note
+carries one) land on their passage, and *Insert reading position link* asks the
+reader where it is.
+
+The protocol is `web/src/lib/embed.ts`: `?open=<epub name>&chapter=&chunk=` on
+the frame's src for the first open, taken back off the URL once acted on, then
+`postMessage` after the reader announces `hearsay:ready` — `hearsay:open`, and
+`hearsay:where` answered with `hearsay:here`. Messages are accepted only from
+the parent window and only from this origin or Obsidian's (`app://obsidian.md`,
+`capacitor://localhost`, `http://localhost`); anything else framing the reader
+is not told where anyone is reading.
+
+**Installing it is a copy, never a symlink**: `main.js`, `manifest.json` and
+`styles.css` into the vault's `.obsidian/plugins/narrator/`. The vault used to
+hold a symlink to a checkout, and every other machine that cloned it got a
+dangling link and a plugin that would not load. The server URL lives in the
+vault's `data.json` (Settings → Narrator), never in this repo, which is public.
+The plugin itself almost never changes now; the reader it frames does.
 
 ## OpenAPI is the contract
 

@@ -1,0 +1,3 @@
+.narrator-view { padding: 0 !important; overflow: hidden; }
+.narrator-view iframe { width: 100%; height: 100%; border: 0; display: block; }
+.narrator-view .narrator-empty { padding: 2em; color: var(--text-muted); }

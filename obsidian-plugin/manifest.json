@@ -1,0 +1,9 @@
+{
+  "id": "narrator",
+  "name": "Narrator",
+  "version": "0.2.0",
+  "minAppVersion": "1.4.0",
+  "description": "The HearSay reader in a pane: EPUBs in the vault open in it, and voice notes link back to the passage they were about.",
+  "author": "Fernando Bandeira",
+  "isDesktopOnly": false
+}
