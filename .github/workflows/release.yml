@@ -1,6 +1,6 @@
 # Build the multi-arch image on every push to master and publish it to GHCR.
 # Both architectures build natively (GitHub's free arm64 runners for public
-# repos) - no QEMU, so the Rust + whisper.cpp compile stays fast. The box then
+# repos) - no QEMU, so the Rust compile stays fast. The box then
 # deploys with a plain `docker pull ghcr.io/fernandobandeira/hearsay:latest`.
 name: release
 
@@ -8,7 +8,8 @@ on:
   push:
     branches: [master]
     # The reader has its own image and its own workflow (web.yml). A UI-only
-    # push has no business spending an hour recompiling whisper.cpp twice - and
+    # push has no business spending the better part of an hour on a Rust build
+    # for two architectures - and
     # the box would not pick the result up anyway: it reads the reader from the
     # hearsay-web image, not from this one. The server image still *builds*
     # web/ (its Dockerfile's node stage), so the fallback baked into it is

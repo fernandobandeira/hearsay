@@ -1,8 +1,8 @@
 # hearsay-web — the reader's build, and nothing else.
 #
 # A data image: no base, no shell, no package manager. It exists so a UI change
-# can reach the box without rebuilding the Rust server (which compiles
-# whisper.cpp and takes a good part of an hour across two architectures). The box
+# can reach the box without rebuilding the Rust server (which takes a good
+# part of an hour across two architectures). The box
 # pulls this, `docker create`s it, `docker cp`s /dist out and lays the files into
 # /home/ubuntu/web, which narrator-rs.service mounts over the reader baked into
 # the server image. See deploy/hearsay-web-update.service.

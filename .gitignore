@@ -1,6 +1,7 @@
 /target
 /models/kokoro/*.onnx
 /models/whisper/*.bin
+/models/phonon-2/
 /work
 node_modules
 /scripts/golden/.venv

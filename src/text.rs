@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn a_voice_memo_can_name_a_book_the_session_does_not_hold() {
         // Everything the fleeting note needs — the book's own title for the
-        // frontmatter and the whisper prompt, its file name for the deep link,
+        // frontmatter, its file name for the deep link,
         // the chapter's title, and the words to quote — out of the bundle, with
         // no session and no plan in memory.
         let d = tempfile::tempdir().expect("tempdir");

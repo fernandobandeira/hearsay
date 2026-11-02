@@ -20,7 +20,7 @@ use crate::book::Chapter;
 use crate::cache;
 use crate::config::Config;
 use crate::events::Bus;
-use crate::stt::Whisper;
+use crate::stt::Transcriber;
 use crate::tts::Engine;
 use crate::vault::Positions;
 
@@ -244,7 +244,7 @@ pub struct AppState {
     pub session: Mutex<Session>,
     pub bus: Bus,
     pub engine: Engine,
-    pub whisper: Whisper,
+    pub stt: Transcriber,
 
     /// `RUN` — set means the worker should render.
     pub run: Gate,
@@ -342,7 +342,7 @@ impl AppState {
     pub fn new(cfg: Config) -> Arc<Self> {
         let bus = Bus::new(cfg.sse_queue, cfg.sse_render_min_s);
         let engine = Engine::new(&cfg);
-        let whisper = Whisper::new(&cfg);
+        let stt = Transcriber::new(&cfg);
         let positions = crate::vault::load_positions(&cfg.positions_dir);
         // Logged once, loudly, and then never mentioned again: a server running
         // without its store is a degraded one and the operator should be able to
@@ -362,7 +362,7 @@ impl AppState {
             session: Mutex::new(Session::new()),
             bus,
             engine,
-            whisper,
+            stt,
             run: Gate::default(),
             build_ev: Gate::default(),
             stop: AtomicBool::new(false),

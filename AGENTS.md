@@ -2,7 +2,7 @@
 
 This file is `AGENTS.md`; `CLAUDE.md` is a symlink to it (Fernando's convention — edit this file, never break the symlink).
 
-The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP contract, same `work/` cache, same writes into the Obsidian vault — so the two are interchangeable in front of the same machine state. Kokoro-82M on CPU through ONNX Runtime, whisper.cpp for voice memos, axum + tokio, one binary.
+The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP contract, same `work/` cache, same writes into the Obsidian vault — so the two are interchangeable in front of the same machine state. Kokoro-82M on CPU through ONNX Runtime, Phonon-2 (a five-value Parakeet-TDT) for voice memos, axum + tokio, one binary.
 
 **Why it exists.** Fernando's motivation is stability, not speed: the reader must never crash and must heal itself. So the type system is doing real work here — every failure path is a typed error with a caller that logs it and degrades, there is no `unwrap()`/`expect()` outside tests and startup, and the render worker derives its bookkeeping from the filesystem rather than from a counter it keeps in its head (see [the disk-truth invariant](#the-disk-truth-invariant), which is a bug the Python version still has).
 
@@ -17,7 +17,8 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 | `src/tts/kokoro.rs` | Kokoro-82M v1.0 fp32 ONNX through `ort`. The 178-symbol vocabulary is inlined as model contract; the voice pack is 510 style vectors indexed by phoneme count. |
 | `src/tts/numbers.rs` | The text normalizer: currency and years into English words before espeak-ng sees them, ported from misaki's `Lexicon.get_number`. See [numbers](#numbers-srcttsnumbersrs). |
 | `src/tts/mod.rs` | `Engine`: lazy load, never fatal, plus the deterministic fake (`NARRATOR_FAKE_TTS=1`) the whole test suite renders with. |
-| `src/stt.rs` | whisper.cpp via `whisper-rs`: `large-v3-turbo-q5_0`, CPU, one transcription at a time, ffmpeg decoding the webm, silero VAD when its model is present. |
+| `src/stt.rs` | Voice memo → text: Phonon-2 through the vendored C engine, CPU, one transcription at a time, ffmpeg decoding the webm, and the STT priority gate. See [voice memos](#voice-memos-phonon-2). |
+| `vendor/phonon-2-c/`, `native/`, `build.rs` | The [phonon-2-c](https://github.com/eschmidbauer/phonon-2-c) engine's library sources, vendored unchanged at a pinned commit (MIT); the shim that is the only thing calling it; and the build script that compiles both with a **named** instruction set, never `-march=native`. |
 | `src/cache.rs` | `work/audio/<key>/chNNN/IIIII.wav` and `gc_audio`. |
 | `src/chapters.rs` | Chapter packing (AAC m4a + chunk→second manifest), lazy HLS, the chapter gc. |
 | `src/plancache.rs` | The parse cache: `plan.json` plus a `parse.json` stamp, so `/api/load` does not re-parse a book that has not changed. |
@@ -48,17 +49,18 @@ The **Rust rewrite of narrator** (`~/git/narrator`, Python/FastAPI). Same HTTP c
 ## Running it
 
 ```bash
-./narrator models        # fetch Kokoro + whisper weights into ./models (~900 MB)
+./narrator models        # fetch Kokoro + Phonon-2 weights into ./models (~600 MB)
 ./narrator web           # npm ci && npm run build in web/ (dev serves web/dist)
 ./narrator dev           # cargo run, serving ./web and ./work
 ./narrator build && ./narrator up     # docker, port 7870 on localhost only
-./narrator test          # the whole suite: 208 tests, no model, no network
+./narrator test          # the whole suite: 341 tests, no network (one runs Phonon-2 if its weights are fetched)
 ./narrator lint          # rustfmt --check + clippy -D warnings
 ./narrator client        # regenerate openapi.json + web/src/client
 ./narrator migrate       # re-chunk cached books, drop only what that invalidated
 ./narrator retrim        # take Kokoro's padding out of wavs already on disk
 ./narrator export --book books/Title.epub [--partial]   # the cache → a .m4b
 ./narrator listen-test   # re-render the GATE 0 passage and report RTF
+./narrator transcribe memo.webm   # the voice-memo transcriber on files; files nothing
 ```
 
 `cargo test` needs neither weights nor network: `NARRATOR_FAKE_TTS` swaps in a deterministic tone as long as the real thing would be, which is how a chapter renders and packs in milliseconds.
@@ -1307,7 +1309,80 @@ undo the measured delta.
 to chunks already rendered at another gain would make a book that changes
 loudness at the frontier.
 
-**Whisper.** `large-v3-turbo-q5_0` ggml, CPU, serialized behind one mutex like the Python's lock. Language auto-detect, `WHISPER_PROMPT` + book title + chapter title as the initial prompt, silero VAD when `models/whisper/ggml-silero-v5.1.2.bin` is present. `WHISPER_MODEL` takes either a bare name (resolved to `<models>/whisper/ggml-<name>.bin`) or a path. `WHISPER_THREADS` sets the thread count; it defaults to every core, which is what it was before it was configurable — see [the measurement](#whisper-on-the-a1).
+### Voice memos: Phonon-2
+
+**Whisper is gone.** `large-v3-turbo-q5_0` was word-perfect and unusable: 30–50×
+*slower* than realtime on the A1 ([measured](#voice-memos-on-the-a1)), so a
+one-minute memo was half an hour of CPU. The transcriber is now
+[Phonon-2](https://huggingface.co/FermionResearch/Phonon-2), Fermion Research's
+re-training of NVIDIA's Parakeet-TDT 0.6B v3 in which every encoder linear
+weight is one of five values per row — `{0, ±lo, ±hi}` — and everything else a
+6-bit table. It is **more** accurate than what it replaced on English, not less:
+
+| Open ASR Leaderboard, 7 English sets | avg WER | AMI (meetings) | VoxPopuli | weights |
+|---|---|---|---|---|
+| Phonon-2 | **5.21 %** | 9.37 | 2.46 | 164 MB packed, 255 MB as loaded |
+| Parakeet-TDT 0.6B v3, its base | 4.96 % | 9.42 | 3.19 | 2.5 GB |
+| whisper `large-v3-turbo`, what it replaced | 6.58 % | 13.88 | 7.02 | 574 MB as q5_0 |
+
+Those are the model card's numbers; independent write-ups find whisper still
+ahead on noisy audio and on two of the seven sets. It is what Fernando chose,
+knowing that.
+
+**Three things whisper did that this does not**, all accepted on purpose:
+
+- **English only.** Every memo is English, so `language` is always `"en"` — in
+  the note's frontmatter, the `note` event and the `/api/note` response. The
+  field stays, so nothing downstream changes shape.
+- **No prompt.** A transducer has no initial prompt, so the book and chapter
+  titles no longer bias how names are spelt. The memo record on disk still
+  carries a `prompt` string, because a rollback to the whisper build has to be
+  able to read a memo this one queued.
+- **No VAD model.** Whisper's decoder invents sentences over silence, which is
+  what the silero VAD was there to paper over. A transducer emits nothing for
+  nothing, and the engine cuts audio longer than 35 s into pause-aligned
+  25–35 s windows itself (the model's regime), with a re-decode of any window it
+  went quiet in.
+
+**The engine is C, vendored.** [phonon-2-c](https://github.com/eschmidbauer/phonon-2-c)
+(MIT) is a few thousand lines with no dependencies beyond libc, libm and
+pthreads: the FastConformer, the LSTM, the TDT greedy decode, the log-mel front
+end and a resampler, verified **token for token** against transformers'
+`ParakeetForTDT` in its exact mode. Its fast path runs the five-value weights as
+int8 codes through NEON `SDOT`. `vendor/phonon-2-c/` is its `csrc/` minus the
+CLI, copied unchanged at a pinned commit; updating it is copying a newer one and
+changing the hash in that directory's README.
+
+Three details that are load-bearing:
+
+- **The instruction set is named.** Upstream builds with `-march=native`, and
+  this image is built on GitHub's arm64 runners — newer cores than the A1's
+  Neoverse N1. `build.rs` compiles for `armv8.2-a+dotprod` (the `SDOT` kernels
+  only exist under `__ARM_FEATURE_DOTPROD`; without it the engine silently drops
+  to fp32 at a quarter of the speed) and `x86-64-v3` on amd64 — the same
+  baseline the image already required for whisper.cpp. `PHONON_MARCH`
+  overrides it.
+- **The thread pool is ours.** The engine sizes a process-wide pool from
+  `P2_THREADS` on first use, and setting an environment variable inside a
+  multi-threaded Rust process is a data race. `native/phonon_shim.c` installs a
+  pool the server created (`STT_THREADS`, default every core) around each call
+  instead, and clears it afterwards so a later call on the same blocking-pool
+  thread never sees a destroyed one.
+- **The shim owns the structs.** Rust sees three functions and two opaque
+  pointers. `P2Result` is a dozen fields, and mirroring it by hand in Rust is a
+  layout that drifts silently the day the vendored copy is updated.
+
+The weights are not the model card's file: the engine reads its own layout
+(`weights.bin` + `weights.json` + `tokens.txt`), converted from Fermion's
+container by upstream's `convert_weights.py` and published as an archive whose
+sha256 `scripts/fetch-models.sh` pins. `STT_MODEL` points elsewhere. Missing
+weights are a warning at startup and a 500 per memo — which the reader's outbox
+retries, so nothing is lost while they are fetched.
+
+`src/stt.rs`'s opt-in test runs the real model on a LibriSpeech clip
+(`tests/fixtures/stt/`) whenever `models/phonon-2` is present, and asserts the
+words. `narrator transcribe <file>` does the same on any file, and is how the
+box is measured.
 
 ## Performance
 
@@ -1381,65 +1456,60 @@ that already exists (`?from=&to=`, requirement 6) covers the case that actually
 wanted paging — a reader that only shows a screenful — at 6 kB and 2 ms. So: no
 cursor, deliberately, until a number says otherwise.
 
-### Whisper on the A1
+### Voice memos on the A1
 
-**Measured at last, and it is the bad news of this round.** A 10.0 s memo
-(synthetic speech, webm/opus, exactly the payload the reader posts), against a
-throwaway container on the box with a temp work dir and no vault mounted:
+**Phonon-2, measured on the box** on 2026-11-02, before it was deployed: the
+new binary in a throwaway container beside the running server, which was
+rendering on the other core the whole time. That is a harsher condition than a
+real memo gets, because the [STT gate](#the-stt-priority-gate) parks the
+renderer for those. Synthetic speech (macOS `say`), webm/opus at 32 kbit/s,
+exactly the payload the reader posts:
+
+| Phonon-2, 2 threads, renderer busy | audio | wall | × realtime |
+|---|---|---|---|
+| short memo, first call (engine load included: 0.05 s) | 6.7 s | 1.82 s | **4.1× faster** |
+| short memo, resident | 6.7 s | 1.80 s | 4.2× faster |
+| long memo, resident | 40.6 s | 9.56 s | 4.4× faster |
+| long memo, again | 40.6 s | 9.68 s | 4.3× faster |
+
+Both transcripts were word-perfect, punctuation and casing included. A
+one-minute memo is now about fourteen seconds where it was half an hour, about
+**170 times faster** than whisper on the same box, and the renderer stands down
+for seconds rather than minutes. The model loads in 0.05 s because the weights
+are memory-mapped, so there is no cold-start cost worth keeping it warm for.
+
+**And what it replaced.** A 10.0 s memo (synthetic speech, webm/opus, exactly
+the payload the reader posts) through whisper `large-v3-turbo-q5_0`, in a
+throwaway container on the box while the renderer was busy:
 
 | `large-v3-turbo-q5_0` | wall | × realtime |
 |---|---|---|
-| 2 threads (the default: every core), first call — pays the 574 MB model load | 311 s | 31× |
-| 2 threads, second call, model resident | 473 s | 47× |
-| 1 thread (`WHISPER_THREADS=1`), model resident | 534 s | 53× |
+| 2 threads (the default: every core), first call — pays the 574 MB model load | 311 s | 31× slower |
+| 2 threads, second call, model resident | 473 s | 47× slower |
+| 1 thread (`WHISPER_THREADS=1`), model resident | 534 s | 53× slower |
 
-The transcript was word-perfect — `large-v3-turbo` is a good model and the prompt
-biasing works — and that is the only good part. **Thirty to fifty times realtime
-means a one-minute memo is half an hour of CPU.** Two threads beat one, so the
-default (every core) stays; but the second call being *slower* than the first,
-with the model already resident, says what the real constraint is. The renderer
-had the other core. Whisper took about one core's worth (≈ 95–99 % of one CPU)
-either way, because on a 2-core box the other core is always busy synthesizing,
-and every one of these numbers was taken with it busy — which is the honest
-condition to measure in, since that is when a memo actually gets recorded. The
-thread count is not the lever.
-
-The lever is the model, and the options are:
-
-1. **A smaller ggml model.** `small` is ~6× less compute than `large-v3-turbo`
-   and `base` ~20×; either would bring a 10 s memo under a minute. The cost is
-   accuracy on proper nouns — which `WHISPER_PROMPT` plus the book and chapter
-   titles already exist to patch. This is the obvious first move: change
-   `WHISPER_MODEL` in `/etc/narrator-rs.env`, fetch the ggml file into
-   `models/whisper/`, restart. **Not done here** — it is a quality trade only
-   Fernando can judge, and it wants his ear on a real memo.
-2. **Transcribe somewhere else.** The memo is already a queued blob in the
-   reader's outbox; nothing says the transcriber has to be the reader's server.
-   A bigger machine (his desktop) with the same endpoint would do, at the cost
-   of a second deployment target.
-3. **Accept the latency.** Nothing breaks today: the outbox holds the recording
-   until a 2xx comes back, the note is written minutes later, and Fernando is
-   not waiting on the screen for it. The failure mode is not data loss, it is a
-   note that appears in the vault five minutes after the thought.
-
-What is *not* an option is leaving this undocumented, which is why it is here:
-the voice-memo path works, and it works at a tenth of the speed anyone would
-guess from the desktop numbers.
+The transcript was word-perfect, and that was the only good part: thirty to
+fifty times realtime meant a one-minute memo was half an hour of CPU. The
+thread count was not the lever, the model was. The options written down then
+were a smaller whisper, transcribing elsewhere, or accepting the latency; the
+answer turned out to be a different family of model, which is both faster and
+more accurate on English.
 
 ### The STT priority gate
 
-**Whisper outranks the renderer and the packer, and they stand down for it.**
-The measurement above is the argument: two ARM cores, Kokoro already at 0.26×
+**Transcription outranks the renderer and the packer, and they stand down for
+it.** It was written for whisper: two ARM cores, Kokoro already at 0.26×
 realtime, whisper at 30–50×, and with twenty chapters queued a ~45 s memo took
 **over seven minutes** while the render RTF fell to 0.26. Neither job got a
-machine.
+machine. Phonon-2 makes the park seconds rather than minutes, and the rule
+stands unchanged, because the argument for it was never the speed.
 
 The tie-break is not speed, it is what is recoverable. A memo exists in exactly
 one place — IndexedDB on the phone that recorded it — until `/api/note` answers
 2xx. A rendered chunk is a file the server can make again from a book it still
 has. So:
 
-* `Whisper::transcribe` takes an RAII claim on `SttGate` (`src/stt.rs`) at its
+* `Transcriber::transcribe` takes an RAII claim on `SttGate` (`src/stt.rs`) at its
   very first line, and holds it across the ffmpeg decode, the **wait** for the
   model mutex, and the transcription. Covering the wait is the point: two memos
   arriving together park the renderer once, for both, instead of letting it wake
@@ -1452,8 +1522,9 @@ has. So:
   chapter has to be packed again from nothing, which costs the box more than the
   transcription gains — and the packer is one chapter at a time, so the wait is
   bounded by one encode either way.
-* `/healthz` does not call a parked renderer a stall. A one-minute memo is half
-  an hour of not rendering on the A1, comfortably past `HEALTH_STALL_S`, and the
+* `/healthz` does not call a parked renderer a stall. A one-minute memo was half
+  an hour of not rendering on the A1 under whisper, comfortably past
+  `HEALTH_STALL_S`, and the
   watchdog restarting the container over it would kill the transcription every
   time it was retried. A stall that is explained is not a stall.
 * Both threads log the park and the resume with its duration. A renderer that has
@@ -1467,16 +1538,16 @@ while the blocking job runs on. The claim belongs to the closure, not the future
 so it goes when the work does. `tests/parity_render.rs` asserts exactly that,
 along with the renderer parking and resuming and the packer holding back.
 
-`WHISPER_THREADS` still defaults to every core, and on the A1 that finally means
-something: with the renderer parked, both cores are actually free for the
-transcription rather than one of them being Kokoro's.
+`STT_THREADS` (still read from `WHISPER_THREADS` when unset) defaults to every
+core, and on the A1 that means something: with the renderer parked, both cores
+are actually free for the transcription rather than one of them being Kokoro's.
 
 ## Config surface
 
-Every name the Python `AGENTS.md` documents, with the same default: `NARRATOR_PORT` (7870), `NARRATOR_VAULT`, `NARRATOR_WORK`, `NARRATOR_BOOKS`, `NARRATOR_WEB`, `BOOKS_SUBDIR`, `POSITIONS_SUBDIR` (`02 - Studies`), `NOTES_SUBDIR` (`05 - Fleeting`), `KOKORO_VOICE` (`af_heart`), `KOKORO_SPEED`, `KOKORO_GAIN` (1.0), `LOOKAHEAD` (80), `PRERENDER_CHAPTERS` (2), `PREFETCH_WHILE_PAUSED`, `MAX_AUDIO_GB` (5), `MAX_CHAPTER_GB` (20), `SILENCE_S` (0.5), `WHISPER_MODEL`, `WHISPER_PROMPT`, `WHISPER_THREADS` (every core), `CHAPTER_BITRATE` (`64k`), `CHAPTER_GAP_S` (0.30), `CHAPTER_PARA_GAP_S` (0.60), `HLS_SEGMENT_S` (6), `TEXT_SHARD_BYTES`, `TEXT_SHARD_CHAPTERS`, `CHAPTER_PHRASE_GAP_S` (0.10), `HEALTH_STALL_S` (300), `AUTOPACK`, `AUTOPACK_EVERY_S`,
+Every name the Python `AGENTS.md` documents, with the same default: `NARRATOR_PORT` (7870), `NARRATOR_VAULT`, `NARRATOR_WORK`, `NARRATOR_BOOKS`, `NARRATOR_WEB`, `BOOKS_SUBDIR`, `POSITIONS_SUBDIR` (`02 - Studies`), `NOTES_SUBDIR` (`05 - Fleeting`), `KOKORO_VOICE` (`af_heart`), `KOKORO_SPEED`, `KOKORO_GAIN` (1.0), `LOOKAHEAD` (80), `PRERENDER_CHAPTERS` (2), `PREFETCH_WHILE_PAUSED`, `MAX_AUDIO_GB` (5), `MAX_CHAPTER_GB` (20), `SILENCE_S` (0.5), `CHAPTER_BITRATE` (`64k`), `CHAPTER_GAP_S` (0.30), `CHAPTER_PARA_GAP_S` (0.60), `HLS_SEGMENT_S` (6), `TEXT_SHARD_BYTES`, `TEXT_SHARD_CHAPTERS`, `CHAPTER_PHRASE_GAP_S` (0.10), `HEALTH_STALL_S` (300), `AUTOPACK`, `AUTOPACK_EVERY_S`,
 `IDLE_RENDER` (on) and `IDLE_CEILING` (0.80) — see [never idle](#never-idle-what-the-worker-does-when-there-is-nothing-to-do); the ceiling is clamped to 0.85 on read, because a typo above the collector's trim floor would be a treadmill nobody could see, `NARRATOR_WATCH_BOOKS`, `NARRATOR_FAKE_TTS`, `SSE_HEARTBEAT_S`, `SSE_QUEUE`, `SSE_RENDER_MIN_S`, `SSE_RETRY_MS`.
 
-New here, because the weights are not downloaded by a Python package on first use: `NARRATOR_MODELS` (`/models`), `KOKORO_MODEL`, `KOKORO_VOICES`, `WHISPER_VAD_MODEL`, `ESPEAK_BIN`, `ESPEAK_VOICE`, `ESPEAK_TIMEOUT` (15 s, seconds, after which the subprocess is killed), `QUEUE_RESUME_DELAY_S` (10 s, how long after startup a wishlist left by the last process may start rendering — the note queue's own startup sweep may be claiming one of the box's two cores). `HF_HOME` and `KOKORO_REPO` are gone — nothing here talks to Hugging Face at runtime.
+New here, because the weights are not downloaded by a Python package on first use: `NARRATOR_MODELS` (`/models`), `KOKORO_MODEL`, `KOKORO_VOICES`, `STT_MODEL` (`<models>/phonon-2`), `STT_THREADS` (every core; `WHISPER_THREADS` is read when it is unset), `PHONON_MARCH` (build time only: the `-march` the engine is compiled for), `ESPEAK_BIN`, `ESPEAK_VOICE`, `ESPEAK_TIMEOUT` (15 s, seconds, after which the subprocess is killed), `QUEUE_RESUME_DELAY_S` (10 s, how long after startup a wishlist left by the last process may start rendering — the note queue's own startup sweep may be claiming one of the box's two cores). `HF_HOME` and `KOKORO_REPO` are gone — nothing here talks to Hugging Face at runtime. So are `WHISPER_MODEL`, `WHISPER_PROMPT` and `WHISPER_VAD_MODEL`, with whisper: an env file that still sets them is harmless, nothing reads them.
 
 A value that will not parse logs a warning and falls back. A typo in an env var is not a reason to refuse to start a reader.
 
@@ -1485,8 +1556,9 @@ A value that will not parse logs a warning and falls back. A typo in an env var 
 ### Two images, server and reader
 
 The repo publishes **two** images to GHCR, and the split exists for one reason:
-the server takes the better part of an hour to build (whisper.cpp, twice, for
-amd64 and arm64) and the reader takes eight seconds. Fernando edits the reader
+the server takes the better part of an hour to build (a Rust release build,
+twice, for amd64 and arm64 — it was longer still while it compiled whisper.cpp)
+and the reader takes eight seconds. Fernando edits the reader
 far more often than the server, and a CSS fix should not wait on a Rust
 compiler.
 
@@ -1508,7 +1580,7 @@ natively, and the second manifest is pure metadata. The cost is nil and the box
 
 ### The server image
 
-Three stages: node builds the reader, cargo builds the server behind a manifest-only dependency layer (so a source edit does not recompile whisper.cpp, which is most of the build), and a `debian:bookworm-slim` runtime carrying one binary plus ffmpeg, espeak-ng and `libgomp1` (ONNX Runtime's CPU provider is OpenMP-threaded). 583 MB.
+Three stages: node builds the reader, cargo builds the server behind a manifest-only dependency layer (so a source edit does not recompile 300 crates; the Phonon-2 engine's C is compiled after it, in seconds), and a `debian:bookworm-slim` runtime carrying one binary plus ffmpeg, espeak-ng and `libgomp1` (ONNX Runtime's CPU provider is OpenMP-threaded). 583 MB.
 
 `HEALTHCHECK` is `narrator --healthcheck`: one loopback GET of `/healthz` written against a `TcpStream`, rather than putting curl in the runtime image for a single request.
 
@@ -1542,8 +1614,9 @@ docker run --rm --name narrator-rs \
 ```
 
 with `/etc/narrator-rs.env` holding `NARRATOR_VAULT=/vault`,
-`MAX_AUDIO_GB=50`, `KOKORO_VOICE=af_heart`,
-`WHISPER_MODEL=large-v3-turbo-q5_0` and the rest (`deploy/narrator-rs.env`).
+`MAX_AUDIO_GB=50`, `KOKORO_VOICE=af_heart` and the rest
+(`deploy/narrator-rs.env`). The transcriber's weights are in the models mount,
+at `/home/ubuntu/narrator/models/phonon-2`.
 Port 7870 is bound to **loopback only** — there is no auth and no TLS, the box
 is reached over Tailscale, and publishing that port is the one change that turns
 a private reader into a public one. `deploy/narrator-rs-watchdog.{sh,service,timer}`
@@ -1680,12 +1753,16 @@ python server left. What that sentence does not cover:
   not to be*. What still has no evidence either way: gc churn at the
   `MAX_AUDIO_GB` cap over days, and whether anything drifts across thousands of
   sessions.
-- **The A1 renders at a quarter of realtime, and whisper there is 30–50× it.**
-  Both are measured now ([Performance](#the-a1-measured)), and neither is a bug —
-  they are 2 ARM cores. The consequence is a design constraint rather than a
-  to-do: nothing about this reader can assume the server keeps up with a
-  listener, and the voice-memo path is minutes, not seconds. A smaller whisper
-  model is the obvious lever and is Fernando's call to pull.
+- **The A1 renders at a quarter of realtime.** Measured
+  ([Performance](#the-a1-measured)), and not a bug — it is 2 ARM cores. The
+  consequence is a design constraint rather than a to-do: nothing about this
+  reader can assume the server keeps up with a listener. The voice-memo path no
+  longer shares that problem since [Phonon-2](#voice-memos-phonon-2) replaced
+  whisper.
+- **Phonon-2 has not been heard on a real memo.** It is measured on a
+  LibriSpeech clip and on synthetic speech on the box, and the model card's
+  accuracy is the vendor's. Names will be spelt worse than whisper's prompted
+  guesses; whether that matters is for Fernando's first week of notes to say.
 
 ## Rules
 

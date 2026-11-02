@@ -636,7 +636,7 @@ fn seed_bundle(h: &Harness, key: &str, name: &str, title: &str, chunks: &[&str])
 }
 
 /// Base64 of something that is not audio (`not really a webm`): enough to get
-/// past the decode, which is as far as a suite with no whisper model can go.
+/// past the decode, which is as far as a suite with no transcriber weights can go.
 const SOME_AUDIO: &str = "bm90IHJlYWxseSBhIHdlYm0=";
 
 #[tokio::test]
@@ -688,7 +688,7 @@ async fn a_memo_naming_another_book_is_answered_from_that_books_bundle() {
         )
         .await;
     // The bundle answered — this is neither the 404 of a book with no text nor
-    // the 400 of a body that never got that far. What stops it here is whisper,
+    // the 400 of a body that never got that far. What stops it here is the transcriber,
     // which has no model in this suite; the words it would have quoted are
     // asserted at the bundle reader in `src/text.rs`.
     assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{body}");

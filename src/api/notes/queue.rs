@@ -33,7 +33,7 @@
 //! The record (`work/notes-idem/<id>.json`) is written before the recording it
 //! describes and updated as the memo moves, every write `.part`-then-renamed and
 //! fsynced, so a crash can leave a stale record but never a half-written one and
-//! never a truncated recording that a later sweep would feed to whisper. The
+//! never a truncated recording that a later sweep would feed to the transcriber. The
 //! shape of a crash decides what happens next: a record with no `filed` in it is
 //! work still owed and never blocks anything; only `filed` short-circuits, and it
 //! is written *after* the note is in the vault.
@@ -74,6 +74,8 @@ pub struct Filed {
 pub struct Pending {
     /// When the memo arrived, in milliseconds since the epoch.
     pub stamp_ms: i64,
+    /// Whisper's initial prompt. Unused since Phonon-2, which takes none, and
+    /// kept because a rollback to the whisper build has to read this record.
     pub prompt: String,
     pub title: String,
     pub name: String,
@@ -444,7 +446,7 @@ impl Drop for Job {
 /// `.part`, fsync, rename, fsync the directory — the pattern the chunk cache
 /// already uses, plus the fsyncs, because these bytes are the memo. A partial
 /// `.webm` under the real name would be a recording the resume sweep would
-/// happily feed to whisper, and a partial record would be a note nobody can
+/// happily feed to the transcriber, and a partial record would be a note nobody can
 /// finish writing. The directory fsync is what makes the rename itself survive a
 /// power cut rather than only the bytes.
 pub fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -634,7 +636,7 @@ mod tests {
             let _ = rx.await;
             Ok(filed_note("once.md"))
         });
-        // While it runs, the id is taken: no second whisper run, no second note.
+        // While it runs, the id is taken: no second transcription, no second note.
         let second = match claim(d.path(), &id) {
             Claim::Attach(w) => w,
             _ => panic!("an in-flight id must not start a second job"),
@@ -764,7 +766,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failure_is_not_recorded_and_is_tried_again() {
-        // Only a filed note short-circuits. A 500 from whisper leaves the memo
+        // Only a filed note short-circuits. A 500 from the transcriber leaves the memo
         // exactly where it was — owed, and claimable here.
         let d = tempfile::tempdir().expect("tempdir");
         let recording = record_audio(d.path(), "20260911223000.webm");

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The one entry point, mirroring ~/git/narrator's CLI so the muscle memory
 # carries over: build | up | down | logs | status | test | models | openapi |
-# client | listen-test | shell | web.
+# client | listen-test | transcribe | shell | web.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -30,8 +30,6 @@ case "$cmd" in
       ${VAULT:+-v "$VAULT:/vault"} \
       ${VAULT:+-e NARRATOR_VAULT=/vault} \
       -e "KOKORO_VOICE=${KOKORO_VOICE:-af_heart}" \
-      -e "WHISPER_MODEL=${WHISPER_MODEL:-large-v3-turbo-q5_0}" \
-      -e "WHISPER_PROMPT=${WHISPER_PROMPT:-}" \
       -e "LOOKAHEAD=${LOOKAHEAD:-80}" \
       -e "PRERENDER_CHAPTERS=${PRERENDER_CHAPTERS:-2}" \
       -e "MAX_AUDIO_GB=${MAX_AUDIO_GB:-5}" \
@@ -58,6 +56,10 @@ case "$cmd" in
   listen-test)
     cargo build --release --bin listen_test
     exec ./target/release/listen_test ;;
+  # The voice-memo transcriber on files, nothing filed: `./narrator transcribe memo.webm`.
+  transcribe)
+    cargo build --release --bin narrator >/dev/null
+    exec env NARRATOR_MODELS="$MODELS" ./target/release/narrator transcribe "$@" ;;
   dev)
     mkdir -p work books
     exec env NARRATOR_WORK="$WORK" NARRATOR_BOOKS="$BOOKS" NARRATOR_MODELS="$MODELS" \

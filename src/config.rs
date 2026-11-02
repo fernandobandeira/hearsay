@@ -60,15 +60,18 @@ pub struct Config {
     pub fake_tts: bool,
 
     pub models: PathBuf,
-    pub whisper_model: PathBuf,
-    pub whisper_vad_model: Option<PathBuf>,
-    pub whisper_prompt: String,
-    /// `WHISPER_THREADS` — how many threads one transcription may use. Defaults
-    /// to every core, which is what it was before this was configurable, and is
-    /// measured to be the right answer on the 2-core box (see AGENTS.md).
-    pub whisper_threads: usize,
+    /// `STT_MODEL` — the Phonon-2 weights directory (`weights.bin`,
+    /// `weights.json`, `tokens.txt`), `<models>/phonon-2` by default. See
+    /// [`crate::stt`].
+    pub stt_model: PathBuf,
+    /// `STT_THREADS` — how many threads one transcription may use. Defaults to
+    /// every core: the renderer and the packer stand down while a memo is
+    /// transcribed, so every core is actually free. `WHISPER_THREADS` is still
+    /// read when `STT_THREADS` is not set, so an env file from the whisper era
+    /// keeps meaning what it meant.
+    pub stt_threads: usize,
     /// `NARRATOR_FAKE_STT` — the memo's own bytes stand in for a transcript, so
-    /// the note path can be tested end to end without a 574 MB ggml model. The
+    /// the note path can be tested end to end without the 255 MB Phonon-2 weights. The
     /// counterpart to `fake_tts`, and like it, off everywhere but a test.
     pub fake_stt: bool,
 
@@ -176,18 +179,15 @@ impl Config {
                 .unwrap_or_else(|| models.join("kokoro/voices")),
             fake_tts: flag("NARRATOR_FAKE_TTS", false),
 
-            whisper_model: crate::stt::model_path(
-                &env("WHISPER_MODEL").unwrap_or_else(|| "large-v3-turbo-q5_0".into()),
-                &models,
-            ),
-            whisper_vad_model: Some(
-                env("WHISPER_VAD_MODEL")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| models.join("whisper/ggml-silero-v5.1.2.bin")),
-            ),
-            whisper_prompt: env("WHISPER_PROMPT").unwrap_or_default(),
-            whisper_threads: num(
-                "WHISPER_THREADS",
+            stt_model: env("STT_MODEL")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| models.join("phonon-2")),
+            stt_threads: num(
+                if env("STT_THREADS").is_some() {
+                    "STT_THREADS"
+                } else {
+                    "WHISPER_THREADS"
+                },
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(4),

@@ -9,7 +9,7 @@
 //! multi-minute transcription and a duplicate note in the vault.
 //!
 //! These need a transcript, which means `fake_stt`: the recording's own bytes
-//! stand in for whisper (`NARRATOR_FAKE_STT`), exactly as `NARRATOR_FAKE_TTS`
+//! stand in for the transcriber (`NARRATOR_FAKE_STT`), exactly as `NARRATOR_FAKE_TTS`
 //! stands in for Kokoro. Everything after it — the vault write, the note's file
 //! name, the delivery contract, the idempotency record — is the real thing.
 
@@ -65,7 +65,7 @@ async fn a_memo_is_filed_once_however_many_times_it_is_posted() {
 
     // The reader never saw that answer — the screen locked — so it asks again
     // with the same id. The same body comes back, and nothing else happens:
-    // no second whisper run, no second note, no second recording on disk.
+    // no second transcription, no second note, no second recording on disk.
     let (again, second) = h.post_json("/api/note", body).await;
     assert_eq!(again, StatusCode::OK, "{second}");
     assert_eq!(first, second, "a replay is the same answer, to the byte");
@@ -325,7 +325,7 @@ async fn two_posts_of_one_memo_at_the_same_time_file_one_note() {
 
 #[tokio::test]
 async fn a_memo_that_was_never_filed_is_not_replayed() {
-    // Only a filed note short-circuits. A memo whisper heard nothing in is a
+    // Only a filed note short-circuits. A memo the transcriber heard nothing in is a
     // 400, is recorded nowhere, and is transcribed again next time — which
     // matters, because "nothing heard" can be a decode that failed rather than a
     // silence, and the recording is still the only copy.

@@ -1,4 +1,4 @@
-//! Voice memo -> whisper transcript -> a fleeting note in the vault.
+//! Voice memo -> Phonon-2 transcript -> a fleeting note in the vault.
 //!
 //! The delivery contract the reader's outbox is built on: **a 2xx carrying
 //! `{ok, file, text, language}` and nothing else counts as delivered.** Every
@@ -15,8 +15,9 @@
 //! refused rather than filed wrong.
 //!
 //! And why the filing is *detached* from the request: on the 2-core box one memo
-//! is minutes of whisper — twenty is fine, latency is not the point here — and a
-//! phone that locks its screen in that window takes the request future with it.
+//! was minutes of whisper, and is still seconds to tens of seconds of Phonon-2
+//! behind a queue of others — latency is not the point here — and a phone that
+//! locks its screen in that window takes the request future with it.
 //! Everything after the recording lands on disk therefore runs in a task the
 //! request does not own (`queue::Job::spawn`), and the handler only watches for
 //! its result. If the *process* goes instead of the client, [`resume_unfiled`]
@@ -215,19 +216,16 @@ pub async fn note(State(st): State<Arc<AppState>>, Json(body): Json<NoteBody>) -
     let stamp = chrono::Local::now();
     let pending = queue::Pending {
         stamp_ms: stamp.timestamp_millis(),
-        // The initial prompt biases whisper toward the words it will actually
-        // hear. Written down with the rest so a resumed memo is transcribed the
-        // same way this one would have been.
-        prompt: [
-            st.cfg.whisper_prompt.as_str(),
-            title.as_str(),
-            ctitle.as_str(),
-        ]
-        .iter()
-        .filter(|x| !x.is_empty())
-        .copied()
-        .collect::<Vec<_>>()
-        .join(", "),
+        // Whisper's initial prompt, which Phonon-2 has no use for: a transducer
+        // takes no prompt. Still written, because it is a required field of the
+        // record on disk and a rollback to the whisper build has to be able to
+        // read a memo this one queued. The book and chapter, as it always was.
+        prompt: [title.as_str(), ctitle.as_str()]
+            .iter()
+            .filter(|x| !x.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", "),
         title,
         name,
         ctitle,
@@ -339,7 +337,7 @@ struct Filing {
 /// turned it into a note. Now the record beside it says what the note should be,
 /// so finishing it needs nobody.
 ///
-/// One at a time, oldest first: whisper is serialized behind its own lock anyway
+/// One at a time, oldest first: the transcriber is serialized behind its own lock anyway
 /// and the box has two cores, so a queue of memos is a queue here too.
 pub fn resume_unfiled(st: Arc<AppState>) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -392,7 +390,7 @@ async fn file_note(f: Filing) -> queue::Outcome {
     let Filing { st, apath, pending } = f;
     let queue::Pending {
         stamp_ms,
-        prompt,
+        prompt: _,
         title,
         name,
         ctitle,
@@ -418,7 +416,7 @@ async fn file_note(f: Filing) -> queue::Outcome {
             if st.cfg.fake_stt {
                 fake_transcript(&ap)
             } else {
-                st.whisper.transcribe(&ap, &prompt)
+                st.stt.transcribe(&ap)
             }
         }
     })
@@ -476,7 +474,7 @@ async fn file_note(f: Filing) -> queue::Outcome {
 
 /// `NARRATOR_FAKE_STT` — the recording is its own transcript.
 ///
-/// There is no whisper counterpart to `NARRATOR_FAKE_TTS`, so until this existed
+/// There is no transcriber counterpart to `NARRATOR_FAKE_TTS`, so until this existed
 /// no test could reach past the transcription: every one of them stopped at a
 /// 500 from a model that is not in the suite. That left the half of this path
 /// that actually writes to the vault — and the delivery contract the reader's

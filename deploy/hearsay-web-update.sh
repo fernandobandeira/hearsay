@@ -4,7 +4,7 @@
 #
 # The reader is published as its own image - ghcr.io/fernandobandeira/hearsay-web,
 # a `FROM scratch` image whose entire filesystem is /dist - so a UI change is a
-# pull and a file copy rather than an hour of recompiling whisper.cpp for two
+# pull and a file copy rather than an hour of recompiling the server for two
 # architectures. This script is the whole deploy: pull, compare the digest to a
 # stamp, and if it moved, copy the files out of the image and into place.
 #

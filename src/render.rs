@@ -817,7 +817,7 @@ fn worker(st: Arc<AppState>) {
         if st.stop.load(Ordering::SeqCst) {
             break;
         }
-        // Whisper outranks this. A voice memo exists only in the phone that
+        // Transcription outranks this. A voice memo exists only in the phone that
         // recorded it until `/api/note` answers, and on the two-core A1 a memo
         // sharing the box with Kokoro took seven minutes instead of one. So the
         // worker stands down for the duration, and this is **not** a render
@@ -1103,7 +1103,7 @@ impl Parked {
     /// caller starts again the instant the last transcription ends; false means
     /// a memo is still being transcribed and the caller should come back round.
     fn clear(&mut self, st: &AppState) -> bool {
-        if !st.whisper.gate().wait_clear(Duration::from_millis(250)) {
+        if !st.stt.gate().wait_clear(Duration::from_millis(250)) {
             if self.since.is_none() {
                 self.since = Some(Instant::now());
                 tracing::info!("{} parked: a voice memo is being transcribed", self.who);

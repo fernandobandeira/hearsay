@@ -49,6 +49,13 @@ async fn main() -> anyhow::Result<()> {
     if argv.first().map(String::as_str) == Some("retrim") {
         std::process::exit(run_retrim(&argv[1..]));
     }
+    // `narrator transcribe <audio>...` runs the voice-memo transcriber on files
+    // and prints what it heard, with the timing on stderr. Nothing is filed and
+    // nothing is touched: it is how the transcriber is measured on the box,
+    // inside the running container, without a note landing in the vault.
+    if argv.first().map(String::as_str) == Some("transcribe") {
+        std::process::exit(run_transcribe(&argv[1..]));
+    }
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             // tower_http's per-request spans and ONNX Runtime's arena
@@ -126,6 +133,43 @@ async fn shutdown(state: Arc<AppState>) {
 }
 
 /// `narrator retrim` — report by default, rewrite only on `--apply`.
+const TRANSCRIBE_USAGE: &str = "usage: narrator transcribe <audio> [<audio>...]
+
+Transcribes each file (anything ffmpeg decodes) with the voice-memo
+transcriber and prints the text. STT_MODEL and STT_THREADS apply as they do
+to the server. Writes nothing.";
+
+fn run_transcribe(argv: &[String]) -> i32 {
+    if argv.is_empty() || argv.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{TRANSCRIBE_USAGE}");
+        return if argv.is_empty() { 2 } else { 0 };
+    }
+    tracing_subscriber::registry()
+        .with(EnvFilter::new("info"))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(std::io::stderr),
+        )
+        .init();
+    let stt = narrator::stt::Transcriber::new(&Config::from_env());
+    let mut rc = 0;
+    for f in argv {
+        let t0 = std::time::Instant::now();
+        match stt.transcribe(std::path::Path::new(f)) {
+            Ok(t) => {
+                eprintln!("{f}: {:.2}s wall", t0.elapsed().as_secs_f64());
+                println!("{}", t.text);
+            }
+            Err(e) => {
+                eprintln!("{f}: {e}");
+                rc = 1;
+            }
+        }
+    }
+    rc
+}
+
 fn run_retrim(argv: &[String]) -> i32 {
     if argv.iter().any(|a| a == "--help" || a == "-h") {
         println!("{}", migrate::RETRIM_USAGE);

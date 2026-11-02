@@ -664,7 +664,7 @@ async fn the_branches_render_in_rank_order() {
         c.prerender_chapters = 0;
     })
     .await;
-    let busy = h.state.whisper.gate().enter();
+    let busy = h.state.stt.gate().enter();
 
     let other = h.add_book("Ranked (2026).epub");
     let (code, loaded) = h.post_json("/api/load", json!({"path": other})).await;

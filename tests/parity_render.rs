@@ -482,7 +482,7 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
 
 // ------------------------------------------------------ the STT priority gate
 
-/// Whisper outranks the renderer, and the renderer has to actually stand down.
+/// Transcription outranks the renderer, and the renderer has to actually stand down.
 ///
 /// The A1 is two cores. With chapters queued, a ~45 s memo took over seven
 /// minutes to come back because Kokoro and whisper were taking turns on the same
@@ -496,8 +496,8 @@ async fn a_transcription_parks_the_renderer_until_it_is_done() {
     let key = key_of(&h);
     let p = cache::chunk_path(&h.work(), &key, 0, 0);
 
-    // What `Whisper::transcribe` holds for the length of a memo.
-    let busy = h.state.whisper.gate().enter();
+    // What `Transcriber::transcribe` holds for the length of a memo.
+    let busy = h.state.stt.gate().enter();
     h.post_json("/api/open", json!({"chapter": 0, "chunk": 0}))
         .await;
     // Long enough that the fake engine would have rendered the whole chapter.
@@ -525,7 +525,7 @@ async fn a_transcription_holds_back_a_new_pack() {
             .expect("seed");
     }
 
-    let busy = h.state.whisper.gate().enter();
+    let busy = h.state.stt.gate().enter();
     let (code, body) = h
         .post_json("/api/chapters/build", json!({"chapters": [0]}))
         .await;
@@ -561,17 +561,14 @@ async fn a_cancelled_request_cannot_leak_the_gate() {
     let h = Harness::new().await;
     let st = h.state.clone();
     let job = tokio::task::spawn_blocking(move || {
-        let _busy = st.whisper.gate().enter();
+        let _busy = st.stt.gate().enter();
         std::thread::sleep(Duration::from_millis(200));
     });
-    until("the gate to be claimed", 5.0, || {
-        h.state.whisper.gate().held()
-    })
-    .await;
+    until("the gate to be claimed", 5.0, || h.state.stt.gate().held()).await;
     // The client went away: the future is dropped, the blocking job is not.
     drop(job);
     until("the gate to clear on its own", 10.0, || {
-        !h.state.whisper.gate().held()
+        !h.state.stt.gate().held()
     })
     .await;
 }

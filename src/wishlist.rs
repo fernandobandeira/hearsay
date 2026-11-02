@@ -983,7 +983,7 @@ pub fn resume(st: &Arc<AppState>) -> Option<Resumed> {
 ///
 /// It is a delay, not a throttle: once the worker is awake, resumed chapters are
 /// ordinary queue entries, rendered one chunk at a time on one thread, parking
-/// for whisper between chunks like everything else.
+/// for a transcription between chunks like everything else.
 pub const RESUME_DELAY_S: f64 = 10.0;
 
 /// Wake the render worker on resumed work, after [`RESUME_DELAY_S`].

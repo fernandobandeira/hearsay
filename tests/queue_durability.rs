@@ -435,7 +435,7 @@ async fn resumed_work_stands_down_for_a_voice_memo() {
     // Taken before the resume delay is up, the way the memo sweep takes it: the
     // sweep is spawned while the router is being built, and the queue is
     // deliberately later.
-    let busy = h.state.whisper.gate().enter();
+    let busy = h.state.stt.gate().enter();
     let first = cache::chunk_path(&h.work(), &key, 0, 0);
     let queued = cache::chunk_path(&h.work(), &key, 1, 0);
     tokio::time::sleep(Duration::from_millis(1800)).await;

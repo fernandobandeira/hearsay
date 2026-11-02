@@ -44,7 +44,7 @@
 //! row at all. Finding those and registering them is how a Rust deploy adopts an
 //! existing cache in place rather than pretending it is empty.
 //!
-//! **The scanner stands down for whisper and for a stalled renderer**, in that
+//! **The scanner stands down for a transcription and for a stalled renderer**, in that
 //! order and for the reasons the render worker and the packer already do (see
 //! [the STT priority gate][crate::stt] and the packer's hold-back in
 //! [`crate::render`]). A full scan is thousands of `stat` calls; a voice memo
@@ -414,12 +414,12 @@ fn scanner(st: Arc<AppState>) {
             std::thread::sleep(wait.min(SLICE));
             continue;
         }
-        // Whisper outranks this, exactly as it outranks the renderer and the
+        // Transcription outranks this, exactly as it outranks the renderer and the
         // packer. A bounded wait on the gate's condvar, so the scan starts the
         // instant the last transcription ends, and both the park and the resume
         // are logged: a background job that has quietly stopped is the shape of
         // bug this whole server is about.
-        if !st.whisper.gate().wait_clear(Duration::from_millis(250)) {
+        if !st.stt.gate().wait_clear(Duration::from_millis(250)) {
             if parked.is_none() {
                 parked = Some(Instant::now());
                 tracing::info!("library scan parked: a voice memo is being transcribed");

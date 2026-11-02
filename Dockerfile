@@ -9,8 +9,9 @@
 #   docker buildx build --platform linux/amd64,linux/arm64 -t narrator-rs:latest .
 #
 # The build needs network for crates.io *and* for `ort`, which downloads a
-# prebuilt ONNX Runtime for the target triple; whisper.cpp is compiled from
-# source by whisper-rs-sys, which is why cmake and clang are in the build stage.
+# prebuilt ONNX Runtime for the target triple. The voice-memo transcriber is
+# the vendored Phonon-2 engine (vendor/phonon-2-c), a few thousand lines of C
+# that build.rs compiles with the system cc in seconds.
 
 # ---------------------------------------------------------------- web build
 FROM node:22-slim AS web
@@ -45,91 +46,40 @@ RUN set -eux; \
 # ------------------------------------------------------------------- build
 FROM rust:1-slim-bookworm AS build
 
-# cmake + clang: whisper-rs-sys compiles whisper.cpp and binds it with bindgen,
-# which needs libclang. pkg-config and libssl for the crates that link openssl.
-# On aarch64 these are the packages that most often differ - keep them explicit.
+# build-essential: the C compiler build.rs drives for the Phonon-2 engine (and
+# for rusqlite's bundled SQLite). pkg-config and libssl for the crates that
+# link openssl. On aarch64 these are the packages that most often differ - keep
+# them explicit.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake clang libclang-dev pkg-config \
-        libssl-dev ca-certificates curl \
+        build-essential pkg-config libssl-dev ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# ggml compiles for the machine it is *built* on unless told otherwise, and this
-# image is built for two architectures, sometimes under emulation - where "the
-# machine" is QEMU's idea of a CPU, not the Ampere Altra the result will run on.
-# A wrong instruction there is a SIGILL, not a slow transcript, so GGML_NATIVE is
-# off and the baseline is named explicitly instead.
-#
-#   amd64: x86-64-v3 (AVX, AVX2, FMA, F16C) - every Intel/AMD part since ~2013,
-#          which both this box and any plausible VPS are. Leaving these off as
-#          well costs whisper.cpp several times its speed for nothing.
-#   arm64: armv8.2-a+dotprod+fp16 - the same class of trade as x86-64-v3, and
-#          made for the same reason. This used to say "the ARMv8 baseline, which
-#          already mandates NEON", on the theory that a voice memo is not the hot
-#          path. It is not the hot path, but it was *unusable*: a 10-second memo
-#          took 311s and 473s to transcribe on the A1 at the default 2 threads,
-#          and 533s pinned to one - 31-53x slower than realtime, so every memo
-#          timed out in the outbox instead of landing in the vault.
-#
-#          The reason is that on ARM this ggml has no runtime dispatch. Every
-#          kernel choice is a preprocessor test: ggml_cpu_has_dotprod() in
-#          ggml/src/ggml-cpu/ggml-cpu.c is `#if defined(__ARM_FEATURE_DOTPROD)`,
-#          and the HWCAP sniffing in ggml-cpu/arch/arm/cpu-feats.cpp is compiled
-#          only under GGML_CPU_ALL_VARIANTS, which needs GGML_BACKEND_DL, which
-#          needs shared libs - and whisper-rs-sys builds static. So with no
-#          -march at all, ggml_vdotq_s32 falls back to the vmull_s8/vpaddlq_s16
-#          emulation in ggml-cpu-impl.h (six instructions where one `sdot` would
-#          do), and GGML_F16_VEC drops from 8-wide native fp16 FMA to 4-wide fp32
-#          with converts. Both are load-bearing for whisper: the first is every
-#          q5_0 x q8_0 matmul, the second the f16 attention and conv layers.
-#
-#          What this costs: the arm64 image now requires ARMv8.2-A with
-#          FEAT_DotProd and FEAT_FP16 - Neoverse-N1/N2 (so the Ampere Altra this
-#          runs on, and Graviton2 and later), Apple silicon, most server and
-#          phone parts from ~2019 on. `lscpu` says yes if it lists `asimddp` and
-#          `asimdhp`; the A1 lists both. It will SIGILL on an ARMv8.0 part such
-#          as a Raspberry Pi 4 (Cortex-A72). That is the same bet amd64 already
-#          makes with AVX2, and a SIGILL at least fails loudly.
-#
-#          GGML_NATIVE stays OFF: under QEMU "native" is QEMU's idea of a CPU,
-#          and a wrong instruction there is a SIGILL rather than a slow
-#          transcript. Naming the baseline is what makes the cross-build safe.
-#          `--build-arg GGML_NATIVE=ON` still works for a build on the box
-#          itself, and takes precedence over the baseline below.
-#
-# whisper-rs-sys passes every GGML_*, WHISPER_* and CMAKE_* environment variable
-# straight through to cmake as -D (build.rs, `for (key, value) in env::vars()`),
-# so GGML_CPU_ARM_ARCH lands on the ggml-cpu target as -march=... and nowhere
-# else - the Rust code itself stays on the generic baseline.
-ARG TARGETARCH
-ARG GGML_NATIVE=OFF
-ENV GGML_NATIVE=${GGML_NATIVE}
-# One shell snippet, sourced by both cargo invocations below. TARGETARCH comes
-# from buildx; dpkg is the fallback for a plain `docker build`.
-RUN set -eux; \
-    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
-    if [ "${GGML_NATIVE}" != "OFF" ]; then \
-        echo '# GGML_NATIVE is on; ggml picks the flags' > /etc/ggml.sh; \
-    elif [ "$arch" = "amd64" ]; then \
-        echo 'export GGML_AVX=ON GGML_AVX2=ON GGML_FMA=ON GGML_F16C=ON' > /etc/ggml.sh; \
-    elif [ "$arch" = "arm64" ]; then \
-        echo 'export GGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16' > /etc/ggml.sh; \
-    else \
-        echo '# ggml baseline for this arch' > /etc/ggml.sh; \
-    fi; \
-    cat /etc/ggml.sh
+# The instruction set the engine is compiled for is named in build.rs, never
+# -march=native: this image is built on GitHub's runners and run on the A1, and
+# the arm64 runners are newer cores than the A1's Neoverse N1. arm64 gets
+# armv8.2-a+dotprod (the int8 SDOT kernels, which are the whole speed of the
+# thing; `lscpu` on the A1 lists `asimddp`), amd64 gets x86-64-v3. The same
+# baseline this image already required for whisper.cpp, so nothing that ran it
+# before stops running it now. `--build-arg PHONON_MARCH=native` for a build on
+# the machine that will run it.
+ARG PHONON_MARCH=
+ENV PHONON_MARCH=${PHONON_MARCH}
 
 WORKDIR /src
 # Dependency layer: a manifest-only build so a source edit does not re-download
-# and re-compile 300 crates (and, more to the point, does not recompile
-# whisper.cpp, which is most of the build).
+# and re-compile 300 crates. No build.rs here, so the stub links nothing of the
+# engine; the C is compiled in the layer below, in seconds.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src/bin \
     && echo 'fn main() {}' > src/main.rs \
     && echo '' > src/lib.rs \
     && echo 'fn main() {}' > src/bin/listen_test.rs \
-    && sh -c '. /etc/ggml.sh; cargo build --release --locked || true' \
+    && (cargo build --release --locked || true) \
     && rm -rf src
 
+COPY build.rs ./
+COPY vendor/ ./vendor/
+COPY native/ ./native/
 COPY src/ ./src/
 # tests/ is deliberately *not* copied. `cargo build --bin narrator` never
 # compiles a test target, and every fixture that lands in this stage is another
@@ -137,7 +87,6 @@ COPY src/ ./src/
 # tests run in CI on the runner, against the same source.
 # Touch so cargo does not reuse the stub's fingerprint.
 RUN set -eux; \
-    . /etc/ggml.sh; \
     touch src/main.rs src/lib.rs; \
     cargo build --release --locked --bin narrator; \
     strip target/release/narrator || true
@@ -146,7 +95,7 @@ RUN set -eux; \
 FROM debian:bookworm-slim
 
 # ffmpeg: chapter packing, HLS segmentation, .m4b export and decoding voice
-#   memos for whisper.
+#   memos for the transcriber.
 # espeak-ng: Kokoro's grapheme-to-phoneme front end. narrator-rs runs it as a
 #   subprocess rather than linking libespeak-ng, so none of the python image's
 #   espeakng_loader surgery is needed here - the apt binary and its data are
@@ -161,14 +110,13 @@ RUN espeak-ng -q --ipa=2 -v en-us "narrator renders books on a cpu." \
     && ffmpeg -version > /dev/null
 
 # Weights and rendered audio live in bind mounts outside the image, so they
-# survive rebuilds. NARRATOR_MODELS holds kokoro/ and whisper/; see
+# survive rebuilds. NARRATOR_MODELS holds kokoro/ and phonon-2/; see
 # scripts/fetch-models.sh for what goes in them.
 ENV NARRATOR_MODELS=/models \
     NARRATOR_WORK=/work \
     NARRATOR_BOOKS=/books \
     NARRATOR_WEB=/web \
     KOKORO_VOICE=af_heart \
-    WHISPER_MODEL=large-v3-turbo-q5_0 \
     RUST_LOG=info,tower_http=warn,ort=warn
 
 COPY --from=web /build/dist /web
